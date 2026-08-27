@@ -1,0 +1,43 @@
+name: Build Ember Connect Mobile
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build IPA
+        run: |
+          xcodebuild clean build \
+            -project EmberConnectMobile.xcodeproj \
+            -scheme EmberConnectMobile \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXCLUDED_ARCHS="armv7" \
+            CONFIGURATION_BUILD_DIR="$(pwd)/build"
+            
+          mkdir -p Payload
+          mv build/EmberConnectMobile.app Payload/
+          zip -r EmberConnectMobile.ipa Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EmberConnectMobile
+          path: EmberConnectMobile.ipa
