@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import ZIPFoundation
 
 struct GuestApp: Identifiable {
     let id = UUID()
@@ -17,9 +18,39 @@ class AppModel: ObservableObject {
         guard let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
         
         let appsDir = documentsURL.appendingPathComponent("Apps")
+        let autoInstallDir = documentsURL.appendingPathComponent("AutoInstall")
         
         if !fileManager.fileExists(atPath: appsDir.path) {
             try? fileManager.createDirectory(at: appsDir, withIntermediateDirectories: true)
+        }
+        if !fileManager.fileExists(atPath: autoInstallDir.path) {
+            try? fileManager.createDirectory(at: autoInstallDir, withIntermediateDirectories: true)
+        }
+        
+        // Auto-install IPAs
+        if let autoIPAs = try? fileManager.contentsOfDirectory(at: autoInstallDir, includingPropertiesForKeys: nil) {
+            for ipaURL in autoIPAs where ipaURL.pathExtension == "ipa" {
+                print("Auto-installing: \(ipaURL.lastPathComponent)")
+                let tempExtract = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                do {
+                    try fileManager.unzipItem(at: ipaURL, to: tempExtract)
+                    let payloadDir = tempExtract.appendingPathComponent("Payload")
+                    if let appsInPayload = try? fileManager.contentsOfDirectory(at: payloadDir, includingPropertiesForKeys: nil) {
+                        for app in appsInPayload where app.pathExtension == "app" {
+                            let dest = appsDir.appendingPathComponent(app.lastPathComponent)
+                            if fileManager.fileExists(atPath: dest.path) {
+                                try fileManager.removeItem(at: dest)
+                            }
+                            try fileManager.moveItem(at: app, to: dest)
+                            print("Successfully installed \(app.lastPathComponent)")
+                        }
+                    }
+                    try fileManager.removeItem(at: ipaURL) // delete IPA after install
+                    try fileManager.removeItem(at: tempExtract) // clean up temp
+                } catch {
+                    print("Failed to unzip \(ipaURL.lastPathComponent): \(error)")
+                }
+            }
         }
         
         do {
