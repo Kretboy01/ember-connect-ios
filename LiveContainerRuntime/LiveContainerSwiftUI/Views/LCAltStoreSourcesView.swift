@@ -228,8 +228,32 @@ final class AltStoreSourcesViewModel: ObservableObject {
     
     private func loadStoredSources() {
         let defaults = UserDefaults.standard
-        let stored = defaults.array(forKey: defaultsKey) as? [String] ?? []
-        let urls = stored.compactMap { URL(string: $0) }
+        let stored = defaults.array(forKey: defaultsKey) as? [String]
+        let urls: [URL]
+        if let stored = stored {
+            urls = stored.compactMap { URL(string: $0) }
+        } else {
+            let defaultSourceStrings = [
+                "https://ipa.cypwn.xyz/cypwn.json",
+                "https://raw.githubusercontent.com/swaggyP36000/TrollStore-IPAs/main/apps.json",
+                "https://raw.githubusercontent.com/Omni-Development/The-Omni-Repository/refs/heads/main/app-repo.json",
+                "https://quarksources.github.io/quantumsource.json",
+                "https://community-apps.sidestore.io/sidecommunity.json",
+                "https://wuxu1.github.io/wuxu-complete-plus.json",
+                "https://github.com/RipeStore/repos/raw/refs/heads/main/RipeStore.json",
+                "https://apps.altstore.io",
+                "https://altstore.oatmealdome.me",
+                "https://alt.getutm.app",
+                "https://provenance-emu.com/apps.json",
+                "https://flyinghead.github.io/flycast-builds/altstore.json",
+                "https://burritosoftware.github.io/altstore/channels/burritosource.json",
+                "https://quarksources.github.io/quarksource.json",
+                "https://pokemmo.com/altstore/",
+                "https://ish.app/altstore.json"
+            ]
+            urls = defaultSourceStrings.compactMap { URL(string: $0) }
+            defaults.set(defaultSourceStrings, forKey: defaultsKey)
+        }
         self.sources = urls.map { SourceItem(url: $0, isLoading: false) }
         for index in sources.indices {
             let url = sources[index].url
