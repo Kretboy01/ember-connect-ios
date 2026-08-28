@@ -42,7 +42,7 @@ jobs:
         run: |
           xcodebuild clean build \
             -project EmberConnectExtensions.xcodeproj \
-            -target EmberConnectBroadcast \
+            -scheme EmberConnectBroadcast \
             -sdk iphoneos \
             -configuration Release \
             -derivedDataPath DerivedDataBroadcast \
