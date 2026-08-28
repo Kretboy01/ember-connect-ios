@@ -120,12 +120,14 @@ class SampleHandler: RPBroadcastSampleHandler {
     /// forwarded and the receiver compares it against the shape of the frame
     /// it actually decoded — see `MirrorProtocol.Orientation`.
     private func updateOrientation(from sampleBuffer: CMSampleBuffer) {
-        let attachment: NSNumber? = CMGetAttachment(
+        // CMGetAttachment returns CFTypeRef? here, so the cast has to happen
+        // after the call rather than through the binding's type.
+        let attachment: CFTypeRef? = CMGetAttachment(
             sampleBuffer,
             key: RPVideoSampleOrientationKey as CFString,
             attachmentModeOut: nil
         )
-        guard let raw = attachment else { return }
+        guard let raw = attachment as? NSNumber else { return }
 
         let next = MirrorProtocol.Orientation(cgImagePropertyOrientation: raw.uint32Value)
         stateLock.lock()
