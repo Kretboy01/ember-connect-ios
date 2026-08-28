@@ -75,6 +75,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     
     @State private var navigateTo : AnyView?
     @State private var isNavigationActive = false
+
     
     @State private var helpPresent = false
     
@@ -130,116 +131,210 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     
     var body: some View {
         NavigationView {
-            ScrollView {
-                NavigationLink(
-                    destination: navigateTo,
-                    isActive: $isNavigationActive,
-                    label: {
-                        EmptyView()
-                })
-                .hidden()
+            ZStack {
+                EmberTheme.bgBase.ignoresSafeArea()
                 
-                LazyVStack {
-                    ForEach(filteredApps, id: \.self) { app in
-                        LCAppBanner(appModel: app, delegate: self, appDataFolders: $appDataFolderNames, tweakFolders: $tweakFolderNames)
+                EmberTheme.heroMeshGradient
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                
+                ScrollView {
+                    NavigationLink(
+                        destination: navigateTo,
+                        isActive: $isNavigationActive,
+                        label: {
+                            EmptyView()
+                    })
+                    .hidden()
+                    
+                    if filteredApps.isEmpty && searchContext.debouncedQuery.isEmpty {
+                        // MARK: - Ember Empty State
+                        VStack(spacing: 20) {
+                            ZStack {
+                                Circle()
+                                    .fill(EmberTheme.accent.opacity(0.12))
+                                    .frame(width: 88, height: 88)
+                                
+                                Circle()
+                                    .fill(EmberTheme.flameGradient)
+                                    .frame(width: 64, height: 64)
+                                    .shadow(color: EmberTheme.accentGlow, radius: 12, x: 0, y: 4)
+                                
+                                Image(systemName: "square.stack.3d.up.fill")
+                                    .font(.system(size: 28, weight: .bold))
+                                    .foregroundStyle(.white)
+                            }
+                            .padding(.top, 40)
+                            
+                            VStack(spacing: 6) {
+                                Text("No Guest Apps Installed")
+                                    .font(.system(.title3, design: .rounded).weight(.bold))
+                                    .foregroundStyle(Color.white)
+                                
+                                Text("Install apps from IPA files, download from URL, or push automatically from Ember Connect Desktop.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(Color.white.opacity(0.65))
+                                    .multilineTextAlignment(.center)
+                                    .padding(.horizontal, 24)
+                                    .lineSpacing(3)
+                            }
+                            
+                            VStack(spacing: 12) {
+                                Button {
+                                    choosingIPA = true
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "doc.badge.plus")
+                                            .font(.system(size: 15, weight: .bold))
+                                        Text("Install IPA from Files")
+                                    }
+                                    .emberFlameButton(isEnabled: true)
+                                }
+                                .buttonStyle(.plain)
+                                
+                                Button {
+                                    Task { await startInstallFromUrl() }
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "link.badge.plus")
+                                            .font(.system(size: 15, weight: .semibold))
+                                        Text("Install from Web Link")
+                                            .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                                    }
+                                    .foregroundStyle(Color.white.opacity(0.85))
+                                    .padding(.horizontal, 20)
+                                    .padding(.vertical, 12)
+                                    .frame(maxWidth: .infinity)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                            .fill(Color.white.opacity(0.06))
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                                            )
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, 32)
+                            .padding(.top, 12)
+                        }
+                        .padding(.vertical, 20)
+                    } else {
+                        LazyVStack(spacing: 12) {
+                            ForEach(filteredApps, id: \.self) { app in
+                                LCAppBanner(appModel: app, delegate: self, appDataFolders: $appDataFolderNames, tweakFolders: $tweakFolderNames)
+                            }
+                            .transition(.scale)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                        .animation(searchContext.isTyping ? nil : .easeInOut, value: filteredApps)
                     }
-                    .transition(.scale)
-                }
-                .padding()
-                .animation(searchContext.isTyping ? nil : .easeInOut, value: filteredApps)
 
-                VStack {
-                    if LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding") {
-                        if sharedModel.isHiddenAppUnlocked {
-                            LazyVStack {
+                    VStack {
+                        if LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding") {
+                            if sharedModel.isHiddenAppUnlocked {
+                                LazyVStack(spacing: 12) {
+                                    HStack {
+                                        Text("lc.appList.hiddenApps".loc)
+                                            .font(.system(.title3, design: .rounded).bold())
+                                            .foregroundStyle(Color.white)
+                                        Spacer()
+                                    }
+                                    
+                                    ForEach(filteredHiddenApps, id: \.self) { app in
+                                        LCAppBanner(appModel: app, delegate: self, appDataFolders: $appDataFolderNames, tweakFolders: $tweakFolderNames)
+                                    }
+                                    .transition(.scale)
+                                }
+                                .padding(.horizontal, 16)
+                                .transition(.opacity)
+                                .animation(searchContext.isTyping ? nil : .easeInOut, value: filteredHiddenApps)
+                                
+                                if sharedModel.hiddenApps.count == 0 {
+                                    Text("lc.appList.hideAppTip".loc)
+                                        .font(.caption)
+                                        .foregroundStyle(Color.white.opacity(0.5))
+                                }
+                            }
+                        } else if sharedModel.hiddenApps.count > 0 {
+                            LazyVStack(spacing: 12) {
                                 HStack {
                                     Text("lc.appList.hiddenApps".loc)
-                                        .font(.system(.title2).bold())
+                                        .font(.system(.title3, design: .rounded).bold())
+                                        .foregroundStyle(Color.white)
                                     Spacer()
                                 }
-                                
                                 ForEach(filteredHiddenApps, id: \.self) { app in
-                                    LCAppBanner(appModel: app, delegate: self, appDataFolders: $appDataFolderNames, tweakFolders: $tweakFolderNames)
+                                    if sharedModel.isHiddenAppUnlocked {
+                                        LCAppBanner(appModel: app, delegate: self, appDataFolders: $appDataFolderNames, tweakFolders: $tweakFolderNames)
+                                    } else {
+                                        LCAppSkeletonBanner()
+                                    }
                                 }
-                                .transition(.scale)
-                                
+                                .animation(.easeInOut, value: sharedModel.isHiddenAppUnlocked)
+                                .onTapGesture {
+                                    Task { await authenticateUser() }
+                                }
                             }
-                            .padding()
-                            .transition(.opacity)
+                            .padding(.horizontal, 16)
                             .animation(searchContext.isTyping ? nil : .easeInOut, value: filteredHiddenApps)
-                            
-                            if sharedModel.hiddenApps.count == 0 {
-                                Text("lc.appList.hideAppTip".loc)
-                                    .foregroundStyle(.gray)
-                            }
                         }
-                    } else if sharedModel.hiddenApps.count > 0 {
-                        LazyVStack {
-                            HStack {
-                                Text("lc.appList.hiddenApps".loc)
-                                    .font(.system(.title2).bold())
-                                Spacer()
-                            }
-                            ForEach(filteredHiddenApps, id: \.self) { app in
-                                if sharedModel.isHiddenAppUnlocked {
-                                    LCAppBanner(appModel: app, delegate: self, appDataFolders: $appDataFolderNames, tweakFolders: $tweakFolderNames)
-                                } else {
-                                    LCAppSkeletonBanner()
+
+                        let appCount = sharedModel.isHiddenAppUnlocked ? filteredApps.count + filteredHiddenApps.count : filteredApps.count
+                        if appCount > 0 || searchContext.debouncedQuery != "" {
+                            Text("lc.appList.appCounter %lld".localizeWithFormat(appCount))
+                                .font(.caption)
+                                .foregroundStyle(Color.white.opacity(0.45))
+                                .padding(.top, 16)
+                                .animation(searchContext.isTyping ? nil : .easeInOut, value: appCount)
+                                .onTapGesture(count: 3) {
+                                    Task { await authenticateUser() }
                                 }
-                            }
-                            .animation(.easeInOut, value: sharedModel.isHiddenAppUnlocked)
-                            .onTapGesture {
-                                Task { await authenticateUser() }
-                            }
                         }
-                        .padding()
-                        .animation(searchContext.isTyping ? nil : .easeInOut, value: filteredHiddenApps)
                     }
+                    .animation(searchContext.isTyping ? nil : .easeInOut, value: LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding"))
 
-                    let appCount = sharedModel.isHiddenAppUnlocked ? filteredApps.count + filteredHiddenApps.count : filteredApps.count
-                    Text(appCount > 0 || searchContext.debouncedQuery != "" ? "lc.appList.appCounter %lld".localizeWithFormat(appCount) : (sharedModel.multiLCStatus == 2 ? "lc.appList.convertToSharedToShowInLC2".loc : "lc.appList.installTip".loc))
-                        .padding(.horizontal)
-                        .foregroundStyle(.gray)
-                        .animation(searchContext.isTyping ? nil : .easeInOut, value: appCount)
-                        .onTapGesture(count: 3) {
-                            Task { await authenticateUser() }
-                        }
-                }.animation(searchContext.isTyping ? nil : .easeInOut, value: LCUtils.appGroupUserDefault.bool(forKey: "LCStrictHiding"))
-
-                if sharedModel.multiLCStatus == 2 {
-                    Text("lc.appList.manageInPrimaryTip".loc).foregroundStyle(.gray).padding()
                 }
-
+                .navigationBarProgressBar(show: $installprogressVisible, progress: $installProgressPercentage)
+                .coordinateSpace(name: "scroll")
             }
-            .navigationBarProgressBar(show:$installprogressVisible, progress: $installProgressPercentage)
-            .coordinateSpace(name: "scroll")
             .onAppear {
                 if !didAppear {
                     onAppear()
                 }
                 Task { await installFromEmberInbox() }
             }
-            
-            .navigationTitle("lc.appList.myApps".loc)
+            .navigationTitle("Ember Connect Mobile")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "flame.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(EmberTheme.accent)
+                        Text("Ember Connect Mobile")
+                            .font(.system(.headline, design: .rounded).weight(.bold))
+                            .foregroundStyle(Color.white)
+                    }
+                }
                 ToolbarItem(placement: .topBarLeading) {
-                    if sharedModel.multiLCStatus != 2 {
-                        if !installprogressVisible {
-                            Menu {
-                                
-                                Button("lc.appList.installFromIpa".loc, systemImage: "doc.badge.plus", action: {
-                                    choosingIPA = true
-                                })
-                                Button("lc.appList.installFromUrl".loc, systemImage: "link.badge.plus", action: {
-                                    Task{ await startInstallFromUrl() }
-                                })
-                            } label: {
-                                Label("add", systemImage: "plus")
-                            }
-                            
-                        } else {
-                            ProgressView().progressViewStyle(.circular).padding(.horizontal, 8)
+                    if !installprogressVisible {
+                        Menu {
+                            Button("lc.appList.installFromIpa".loc, systemImage: "doc.badge.plus", action: {
+                                choosingIPA = true
+                            })
+                            Button("lc.appList.installFromUrl".loc, systemImage: "link.badge.plus", action: {
+                                Task { await startInstallFromUrl() }
+                            })
+                        } label: {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.system(size: 18))
+                                .foregroundStyle(EmberTheme.accent)
                         }
+                    } else {
+                        ProgressView().progressViewStyle(.circular).tint(EmberTheme.accent).padding(.horizontal, 8)
                     }
                 }
                 ToolbarItem(placement: .topBarLeading) {
@@ -249,23 +344,18 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                         } label: {
                             IconImageView(icon: BuiltInSideStoreAppInfo.shared.iconIsDarkIcon(darkModeIcon))
                                 .frame(width: UIFont.preferredFont(forTextStyle: .body).lineHeight, height: UIFont.preferredFont(forTextStyle: .body).lineHeight)
-
                         }
                     } else {
                         Button("Help", systemImage: "questionmark") {
                             helpPresent = true
                         }
                     }
-                    
-
                 }
-                
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("lc.appList.openLink".loc, systemImage: "link", action: {
                         Task { await onOpenWebViewTapped() }
                     })
                 }
-                
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Picker("Sort by", selection: $sharedAppSortManager.appSortType) {
@@ -281,7 +371,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                         }
                         if sharedAppSortManager.appSortType == .custom {
                             Divider()
-                            
                             Button {
                                 customSortViewPresent = true
                             } label: {
@@ -316,7 +405,6 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 }, label: {
                     Text(installOption.isReplace ? installOption.nameOfFolderToInstall : "lc.appList.installAsNew".loc)
                 })
-            
             }
             Button(role: .cancel, action: {
                 installReplaceAlert.close(result: nil)
@@ -338,7 +426,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         } message: {
             Text("lc.appBanner.confirmRunWhenMultitasking".loc)
         }
-        .alert("lc.appList.generatedIconStyleSelector.title".loc, isPresented:$generatedIconStyleSelector.show) {
+        .alert("lc.appList.generatedIconStyleSelector.title".loc, isPresented: $generatedIconStyleSelector.show) {
             Button {
                 generatedIconStyleSelector.close(result: .Light)
             } label: {
@@ -360,25 +448,25 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         }
         .textFieldAlert(
             isPresented: $webViewUrlInput.show,
-            title:  "lc.appList.enterUrlTip".loc,
+            title: "lc.appList.enterUrlTip".loc,
             text: $webViewUrlInput.initVal,
             placeholder: "scheme://",
             action: { newText in
                 webViewUrlInput.close(result: newText)
             },
-            actionCancel: {_ in
+            actionCancel: { _ in
                 webViewUrlInput.close(result: nil)
             }
         )
         .textFieldAlert(
             isPresented: $installUrlInput.show,
-            title:  "lc.appList.installUrlInputTip".loc,
+            title: "lc.appList.installUrlInputTip".loc,
             text: $installUrlInput.initVal,
             placeholder: "https://",
             action: { newText in
                 installUrlInput.close(result: newText)
             },
-            actionCancel: {_ in
+            actionCancel: { _ in
                 installUrlInput.close(result: nil)
             }
         )
@@ -417,6 +505,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 isViewAppeared = true
             }
         }
+
         .onChange(of: sharedModel.deepLink) { link in
             guard sharedModel.selectedTab == .apps, let link else { return }
             sharedModel.deepLink = nil

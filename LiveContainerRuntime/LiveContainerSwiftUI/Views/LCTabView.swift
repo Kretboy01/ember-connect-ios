@@ -1,5 +1,5 @@
 //
-//  TabView.swift
+//  LCTabView.swift
 //  LiveContainerSwiftUI
 //
 //  Created by s s on 2024/8/21.
@@ -37,7 +37,6 @@ struct LCTabView: View {
         LCSourcesView(searchContext: searchContextSource)
     }
 
-    
     var body: some View {
         Group {
             if #available(iOS 19.0, *), SharedModel.isLiquidGlassSearchEnabled {
@@ -69,7 +68,6 @@ struct LCTabView: View {
                             appListView
                                 .searchable(text: $searchContextAppList.query)
                         }
-
                     }
                 }
             } else {
@@ -86,14 +84,16 @@ struct LCTabView: View {
                             Label("lc.tabView.apps".loc, systemImage: "square.stack.3d.up.fill")
                         }
                         .tag(LCTabIdentifier.apps)
+                    
                     EmberMirrorView()
                         .tabItem {
                             Label("Mirror", systemImage: "airplayvideo")
                         }
                         .tag(LCTabIdentifier.mirror)
+                    
                     if DataManager.shared.model.multiLCStatus != 2 {
                         LCTweaksView(tweakFolders: $tweakFolderNames)
-                            .tabItem{
+                            .tabItem {
                                 Label("lc.tabView.tweaks".loc, systemImage: "wrench.and.screwdriver")
                             }
                             .tag(LCTabIdentifier.tweaks)
@@ -107,11 +107,12 @@ struct LCTabView: View {
                 }
             }
         }
+        .tint(EmberTheme.accent)
+        .preferredColorScheme(.dark)
         .downloadAlert(helper: downloadHelper)
         .environmentObject(downloadHelper)
-        .alert("lc.common.error".loc, isPresented: $errorShow){
-            Button("lc.common.ok".loc, action: {
-            })
+        .alert("lc.common.error".loc, isPresented: $errorShow) {
+            Button("lc.common.ok".loc, action: {})
             Button("lc.common.copy".loc, action: {
                 copyError()
             })

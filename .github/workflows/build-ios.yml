@@ -82,7 +82,7 @@ jobs:
           FILE_SHARING=$(/usr/libexec/PlistBuddy -c "Print :UIFileSharingEnabled" "$INFO")
           EXTENSION_COUNT=$(find "$APP/PlugIns" -mindepth 1 -maxdepth 1 -type d -name '*.appex' | wc -l | tr -d ' ')
 
-          test "$DISPLAY_NAME" = "Ember Connect"
+          test "$DISPLAY_NAME" = "Ember Connect Mobile"
           test "$BUNDLE_ID" = "com.emberwave.EmberConnectMobile"
           test "$FILE_SHARING" = "true"
           test "$EXTENSION_COUNT" = "1"

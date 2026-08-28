@@ -59,102 +59,110 @@ struct LCAppBanner : View {
     @State private var mainHueColor: CGFloat? = nil
     
     var body: some View {
+        HStack(spacing: 14) {
+            IconImageView(icon: icon)
+                .frame(width: 58, height: 58)
+                .shadow(color: Color.black.opacity(0.4), radius: 6, x: 0, y: 3)
 
-        HStack {
-            HStack {
-                IconImageView(icon: icon)
-                    .frame(width: 60, height: 60)
-
-                VStack (alignment: .leading, content: {
-                    let color = (dynamicColors ? mainColor : Color("FontColor"))
-                    // note: keep this so the color updates when toggling dark mode
-                    let textColor = colorScheme == .dark ? color.readableTextColor() : color.readableTextColor()
-                    HStack {
-                        Text(model.displayName).font(.system(size: 16)).bold()
-                        if model.uiIsShared {
-                            Image(systemName: "arrowshape.turn.up.left.fill")
-                                .font(.system(size: 8))
-                                .foregroundColor(.white)
-                                .frame(width: 16, height:16)
-                                .background(
-                                    Capsule().fill(Color("BadgeColor"))
-                                )
-                        }
-                        if model.uiIsJITNeeded {
-                            Image(systemName: "bolt.fill")
-                                .font(.system(size: 8))
-                                .foregroundColor(.white)
-                                .frame(width: 16, height:16)
-                                .background(
-                                    Capsule().fill(Color("JITBadgeColor"))
-                                )
-                        }
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(model.displayName)
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.white)
+                        .lineLimit(1)
+                    
+                    if model.uiIsShared {
+                        Image(systemName: "arrowshape.turn.up.left.fill")
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 15, height: 15)
+                            .background(Circle().fill(EmberTheme.cyan))
+                    }
+                    if model.uiIsJITNeeded {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(.black)
+                            .frame(width: 15, height: 15)
+                            .background(Circle().fill(EmberTheme.warning))
+                    }
 #if is32BitSupported
-                        if model.uiIs32bit {
-                            Text("32")
-                                .font(.system(size: 8))
-                                .foregroundColor(.white)
-                                .frame(width: 16, height:16)
-                                .background(
-                                    Capsule().fill(Color("32BitBadgeColor"))
-                                )
-                        }
+                    if model.uiIs32bit {
+                        Text("32")
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 15, height: 15)
+                            .background(Circle().fill(Color.purple))
+                    }
 #endif
-                        if model.uiIsLocked && !model.uiIsHidden {
-                            Image(systemName: "lock.fill")
-                                .font(.system(size: 8))
-                                .foregroundColor(.white)
-                                .frame(width: 16, height:16)
-                                .background(
-                                    Capsule().fill(Color("BadgeColor"))
-                                )
-                        }
+                    if model.uiIsLocked && !model.uiIsHidden {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 15, height: 15)
+                            .background(Circle().fill(EmberTheme.danger))
                     }
+                }
 
-                    Text("\(model.version) - \(model.bundleIdentifier)").font(.system(size: 12)).foregroundColor(textColor)
-                    if !model.uiRemark.isEmpty {
-                        Text(model.uiRemark)
-                            .font(.system(size: 10))
-                            .foregroundColor(textColor.opacity(0.8))
-                            .lineLimit(1)
+                Text("\(model.version) • \(model.bundleIdentifier)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.6))
+                    .lineLimit(1)
+                
+                if !model.uiRemark.isEmpty {
+                    Text(model.uiRemark)
+                        .font(.system(size: 10))
+                        .foregroundStyle(EmberTheme.accentHi.opacity(0.9))
+                        .lineLimit(1)
+                }
+                
+                if let containerName = model.uiSelectedContainer?.name {
+                    HStack(spacing: 4) {
+                        Image(systemName: "internaldrive")
+                            .font(.system(size: 8))
+                        Text(containerName)
+                            .font(.system(size: 9, weight: .medium))
                     }
-                    Text(model.uiSelectedContainer?.name ?? "lc.appBanner.noDataFolder".loc).font(.system(size: 8)).foregroundColor(textColor)
-                })
+                    .foregroundStyle(Color.white.opacity(0.45))
+                }
             }
-            .allowsHitTesting(false)
+            
             Spacer()
+            
+            // Launch Action Button
             ZStack {
                 if !model.isSigningInProgress {
-                    Text("lc.appBanner.run".loc).bold().foregroundColor(.white)
-                        .lineLimit(1)
-                        .frame(height:32)
-                        .minimumScaleFactor(0.1)
+                    Text("OPEN")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
                 } else {
-                    ProgressView().progressViewStyle(.circular)
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .tint(.white)
+                        .scaleEffect(0.8)
                 }
-
             }
-            .buttonStyle(BasicButtonStyle())
-            .padding()
-            .frame(idealWidth: 70)
-            .frame(height: 32)
-            .fixedSize()
-            .background(GeometryReader { g in
-                if !model.isSigningInProgress {
-                    Capsule().fill(dynamicColors ? mainColor : Color("FontColor"))
-                } else {
-                    let w = g.size.width
-                    let h = g.size.height
-                    Capsule()
-                        .fill(dynamicColors ? mainColor : Color("FontColor")).opacity(0.2)
-                    Circle()
-                        .fill(dynamicColors ? mainColor : Color("FontColor"))
-                        .frame(width: w * 2, height: w * 2)
-                        .offset(x: (model.signProgress - 2) * w, y: h/2-w)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(
+                Group {
+                    if model.isSigningInProgress {
+                        Capsule().fill(Color.white.opacity(0.15))
+                    } else if dynamicColors && mainColor != .clear {
+                        LinearGradient(
+                            colors: [mainColor, mainColor.opacity(0.8)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    } else {
+                        EmberTheme.flameGradient
+                    }
                 }
-
-            })
+            )
             .clipShape(Capsule())
+            .overlay(
+                Capsule().stroke(Color.white.opacity(0.2), lineWidth: 0.8)
+            )
+            .shadow(color: (dynamicColors && mainColor != .clear ? mainColor : EmberTheme.accent).opacity(0.35), radius: 6, x: 0, y: 2)
             .contentShape(Capsule())
             .onTapGesture {
                 if #available(iOS 16.0, *) {
@@ -172,17 +180,32 @@ struct LCAppBanner : View {
                         }
                     }
                     
-                    Task{ await runApp() }
+                    Task { await runApp() }
                 } else {
-                    Task{ await runApp() }
+                    Task { await runApp() }
                 }
             }
             .disabled(model.isAppRunning)
         }
-        .padding()
-        .frame(height: 88)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
         .background {
-            RoundedRectangle(cornerSize: CGSize(width:22, height: 22)).fill(dynamicColors ? mainColor.opacity(0.5) : Color("AppBannerBG"))
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            EmberTheme.surface1.opacity(0.9),
+                            (dynamicColors && mainColor != .clear ? mainColor.opacity(0.15) : EmberTheme.surface2.opacity(0.7))
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.35), radius: 8, x: 0, y: 3)
                 .onTapGesture(count: 2) {
                     openSettings()
                 }

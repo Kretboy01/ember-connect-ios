@@ -2,35 +2,227 @@ import ReplayKit
 import SwiftUI
 import UIKit
 
-/// Ember Connect's screen-mirroring controls. The actual capture and H.264
-/// transport live in the embedded EmberConnectBroadcast ReplayKit extension.
+/// Ember Connect's screen-mirroring dashboard.
+/// Leverages the embedded EmberConnectBroadcast ReplayKit extension to stream
+/// hardware H.264 video at 60fps directly over USB (usbmux) or Wi-Fi.
 struct EmberMirrorView: View {
+    @State private var isPulsing = false
+    
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    Image(systemName: "airplayvideo")
-                        .font(.system(size: 52))
-                        .foregroundStyle(.orange)
-
-                    Text("Mirror this iPhone")
-                        .font(.title2.bold())
-
-                    Text("Keep Ember Connect Desktop open, then start the broadcast here. The desktop connects over USB or your local network and displays the phone at full frame rate.")
-                        .foregroundStyle(.secondary)
-
-                    EmberBroadcastButton()
-
-                    Text("The broadcast continues while you open and use guest apps inside Ember Connect.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+            ZStack {
+                // Background dark obsidian canvas
+                EmberTheme.bgBase.ignoresSafeArea()
+                
+                // Ambient radiant mesh in top corner
+                EmberTheme.heroMeshGradient
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        
+                        // MARK: - Hero Broadcast Card
+                        VStack(alignment: .leading, spacing: 16) {
+                            HStack(alignment: .top) {
+                                ZStack {
+                                    Circle()
+                                        .fill(EmberTheme.accent.opacity(0.15))
+                                        .frame(width: 56, height: 56)
+                                        .scaleEffect(isPulsing ? 1.15 : 0.95)
+                                        .animation(
+                                            .easeInOut(duration: 1.8).repeatForever(autoreverses: true),
+                                            value: isPulsing
+                                        )
+                                    
+                                    Circle()
+                                        .fill(EmberTheme.flameGradient)
+                                        .frame(width: 44, height: 44)
+                                        .shadow(color: EmberTheme.accentGlow, radius: 10, x: 0, y: 3)
+                                    
+                                    Image(systemName: "airplayvideo")
+                                        .font(.system(size: 20, weight: .bold))
+                                        .foregroundStyle(.white)
+                                }
+                                
+                                Spacer()
+                                
+                                // Live Ready Badge
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(EmberTheme.success)
+                                        .frame(width: 8, height: 8)
+                                    Text("60 FPS READY")
+                                        .font(.system(size: 10, weight: .heavy, design: .rounded))
+                                        .foregroundStyle(EmberTheme.success)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    Capsule()
+                                        .fill(EmberTheme.success.opacity(0.12))
+                                        .overlay(Capsule().stroke(EmberTheme.success.opacity(0.25), lineWidth: 1))
+                                )
+                            }
+                            
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Live Screen Mirroring")
+                                    .font(.system(.title2, design: .rounded).weight(.bold))
+                                    .foregroundStyle(Color.white)
+                                
+                                Text("Stream your iPhone display in real-time hardware H.264 directly to Ember Connect Desktop.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(Color.white.opacity(0.7))
+                                    .lineSpacing(2)
+                            }
+                            
+                            // Tech Spec Pills
+                            HStack(spacing: 8) {
+                                SpecPill(icon: "bolt.fill", text: "Hardware H.264")
+                                SpecPill(icon: "cable.connector", text: "Direct USB / usbmux")
+                                SpecPill(icon: "gauge.with.needle", text: "Zero Lag")
+                            }
+                            
+                            Divider()
+                                .background(EmberTheme.borderSubtle)
+                                .padding(.vertical, 2)
+                            
+                            // Glowing Broadcast Action Button
+                            EmberBroadcastButton()
+                        }
+                        .padding(20)
+                        .emberGlassCard(cornerRadius: 22, withGlow: true)
+                        
+                        // MARK: - Connection Methods Section
+                        Text("Connection Transport")
+                            .font(.system(.headline, design: .rounded).weight(.bold))
+                            .foregroundStyle(Color.white)
+                            .padding(.horizontal, 4)
+                        
+                        VStack(spacing: 12) {
+                            ConnectionGuideCard(
+                                icon: "cable.connector.horizontal",
+                                iconColor: EmberTheme.accent,
+                                title: "USB usbmux (Recommended)",
+                                subtitle: "Connect Lightning or USB-C cable. Zero configuration needed; desktop auto-connects to port 7878 with crystal-clear 60fps."
+                            )
+                            
+                            ConnectionGuideCard(
+                                icon: "wifi",
+                                iconColor: EmberTheme.cyan,
+                                title: "Local Wi-Fi Network",
+                                subtitle: "Ensure iPhone and Desktop are on the same subnet. Connect wirelessly with EMBER_MIRROR_HOST set to your device IP."
+                            )
+                        }
+                        
+                        // MARK: - Live Container Compatibility Tip
+                        HStack(alignment: .top, spacing: 14) {
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 20, weight: .bold))
+                                .foregroundStyle(EmberTheme.accentHi)
+                                .padding(10)
+                                .background(
+                                    Circle().fill(EmberTheme.accent.opacity(0.15))
+                                )
+                            
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Multitasking Supported")
+                                    .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                                    .foregroundStyle(Color.white)
+                                
+                                Text("The ReplayKit broadcast stays active system-wide even when you leave Ember Connect or launch guest apps.")
+                                    .font(.footnote)
+                                    .foregroundStyle(Color.white.opacity(0.65))
+                                    .lineSpacing(2)
+                            }
+                        }
+                        .padding(16)
+                        .emberGlassCard(cornerRadius: 16)
+                        
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
             }
             .navigationTitle("Screen Mirror")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "flame.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(EmberTheme.accent)
+                        Text("Ember Mirror")
+                            .font(.system(.headline, design: .rounded).weight(.bold))
+                            .foregroundStyle(Color.white)
+                    }
+                }
+            }
+            .onAppear {
+                isPulsing = true
+            }
         }
         .navigationViewStyle(StackNavigationViewStyle())
+    }
+}
+
+// MARK: - Supporting Views
+
+private struct SpecPill: View {
+    let icon: String
+    let text: String
+    
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(EmberTheme.accentHi)
+            Text(text)
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.white.opacity(0.9))
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            Capsule()
+                .fill(Color.white.opacity(0.06))
+                .overlay(Capsule().stroke(Color.white.opacity(0.1), lineWidth: 0.5))
+        )
+    }
+}
+
+private struct ConnectionGuideCard: View {
+    let icon: String
+    let iconColor: Color
+    let title: String
+    let subtitle: String
+    
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(iconColor)
+                .frame(width: 36, height: 36)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(iconColor.opacity(0.12))
+                )
+            
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(.subheadline, design: .rounded).weight(.semibold))
+                    .foregroundStyle(Color.white)
+                
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(Color.white.opacity(0.6))
+                    .lineSpacing(2)
+            }
+            
+            Spacer()
+        }
+        .padding(14)
+        .emberGlassCard(cornerRadius: 14)
     }
 }
 
@@ -110,29 +302,22 @@ private struct EmberBroadcastButton: View {
             } label: {
                 HStack(spacing: 12) {
                     Image(systemName: isAvailable ? "record.circle" : "exclamationmark.triangle.fill")
-                        .font(.title2)
+                        .font(.system(size: 20, weight: .bold))
+                    
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(isAvailable ? "Start Mirroring" : "Mirroring Unavailable")
-                            .font(.headline)
-                        Text(isAvailable ? "Open the system broadcast sheet" : "Broadcast extension is missing")
+                        Text(isAvailable ? "Start Broadcast Stream" : "Mirroring Extension Missing")
+                            .font(.system(.headline, design: .rounded).weight(.bold))
+                        Text(isAvailable ? "Tap to open system broadcast picker" : "Reinstall with ReplayKit extension")
                             .font(.caption)
                             .opacity(0.85)
                     }
+                    
                     Spacer()
+                    
                     Image(systemName: "chevron.right")
+                        .font(.system(size: 14, weight: .bold))
                 }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 14)
-                .frame(maxWidth: .infinity)
-                .background(
-                    LinearGradient(
-                        colors: isAvailable ? [.orange, .red] : [.gray, Color(white: 0.25)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .emberFlameButton(isEnabled: isAvailable)
             }
             .buttonStyle(.plain)
             .disabled(!isAvailable)
@@ -147,7 +332,7 @@ private struct EmberBroadcastButton: View {
             if !isAvailable {
                 Text("Reinstall Ember Connect Mobile from an IPA that contains EmberConnectBroadcast.appex.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(EmberTheme.danger)
             }
         }
         .alert("Could not open the broadcast picker", isPresented: $showError) {

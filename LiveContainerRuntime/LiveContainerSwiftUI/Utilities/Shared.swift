@@ -94,11 +94,8 @@ class SharedModel: ObservableObject {
     public static let keychainAccessGroupCount = 128
     
     func updateMultiLCStatus() {
-        if LCUtils.appUrlScheme()?.lowercased() != "livecontainer" {
-            multiLCStatus = 2
-        } else {
-            multiLCStatus = 0
-        }
+        // Ember Connect Mobile is always the primary host container
+        multiLCStatus = 0
     }
     
     init() {
