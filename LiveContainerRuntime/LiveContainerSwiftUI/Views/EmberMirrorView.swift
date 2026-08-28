@@ -1,3 +1,4 @@
+import Network
 import ReplayKit
 import SwiftUI
 import UIKit
@@ -111,7 +112,7 @@ struct EmberMirrorView: View {
                                 icon: "wifi",
                                 iconColor: EmberTheme.cyan,
                                 title: "Local Wi-Fi Network",
-                                subtitle: "Ensure iPhone and Desktop are on the same subnet. Connect wirelessly with EMBER_MIRROR_HOST set to your device IP."
+                                subtitle: "Same Wi-Fi network, no setup: this iPhone advertises itself and the desktop finds it. Allow Local Network access when iOS asks. Set EMBER_MIRROR_HOST on the desktop to pin an address instead."
                             )
                         }
                         
@@ -160,10 +161,73 @@ struct EmberMirrorView: View {
             }
             .onAppear {
                 isPulsing = true
+                LocalNetworkPermissionPrimer.shared.prime()
             }
         }
         .navigationViewStyle(StackNavigationViewStyle())
     }
+}
+
+// MARK: - Local network permission
+
+/// Provokes iOS's Local Network permission prompt from the *app*.
+///
+/// The broadcast extension needs this permission to advertise itself over
+/// Bonjour, but an extension has no way to present the prompt — so if it is
+/// the first thing to ask, the request is simply denied and wireless
+/// discovery never works. Browsing for the same service here, from a screen
+/// the user has deliberately opened, puts the dialog in front of them at a
+/// moment when it makes sense.
+///
+/// Failure is not reported: USB does not need this, and the extension falls
+/// back to an unadvertised listener if the permission never arrives.
+private final class LocalNetworkPermissionPrimer {
+    static let shared = LocalNetworkPermissionPrimer()
+
+    private var browser: NWBrowser?
+    private var hasPrimed = false
+
+    func prime() {
+        guard !hasPrimed else { return }
+        hasPrimed = true
+
+        let parameters = NWParameters()
+        parameters.includePeerToPeer = false
+        let descriptor = NWBrowser.Descriptor.bonjour(
+            type: MirrorBonjour.type,
+            domain: nil
+        )
+        let browser = NWBrowser(for: descriptor, using: parameters)
+        self.browser = browser
+
+        browser.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.stop()
+            default:
+                break
+            }
+        }
+        browser.start(queue: .main)
+
+        // The prompt appears as soon as the browse starts; there is nothing to
+        // do with the results, so do not keep a multicast browser running
+        // behind the user's back.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.stop()
+        }
+    }
+
+    private func stop() {
+        browser?.cancel()
+        browser = nil
+    }
+}
+
+/// Duplicated from `Shared/MirrorProtocol.swift`, which is compiled into the
+/// broadcast extension only — the host app target does not see it.
+private enum MirrorBonjour {
+    static let type = "_ember-mirror._tcp"
 }
 
 // MARK: - Supporting Views
@@ -255,17 +319,35 @@ private final class EmberBroadcastPickerController: ObservableObject {
         return nil
     }
 
-    private func findButton(in view: UIView) -> UIButton? {
-        if let button = view as? UIButton { return button }
+    /// Finds the control inside `RPSystemBroadcastPickerView` that actually
+    /// opens the system sheet.
+    ///
+    /// The picker's own bounds are mostly transparent padding — only its inner
+    /// button is a hit target — which is why laying it across a full-width row
+    /// and expecting taps to land does not work. It is parked at 1 pt instead
+    /// and its control invoked directly.
+    ///
+    /// `UIControl` rather than `UIButton`: the private hierarchy is not API and
+    /// has changed shape across iOS releases. Every control it has ever used is
+    /// a `UIControl`, and matching on the broader type survives the next
+    /// reshuffle.
+    private func findControl(in view: UIView) -> UIControl? {
+        if let control = view as? UIControl { return control }
         for subview in view.subviews {
-            if let button = findButton(in: subview) { return button }
+            if let control = findControl(in: subview) { return control }
         }
         return nil
     }
 
     func present() -> Bool {
-        guard let pickerView, let button = findButton(in: pickerView) else { return false }
-        button.sendActions(for: .touchUpInside)
+        guard let pickerView else { return false }
+
+        // Lay out first: the control is created lazily, so on the very first
+        // tap it may not exist yet in a view that has never been laid out.
+        pickerView.layoutIfNeeded()
+
+        guard let control = findControl(in: pickerView) else { return false }
+        control.sendActions(for: .touchUpInside)
         return true
     }
 }

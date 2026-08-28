@@ -15,6 +15,9 @@ final class MirrorServer {
     private var connections: [ObjectIdentifier: Client] = [:]
     private let lock = NSLock()
     private let port: UInt16
+    /// Set once the listener has been rebuilt without its Bonjour service —
+    /// see `start(advertise:)`. Bounds the retry to a single attempt.
+    private var advertisementDisabled = false
 
     /// A connected desktop, plus the state needed to keep it from becoming a
     /// memory leak when it cannot keep up.
@@ -48,6 +51,21 @@ final class MirrorServer {
     // MARK: - Lifecycle
 
     func start() {
+        start(advertise: true)
+    }
+
+    /// - Parameter advertise: publish `_ember-mirror._tcp` so a desktop on the
+    ///   same network can find the phone without being told its address.
+    ///
+    ///   Advertising is *not* free: since iOS 14 registering a Bonjour service
+    ///   requires local-network permission, and a broadcast extension has no
+    ///   way to present the prompt that grants it. If the user has not already
+    ///   allowed the containing app, `NWListener` fails outright — taking the
+    ///   plain TCP listener down with it and killing mirroring over USB, which
+    ///   never needed the network in the first place. So a failure while
+    ///   advertising retries once without it: discovery is a convenience,
+    ///   the socket is the product.
+    private func start(advertise: Bool) {
         guard listener == nil else { return }
 
         let parameters = NWParameters.tcp
@@ -65,20 +83,36 @@ final class MirrorServer {
             return
         }
 
-        created.service = NWListener.Service(name: "EmberConnectMirror", type: "_ember-mirror._tcp")
+        if advertise && !advertisementDisabled {
+            created.service = NWListener.Service(name: MirrorProtocol.bonjourName,
+                                                 type: MirrorProtocol.bonjourType)
+        }
 
         created.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
-        // Captures the port by value rather than self — the listener holds
-        // this closure for its lifetime, so capturing self would keep the
-        // server alive after the broadcast ends.
+        // `self` is captured weakly, not strongly: the listener holds this
+        // closure for its lifetime, so a strong capture would keep the server
+        // alive after the broadcast ends.
         let boundPort = port
-        created.stateUpdateHandler = { state in
+        let advertising = created.service != nil
+        created.stateUpdateHandler = { [weak self] state in
             switch state {
-            case .ready: NSLog("[Mirror] listening on \(boundPort)")
-            case .failed(let error): NSLog("[Mirror] listener failed: \(error)")
-            default: break
+            case .ready:
+                NSLog("[Mirror] listening on \(boundPort)\(advertising ? " (advertised)" : "")")
+            case .failed(let error):
+                NSLog("[Mirror] listener failed: \(error)")
+                guard let self else { return }
+                if advertising {
+                    // Almost certainly local-network permission. Drop the
+                    // advertisement and come back up as a plain socket.
+                    NSLog("[Mirror] retrying without Bonjour advertisement")
+                    self.advertisementDisabled = true
+                    self.stop()
+                    self.start(advertise: false)
+                }
+            default:
+                break
             }
         }
 
@@ -141,11 +175,13 @@ final class MirrorServer {
 
     func send(type: MirrorProtocol.PacketType,
               payload: Data,
-              width: Int,
-              height: Int,
-              timestampMicros: UInt64) {
+              width: Int = 0,
+              height: Int = 0,
+              flags: UInt8 = 0,
+              timestampMicros: UInt64 = 0) {
         let header = MirrorProtocol.Header(
             type: type,
+            flags: flags,
             width: UInt16(clamping: width),
             height: UInt16(clamping: height),
             timestampMicros: timestampMicros,

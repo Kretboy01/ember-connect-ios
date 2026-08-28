@@ -96,6 +96,7 @@
 	<string>The guest app is requesting for this permission.</string>
 	<key>NSBonjourServices</key>
 	<array>
+		<string>_ember-mirror._tcp</string>
 		<string>_airplay._tcp</string>
 		<string>_raop._tcp</string>
 		<string>_companion-link._tcp</string>

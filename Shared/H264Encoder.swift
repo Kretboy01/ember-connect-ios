@@ -14,7 +14,12 @@ import CoreMedia
 final class H264Encoder {
     /// Called for every encoded frame. `isKeyframe` lets the caller tag the
     /// packet so a late-joining decoder knows where it may start.
-    var onEncodedFrame: ((Data, Bool, CMTime) -> Void)?
+    ///
+    /// The dimensions travel with the frame rather than being read back off
+    /// the encoder: VideoToolbox invokes this from its own thread, and a
+    /// rotation that rebuilds the session mid-flight would otherwise let a
+    /// frame be published with the *next* resolution in its header.
+    var onEncodedFrame: ((Data, Bool, CMTime, Int, Int) -> Void)?
     /// Called whenever the parameter sets change, including once before the
     /// first frame.
     var onFormat: ((Data, Int, Int) -> Void)?
@@ -34,7 +39,10 @@ final class H264Encoder {
     }
 
     deinit {
-        invalidate()
+        // Not via `queue`: nothing else can hold a reference at this point,
+        // and a `sync` from whatever thread released the last one risks
+        // deadlocking if that thread *is* the encoder queue.
+        tearDown()
     }
 
     // MARK: - Session lifecycle
@@ -47,7 +55,7 @@ final class H264Encoder {
             return true
         }
 
-        invalidate()
+        tearDown()
 
         var newSession: VTCompressionSession?
         let status = VTCompressionSessionCreate(
@@ -105,7 +113,14 @@ final class H264Encoder {
         return true
     }
 
+    /// Tears the session down. Safe to call from any thread — `encode` holds
+    /// the same queue, and VideoToolbox is not re-entrant.
     func invalidate() {
+        queue.sync { tearDown() }
+    }
+
+    /// Caller must already hold `queue`.
+    private func tearDown() {
         if let session {
             VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(session)
@@ -128,6 +143,11 @@ final class H264Encoder {
             guard prepare(width: bufferWidth, height: bufferHeight),
                   let session else { return }
 
+            // Snapshot under the queue: `handleEncoded` runs on VideoToolbox's
+            // thread, where `self.width` may already describe a newer session.
+            let encodedWidth = width
+            let encodedHeight = height
+
             var frameProperties: CFDictionary?
             if forceNextKeyframe {
                 frameProperties = [
@@ -145,7 +165,7 @@ final class H264Encoder {
                 infoFlagsOut: nil
             ) { [weak self] status, _, encoded in
                 guard status == noErr, let encoded else { return }
-                self?.handleEncoded(encoded)
+                self?.handleEncoded(encoded, width: encodedWidth, height: encodedHeight)
             }
         }
     }
@@ -163,7 +183,7 @@ final class H264Encoder {
         }
     }
 
-    private func handleEncoded(_ sampleBuffer: CMSampleBuffer) {
+    private func handleEncoded(_ sampleBuffer: CMSampleBuffer, width: Int, height: Int) {
         guard CMSampleBufferDataIsReady(sampleBuffer),
               let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
 
@@ -192,7 +212,11 @@ final class H264Encoder {
         let avcc = Data(bytes: dataPointer, count: totalLength)
         guard let annexB = Self.convertToAnnexB(avcc) else { return }
 
-        onEncodedFrame?(annexB, isKeyframe, CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        onEncodedFrame?(annexB,
+                        isKeyframe,
+                        CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+                        width,
+                        height)
     }
 
     // MARK: - Bitstream helpers
