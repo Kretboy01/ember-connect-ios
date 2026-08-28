@@ -1,0 +1,11 @@
+# Xcode / XcodeGen
+EmberConnectMobile.xcodeproj/
+DerivedData/
+build/
+Payload/
+*.ipa
+
+# Downloaded CI output
+artifacts/
+
+.DS_Store

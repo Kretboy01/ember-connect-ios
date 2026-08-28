@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: macos-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,22 +19,45 @@ jobs:
       - name: Generate Xcode Project
         run: xcodegen generate
 
-      - name: Build IPA
+      - name: Build
+        # Uses -derivedDataPath rather than overriding CONFIGURATION_BUILD_DIR.
+        # Forcing every target into one flat directory stops Xcode from nesting
+        # the broadcast extension inside the app, and the .ipa then ships
+        # without it — the app installs but mirroring silently does nothing.
         run: |
           xcodebuild clean build \
             -project EmberConnectMobile.xcodeproj \
             -scheme EmberConnectMobile \
             -sdk iphoneos \
             -configuration Release \
+            -derivedDataPath DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            EXCLUDED_ARCHS="armv7" \
-            CONFIGURATION_BUILD_DIR="$(pwd)/build"
-            
+            EXCLUDED_ARCHS="armv7"
+
+      - name: Verify the broadcast extension was embedded
+        run: |
+          APP="DerivedData/Build/Products/Release-iphoneos/EmberConnectMobile.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::App bundle not found at $APP"
+            exit 1
+          fi
+          if [ ! -d "$APP/PlugIns/EmberConnectBroadcast.appex" ]; then
+            echo "::error::Broadcast extension missing — screen mirroring would not work."
+            ls -R "$APP/PlugIns" || true
+            exit 1
+          fi
+          echo "Extension embedded:"
+          ls -la "$APP/PlugIns"
+
+      - name: Package IPA
+        run: |
+          APP="DerivedData/Build/Products/Release-iphoneos/EmberConnectMobile.app"
           mkdir -p Payload
-          mv build/EmberConnectMobile.app Payload/
-          zip -r EmberConnectMobile.ipa Payload
+          cp -R "$APP" Payload/
+          zip -qr EmberConnectMobile.ipa Payload
+          echo "IPA size: $(du -h EmberConnectMobile.ipa | cut -f1)"
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4

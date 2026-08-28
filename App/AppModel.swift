@@ -10,72 +10,142 @@ struct GuestApp: Identifiable {
     let version: String
 }
 
-class AppModel: ObservableObject {
-    @Published var apps: [GuestApp] = []
-    
-    func loadApps() {
+@MainActor
+final class AppModel: ObservableObject {
+    @Published private(set) var apps: [GuestApp] = []
+    @Published private(set) var isLoading = false
+    /// Surfaced in the UI. Previously every failure here went to `print`,
+    /// where nobody would ever see it.
+    @Published var lastError: String?
+
+    private var hasLoadedOnce = false
+
+    /// Where the desktop drops IPAs for pickup, relative to the app's
+    /// Documents folder (which is what `install_to_container_operation`
+    /// writes into over AFC).
+    private static let autoInstallDirName = "AutoInstall"
+    private static let appsDirName = "Apps"
+
+    func loadIfNeeded() {
+        guard !hasLoadedOnce else { return }
+        hasLoadedOnce = true
+        Task { await load() }
+    }
+
+    func reload() {
+        Task { await load() }
+    }
+
+    /// Scans for guest apps, installing anything the desktop has dropped into
+    /// `AutoInstall/` first.
+    ///
+    /// All of this is file I/O and zip extraction. It used to run inline on
+    /// the main thread from `onAppear`, so unpacking a large IPA froze the UI
+    /// for the duration.
+    func load() async {
+        isLoading = true
+        lastError = nil
+
+        let result = await Task.detached(priority: .userInitiated) { () -> Result<[GuestApp], Error> in
+            do {
+                return .success(try Self.scanDisk())
+            } catch {
+                return .failure(error)
+            }
+        }.value
+
+        switch result {
+        case .success(let loaded):
+            apps = loaded.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        case .failure(let error):
+            lastError = error.localizedDescription
+        }
+
+        isLoading = false
+    }
+
+    // MARK: - Disk work (runs off the main actor)
+
+    private nonisolated static func scanDisk() throws -> [GuestApp] {
         let fileManager = FileManager.default
-        guard let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
-        
-        let appsDir = documentsURL.appendingPathComponent("Apps")
-        let autoInstallDir = documentsURL.appendingPathComponent("AutoInstall")
-        
-        if !fileManager.fileExists(atPath: appsDir.path) {
-            try? fileManager.createDirectory(at: appsDir, withIntermediateDirectories: true)
+        guard let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            throw MirrorError.noDocumentsDirectory
         }
-        if !fileManager.fileExists(atPath: autoInstallDir.path) {
-            try? fileManager.createDirectory(at: autoInstallDir, withIntermediateDirectories: true)
+
+        let appsDir = documentsURL.appendingPathComponent(appsDirName)
+        let autoInstallDir = documentsURL.appendingPathComponent(autoInstallDirName)
+
+        for dir in [appsDir, autoInstallDir] where !fileManager.fileExists(atPath: dir.path) {
+            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
         }
-        
-        // Auto-install IPAs
-        if let autoIPAs = try? fileManager.contentsOfDirectory(at: autoInstallDir, includingPropertiesForKeys: nil) {
-            for ipaURL in autoIPAs where ipaURL.pathExtension == "ipa" {
-                print("Auto-installing: \(ipaURL.lastPathComponent)")
-                let tempExtract = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-                do {
-                    try fileManager.unzipItem(at: ipaURL, to: tempExtract)
-                    let payloadDir = tempExtract.appendingPathComponent("Payload")
-                    if let appsInPayload = try? fileManager.contentsOfDirectory(at: payloadDir, includingPropertiesForKeys: nil) {
-                        for app in appsInPayload where app.pathExtension == "app" {
-                            let dest = appsDir.appendingPathComponent(app.lastPathComponent)
-                            if fileManager.fileExists(atPath: dest.path) {
-                                try fileManager.removeItem(at: dest)
-                            }
-                            try fileManager.moveItem(at: app, to: dest)
-                            print("Successfully installed \(app.lastPathComponent)")
-                        }
+
+        install(from: autoInstallDir, into: appsDir, fileManager: fileManager)
+
+        let contents = try fileManager.contentsOfDirectory(at: appsDir, includingPropertiesForKeys: nil)
+        return contents.compactMap { item -> GuestApp? in
+            guard item.pathExtension == "app" else { return nil }
+            let infoPlistPath = item.appendingPathComponent("Info.plist")
+            guard let dict = NSDictionary(contentsOf: infoPlistPath) else { return nil }
+            let name = dict["CFBundleDisplayName"] as? String
+                ?? dict["CFBundleName"] as? String
+                ?? item.deletingPathExtension().lastPathComponent
+            return GuestApp(
+                name: name,
+                bundleId: dict["CFBundleIdentifier"] as? String ?? "unknown",
+                path: item.path,
+                version: dict["CFBundleShortVersionString"] as? String ?? "1.0"
+            )
+        }
+    }
+
+    /// Unpacks every IPA in `source` into `destination`.
+    ///
+    /// A failure on one IPA must not abort the rest of the scan, so each is
+    /// handled independently and a broken archive is left in place rather than
+    /// deleted — otherwise the evidence disappears and the app simply appears
+    /// to ignore it.
+    private nonisolated static func install(from source: URL, into destination: URL, fileManager: FileManager) {
+        guard let entries = try? fileManager.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) else {
+            return
+        }
+
+        for ipaURL in entries where ipaURL.pathExtension.lowercased() == "ipa" {
+            let scratch = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? fileManager.removeItem(at: scratch) }
+
+            do {
+                try fileManager.unzipItem(at: ipaURL, to: scratch)
+                let payloadDir = scratch.appendingPathComponent("Payload")
+                let payload = try fileManager.contentsOfDirectory(at: payloadDir, includingPropertiesForKeys: nil)
+
+                var installedAny = false
+                for app in payload where app.pathExtension == "app" {
+                    let target = destination.appendingPathComponent(app.lastPathComponent)
+                    if fileManager.fileExists(atPath: target.path) {
+                        try fileManager.removeItem(at: target)
                     }
-                    try fileManager.removeItem(at: ipaURL) // delete IPA after install
-                    try fileManager.removeItem(at: tempExtract) // clean up temp
-                } catch {
-                    print("Failed to unzip \(ipaURL.lastPathComponent): \(error)")
+                    try fileManager.moveItem(at: app, to: target)
+                    installedAny = true
                 }
+
+                // Only consume the IPA once something was actually extracted.
+                if installedAny {
+                    try? fileManager.removeItem(at: ipaURL)
+                }
+            } catch {
+                NSLog("[EmberConnect] could not install \(ipaURL.lastPathComponent): \(error)")
             }
         }
-        
-        do {
-            let contents = try fileManager.contentsOfDirectory(at: appsDir, includingPropertiesForKeys: nil)
-            var loadedApps: [GuestApp] = []
-            
-            for item in contents {
-                if item.pathExtension == "app" {
-                    let infoPlistPath = item.appendingPathComponent("Info.plist")
-                    if let dict = NSDictionary(contentsOf: infoPlistPath) {
-                        let name = dict["CFBundleDisplayName"] as? String ?? dict["CFBundleName"] as? String ?? item.lastPathComponent
-                        let bundleId = dict["CFBundleIdentifier"] as? String ?? "unknown"
-                        let version = dict["CFBundleShortVersionString"] as? String ?? "1.0"
-                        
-                        loadedApps.append(GuestApp(name: name, bundleId: bundleId, path: item.path, version: version))
-                    }
-                }
-            }
-            
-            DispatchQueue.main.async {
-                self.apps = loadedApps
-            }
-            
-        } catch {
-            print("Failed to load apps: \(error)")
+    }
+}
+
+enum MirrorError: LocalizedError {
+    case noDocumentsDirectory
+
+    var errorDescription: String? {
+        switch self {
+        case .noDocumentsDirectory:
+            return "This app has no Documents directory, so it cannot store apps."
         }
     }
 }

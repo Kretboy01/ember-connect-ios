@@ -1,10 +1,16 @@
 #import <Foundation/Foundation.h>
 
+NS_ASSUME_NONNULL_BEGIN
+
 @interface ECRuntime : NSObject
 
-// Launches the executable inside the guest .app bundle.
-// Note: This requires the host app to have get-task-allow entitlement
-// and for JIT to be enabled over the network prior to calling.
-+ (void)launchGuestAppAtPath:(NSString *)appPath;
+/// Attempts to load and start the executable inside a guest .app bundle.
+///
+/// Returns nil on success, or a human-readable explanation of what stopped it.
+/// The previous version returned void and logged failures with NSLog, so a tap
+/// that could not possibly work looked identical to one that did nothing.
++ (nullable NSString *)launchGuestAppAtPath:(NSString *)appPath;
 
 @end
+
+NS_ASSUME_NONNULL_END
