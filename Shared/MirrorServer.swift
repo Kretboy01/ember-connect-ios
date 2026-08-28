@@ -65,6 +65,8 @@ final class MirrorServer {
             return
         }
 
+        created.service = NWListener.Service(name: "EmberConnectMirror", type: "_ember-mirror._tcp")
+
         created.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
