@@ -77,8 +77,8 @@ class SampleHandler: RPBroadcastSampleHandler {
                 let micros = pts.isValid ? UInt64(max(0, CMTimeGetSeconds(pts) * 1_000_000)) : 0
                 server.send(type: .audio,
                             payload: audio.data,
-                            width: audio.sampleRate,
-                            height: audio.channels,
+                            width: Int(audio.sampleRate),
+                            height: Int(audio.channels),
                             timestampMicros: micros)
             }
         @unknown default:
