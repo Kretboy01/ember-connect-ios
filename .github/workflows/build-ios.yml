@@ -13,53 +13,94 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Select Xcode 26.2
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.2"
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Generate Xcode Project
+      - name: Generate ReplayKit extension project
         run: xcodegen generate
 
-      - name: Build
-        # Uses -derivedDataPath rather than overriding CONFIGURATION_BUILD_DIR.
-        # Forcing every target into one flat directory stops Xcode from nesting
-        # the broadcast extension inside the app, and the .ipa then ships
-        # without it — the app installs but mirroring silently does nothing.
+      - name: Build the LiveContainer runtime
         run: |
           xcodebuild clean build \
-            -project EmberConnectMobile.xcodeproj \
-            -scheme EmberConnectMobile \
+            -project LiveContainerRuntime/LiveContainer.xcodeproj \
+            -scheme LiveContainer \
             -sdk iphoneos \
             -configuration Release \
-            -derivedDataPath DerivedData \
+            -derivedDataPath DerivedDataContainer \
+            LIVECONTAINER_BUNDLE_IDENTIFIER=com.emberwave.EmberConnectMobile \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             EXCLUDED_ARCHS="armv7"
 
-      - name: Verify the broadcast extension was embedded
+      - name: Build Ember screen-mirroring extension
         run: |
-          APP="DerivedData/Build/Products/Release-iphoneos/EmberConnectMobile.app"
+          xcodebuild clean build \
+            -project EmberConnectExtensions.xcodeproj \
+            -target EmberConnectBroadcast \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath DerivedDataBroadcast \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXCLUDED_ARCHS="armv7"
+
+      - name: Assemble Ember container host
+        run: |
+          APP="DerivedDataContainer/Build/Products/Release-iphoneos/LiveContainer.app"
+          BROADCAST="DerivedDataBroadcast/Build/Products/Release-iphoneos/EmberConnectBroadcast.appex"
+
           if [ ! -d "$APP" ]; then
-            echo "::error::App bundle not found at $APP"
+            echo "::error::Container host was not built at $APP"
             exit 1
           fi
-          if [ ! -d "$APP/PlugIns/EmberConnectBroadcast.appex" ]; then
-            echo "::error::Broadcast extension missing — screen mirroring would not work."
-            ls -R "$APP/PlugIns" || true
+          if [ ! -d "$BROADCAST" ]; then
+            echo "::error::ReplayKit extension was not built at $BROADCAST"
             exit 1
           fi
-          echo "Extension embedded:"
-          ls -la "$APP/PlugIns"
+
+          # LiveProcess, LaunchAppExtension, and ShareExtension are optional
+          # LiveContainer features. Shipping them would consume three more
+          # App IDs, so Ember keeps only its ReplayKit mirroring extension.
+          rm -rf "$APP/PlugIns" "$APP/Extensions"
+          mkdir -p "$APP/PlugIns"
+          cp -R "$BROADCAST" "$APP/PlugIns/"
+
+      - name: Verify container, branding, and App ID usage
+        run: |
+          APP="DerivedDataContainer/Build/Products/Release-iphoneos/LiveContainer.app"
+          INFO="$APP/Info.plist"
+
+          DISPLAY_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$INFO")
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO")
+          FILE_SHARING=$(/usr/libexec/PlistBuddy -c "Print :UIFileSharingEnabled" "$INFO")
+          EXTENSION_COUNT=$(find "$APP/PlugIns" -mindepth 1 -maxdepth 1 -type d -name '*.appex' | wc -l | tr -d ' ')
+
+          test "$DISPLAY_NAME" = "Ember Connect"
+          test "$BUNDLE_ID" = "com.emberwave.EmberConnectMobile"
+          test "$FILE_SHARING" = "true"
+          test "$EXTENSION_COUNT" = "1"
+          test -d "$APP/PlugIns/EmberConnectBroadcast.appex"
+          test -f "$APP/Frameworks/LiveContainerSwiftUI.framework/LiveContainerSwiftUI"
+          test -f "$APP/Frameworks/ZSign.dylib"
+
+          echo "Verified Ember Connect host with one ReplayKit extension."
 
       - name: Package IPA
         run: |
-          APP="DerivedData/Build/Products/Release-iphoneos/EmberConnectMobile.app"
+          APP="DerivedDataContainer/Build/Products/Release-iphoneos/LiveContainer.app"
           mkdir -p Payload
-          cp -R "$APP" Payload/
-          zip -qr EmberConnectMobile.ipa Payload
+          cp -R "$APP" Payload/EmberConnectMobile.app
+          zip -qry EmberConnectMobile.ipa Payload
           echo "IPA size: $(du -h EmberConnectMobile.ipa | cut -f1)"
 
-      - name: Upload IPA Artifact
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: EmberConnectMobile

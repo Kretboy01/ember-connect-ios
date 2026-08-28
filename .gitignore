@@ -1,6 +1,9 @@
 # Xcode / XcodeGen
 EmberConnectMobile.xcodeproj/
+EmberConnectExtensions.xcodeproj/
 DerivedData/
+DerivedDataContainer/
+DerivedDataBroadcast/
 build/
 Payload/
 *.ipa
@@ -9,3 +12,14 @@ Payload/
 artifacts/
 
 .DS_Store
+
+# The OpenSSL dependency ships hundreds of megabytes of duplicate binaries for
+# every Apple platform. Ember's device-only build needs the XCFramework and
+# iphoneos framework; keep those plus attribution, ignore the redundant SDKs.
+LiveContainerRuntime/OpenSSL/*
+!LiveContainerRuntime/OpenSSL/Frameworks/
+LiveContainerRuntime/OpenSSL/Frameworks/*
+!LiveContainerRuntime/OpenSSL/Frameworks/OpenSSL.xcframework/
+!LiveContainerRuntime/OpenSSL/Frameworks/iphoneos/
+!LiveContainerRuntime/OpenSSL/LICENSE.txt
+!LiveContainerRuntime/OpenSSL/README.md
