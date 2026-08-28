@@ -68,15 +68,18 @@ enum MirrorProtocol {
 }
 
 extension Data {
+    // `Swift.` qualified deliberately: inside an extension on Data, a bare
+    // `withUnsafeBytes` binds to Data's own instance method rather than the
+    // global `withUnsafeBytes(of:_:)`, which does not compile.
     mutating func appendLE(_ value: UInt16) {
-        withUnsafeBytes(of: value.littleEndian) { append(contentsOf: $0) }
+        Swift.withUnsafeBytes(of: value.littleEndian) { append(contentsOf: $0) }
     }
 
     mutating func appendLE(_ value: UInt32) {
-        withUnsafeBytes(of: value.littleEndian) { append(contentsOf: $0) }
+        Swift.withUnsafeBytes(of: value.littleEndian) { append(contentsOf: $0) }
     }
 
     mutating func appendLE(_ value: UInt64) {
-        withUnsafeBytes(of: value.littleEndian) { append(contentsOf: $0) }
+        Swift.withUnsafeBytes(of: value.littleEndian) { append(contentsOf: $0) }
     }
 }
