@@ -10,7 +10,10 @@ struct AppLibraryView: View {
     @State private var launchFailure: String?
 
     var body: some View {
-        NavigationStack {
+        // NavigationView rather than NavigationStack: the deployment target is
+        // iOS 15 and NavigationStack needs 16. The stack style stops iPad
+        // rendering this as a split view with an empty detail pane.
+        NavigationView {
             ScrollView {
                 VStack(spacing: 20) {
                     mirroringSection
@@ -30,6 +33,7 @@ struct AppLibraryView: View {
                 Text(launchFailure ?? "")
             }
         }
+        .navigationViewStyle(StackNavigationViewStyle())
     }
 
     // MARK: - Mirroring
