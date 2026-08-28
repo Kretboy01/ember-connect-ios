@@ -85,9 +85,14 @@ final class H264Encoder {
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                              value: NSNumber(value: 2))
         // Scale the bitrate with pixel count so a Pro Max does not look worse
-        // than an SE. ~0.12 bits per pixel per frame is a reasonable target
-        // for screen content, which compresses far better than camera video.
-        let bitrate = min(Int(Double(width * height) * 0.12 * Double(targetFrameRate)), 24_000_000)
+        // than an SE.
+        //
+        // 0.28 bits per pixel per frame is generous for screen content, which
+        // compresses far better than camera video — but the stream crosses a
+        // USB cable, not a network, so there is no reason to ration it. At the
+        // earlier 0.12 the panel's fine detail (small text, thin icon strokes)
+        // was visibly softened by the encoder rather than by any scaling.
+        let bitrate = min(Int(Double(width * height) * 0.28 * Double(targetFrameRate)), 40_000_000)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_AverageBitRate,
                              value: NSNumber(value: bitrate))
 
