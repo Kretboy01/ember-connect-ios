@@ -39,6 +39,8 @@ enum MirrorProtocol {
         case frame = 2
         /// A JSON blob describing the session (scale, orientation).
         case meta = 3
+        /// Low-latency audio packet (PCM / AAC).
+        case audio = 4
     }
 
     struct Header {

@@ -27,11 +27,9 @@ class SampleHandler: RPBroadcastSampleHandler {
             guard let self else { return }
             // Only republish when the sets actually change; they are emitted
             // on every keyframe.
-            if self.parameterSets != sets {
-                self.parameterSets = sets
-                self.frameWidth = width
-                self.frameHeight = height
-            }
+            self.parameterSets = sets
+            self.frameWidth = width
+            self.frameHeight = height
             self.server.send(type: .config,
                              payload: sets,
                              width: width,
@@ -68,11 +66,54 @@ class SampleHandler: RPBroadcastSampleHandler {
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer,
                                       with sampleBufferType: RPSampleBufferType) {
-        guard sampleBufferType == .video else { return }
-        // Nothing is watching; skip the encode entirely rather than burning
-        // battery compressing frames that go nowhere.
         guard server.hasClients else { return }
-        encoder.encode(sampleBuffer: sampleBuffer)
+
+        switch sampleBufferType {
+        case .video:
+            encoder.encode(sampleBuffer: sampleBuffer)
+        case .audioApp, .audioMic:
+            if let audio = extractAudioData(from: sampleBuffer) {
+                let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                let micros = pts.isValid ? UInt64(max(0, CMTimeGetSeconds(pts) * 1_000_000)) : 0
+                server.send(type: .audio,
+                            payload: audio.data,
+                            width: audio.sampleRate,
+                            height: audio.channels,
+                            timestampMicros: micros)
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    private func extractAudioData(from sampleBuffer: CMSampleBuffer) -> (data: Data, sampleRate: UInt16, channels: UInt16)? {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee else {
+            return nil
+        }
+
+        var blockBuffer: CMBlockBuffer?
+        var bufferList = AudioBufferList()
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: &bufferList,
+            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+
+        guard status == noErr, bufferList.mNumberBuffers > 0 else { return nil }
+
+        let audioBuffer = bufferList.mBuffers
+        guard let mData = audioBuffer.mData, audioBuffer.mDataByteSize > 0 else { return nil }
+
+        let data = Data(bytes: mData, count: Int(audioBuffer.mDataByteSize))
+        let sampleRate = UInt16(min(max(asbd.mSampleRate, 1), 65535))
+        let channels = UInt16(min(max(asbd.mChannelsPerFrame, 1), 8))
+        return (data, sampleRate, channels)
     }
 
     override func broadcastPaused() {

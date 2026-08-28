@@ -101,6 +101,7 @@ final class H264Encoder {
         session = created
         self.width = width
         self.height = height
+        self.forceNextKeyframe = true
         return true
     }
 
