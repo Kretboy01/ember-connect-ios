@@ -625,7 +625,27 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
             }
 
             for ipaURL in ipaURLs {
+                // Ensure file is a valid zip archive (PK\x03\x04) and is at least 50 KB
+                let fileSize = (try? fileManager.attributesOfItem(atPath: ipaURL.path)[.size] as? UInt64) ?? 0
+                var isValidZip = false
+                if let handle = try? FileHandle(forReadingFrom: ipaURL) {
+                    let header = handle.readData(ofLength: 4)
+                    try? handle.close()
+                    if header == Data([0x50, 0x4B, 0x03, 0x04]) {
+                        isValidZip = true
+                    }
+                }
+
+                guard isValidZip, fileSize >= 50_000 else {
+                    print("[EmberInbox] Discarding invalid/corrupted download: \(ipaURL.lastPathComponent) (\(fileSize) bytes)")
+                    try? fileManager.removeItem(at: ipaURL)
+                    continue
+                }
+
                 await startInstallApp(ipaURL)
+                if fileManager.fileExists(atPath: ipaURL.path) {
+                    try? fileManager.removeItem(at: ipaURL)
+                }
                 if errorShow { break }
             }
         } catch {
@@ -753,11 +773,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         do {
             self.installprogressVisible = true
             try await installIpaFile(fileUrl)
-            try FileManager.default.removeItem(at: fileUrl)
+            try? FileManager.default.removeItem(at: fileUrl)
         } catch {
             errorInfo = error.localizedDescription
             errorShow = true
             self.installprogressVisible = false
+            try? FileManager.default.removeItem(at: fileUrl)
         }
     }
     
