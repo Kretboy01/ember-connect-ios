@@ -1,10 +1,5 @@
 import SwiftUI
 
-/// Bundle id of the embedded broadcast extension. Kept in one place because
-/// the picker will silently do nothing if it does not match the extension's
-/// actual `PRODUCT_BUNDLE_IDENTIFIER` in project.yml.
-private let broadcastExtensionId = "com.emberwave.EmberConnectMobile.Broadcast"
-
 struct AppLibraryView: View {
     @StateObject private var model = AppModel()
     @State private var launchFailure: String?
@@ -43,7 +38,7 @@ struct AppLibraryView: View {
             SectionHeader(title: "Screen Mirroring",
                           subtitle: "Show this device inside the desktop app")
 
-            BroadcastButton(extensionBundleId: broadcastExtensionId)
+            BroadcastButton()
 
             Label(
                 "Keep the device connected by USB. The desktop picks up the stream automatically once the broadcast starts.",

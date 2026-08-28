@@ -12,6 +12,10 @@ targets:
       - Shared
     settings:
       GENERATE_INFOPLIST_FILE: "YES"
+      # Reuses the already-registered com.vix.emberwave App ID rather than
+      # burning one of the ten a free account gets per rolling 7 days.
+      # isideload rewrites this to com.vix.emberwave.<TEAMID> at sign time.
+      PRODUCT_BUNDLE_IDENTIFIER: com.vix.emberwave
       CODE_SIGN_IDENTITY: ""
       CODE_SIGNING_REQUIRED: "NO"
       CODE_SIGNING_ALLOWED: "NO"
@@ -43,7 +47,9 @@ targets:
     settings:
       GENERATE_INFOPLIST_FILE: "NO"
       INFOPLIST_FILE: Broadcast/Info.plist
-      PRODUCT_BUNDLE_IDENTIFIER: com.emberwave.EmberConnectMobile.Broadcast
+      # Must be a prefix-extension of the host app's id — isideload rejects an
+      # extension whose id does not start with the main bundle id.
+      PRODUCT_BUNDLE_IDENTIFIER: com.vix.emberwave.Broadcast
       PRODUCT_NAME: EmberConnectBroadcast
       CODE_SIGN_IDENTITY: ""
       CODE_SIGNING_REQUIRED: "NO"
