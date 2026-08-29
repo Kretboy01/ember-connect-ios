@@ -1,11 +1,20 @@
 # Flappy Practice (SpriteKit)
 
-This is Ember Connect's intentionally small example tweak. It adds a compact
-`1x` button to the bottom-right of a guest app. In a SpriteKit game, tapping it
-switches every visible `SKScene` between its original speed and `0.55x`.
+This is Ember Connect's example game-specific tweak. It adds a compact `EC`
+button to the bottom-right of Brandon Plank's Flappy Bird. Tapping it opens a
+practice menu with:
 
-It is useful for Flappy-style SpriteKit games and clones. The original Flappy
-Bird and some ports use other engines; those show `No SK` and are left alone.
+- coordinated `1x`, `0.75x`, and `0.5x` speed presets;
+- wider pipe gaps; and
+- ghost mode, which disables crash contacts while leaving score gates active.
+
+The speed presets affect both parts of the game. SpriteKit scene actions slow
+the scenery and pipes, while the tweak scales gravity, current bird velocity,
+and flap impulses so the bird follows the same arc over the slower timeline.
+
+The implementation deliberately targets the SpriteKit physics categories and
+`GameScene` used by `org.brandonplank.flappybird`; it is not advertised as a
+generic tweak for unrelated Flappy clones.
 
 ## What it demonstrates
 
@@ -20,8 +29,9 @@ Bird and some ports use other engines; those show `No SK` and are left alone.
 5. The Objective-C constructor above runs inside the guest process and adds the
    practice control.
 
-The tweak uses public UIKit and SpriteKit APIs. It does not patch scores,
-purchases, network calls, or game-specific classes.
+The tweak uses UIKit and SpriteKit APIs plus a narrow `applyImpulse:` hook for
+the bird physics body. It does not patch stored scores, purchases, or network
+calls.
 
 For diagnosis it records its last lifecycle state in the guest app's
 `Library/Caches/EmberConnect/FlappyPracticeStatus.plist`. This distinguishes a
