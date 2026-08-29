@@ -119,7 +119,7 @@ struct LCTweakFolderView : View {
                     }
                 }
 
-                Section("Bundled Game Tweaks") {
+                Section {
                     ForEach(Self.bundledPresets) { preset in
                         let isInstalled = isPresetInstalled(preset)
                         VStack(alignment: .leading, spacing: 6) {
@@ -146,6 +146,8 @@ struct LCTweakFolderView : View {
                         }
                         .padding(.vertical, 4)
                     }
+                } header: {
+                    Text("Bundled Game Tweaks")
                 } footer: {
                     Text("Installing a bundled tweak creates its app folder, patches RPATH, and automatically assigns the folder to matching installed guest apps. Relaunch the game after installing.")
                 }
@@ -354,7 +356,7 @@ struct LCTweakFolderView : View {
             // Assign to any matching installed guest app
             let matchingApps = DataManager.shared.model.apps.filter { app in
                 let bundleId = app.bundleIdentifier.lowercased()
-                let appName = (app.appInfo.name ?? "").lowercased()
+                let appName = app.displayName.lowercased()
                 let targetIds = preset.targetBundleIdentifiers.map { $0.lowercased() }
                 if targetIds.contains(bundleId) { return true }
                 for keyword in preset.targetNameKeywords {
