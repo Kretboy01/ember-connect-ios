@@ -6,6 +6,9 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
+#define EMBER_FLAPPY_BUTTON_TAG 0xFB001
+#define EMBER_FLAPPY_HUD_TAG    0xFB002
+
 // MARK: - Constants & Settings Keys
 static NSString *const kEmberSpeedKey = @"EmberFlappyPractice.speed";
 static NSString *const kEmberGravityKey = @"EmberFlappyPractice.gravity";
@@ -22,20 +25,14 @@ static NSString *const kEmberStatsHudKey = @"EmberFlappyPractice.statsHud";
 
 static const CGFloat EmberExtraGap = 34.0;
 
-// MARK: - Global Variables for Hooks
+// MARK: - Global Variables for Physics Hook
 static CGFloat gEmberSpeedFactor = 1.0;
 static CGFloat gEmberGravityFactor = 1.0;
 static CGFloat gEmberFlapFactor = 1.0;
-static void (*OriginalApplyImpulse)(SKPhysicsBody *, SEL, CGVector);
-
-static BOOL EmberIsFlappyBirdBody(SKPhysicsBody *body) {
-    SKNode *node = body.node;
-    if (!node || body.categoryBitMask != 1) return NO;
-    return YES;
-}
+static void (*OriginalApplyImpulse)(SKPhysicsBody *, SEL, CGVector) = NULL;
 
 static void HookedApplyImpulse(SKPhysicsBody *body, SEL selector, CGVector impulse) {
-    if (EmberIsFlappyBirdBody(body)) {
+    if (body && body.categoryBitMask == 1) {
         if (gEmberSpeedFactor < 0.999) {
             impulse.dx *= gEmberSpeedFactor;
             impulse.dy *= gEmberSpeedFactor;
@@ -44,15 +41,20 @@ static void HookedApplyImpulse(SKPhysicsBody *body, SEL selector, CGVector impul
             impulse.dy *= gEmberFlapFactor;
         }
     }
-    OriginalApplyImpulse(body, selector, impulse);
+    if (OriginalApplyImpulse) {
+        OriginalApplyImpulse(body, selector, impulse);
+    }
 }
 
 static void EmberInstallPhysicsHook(void) {
-    Method m = class_getInstanceMethod(SKPhysicsBody.class, @selector(applyImpulse:));
-    if (m) {
-        OriginalApplyImpulse = (void *)method_getImplementation(m);
-        method_setImplementation(m, (IMP)HookedApplyImpulse);
-    }
+    static dispatch_once_t hookToken;
+    dispatch_once(&hookToken, ^{
+        Method m = class_getInstanceMethod(SKPhysicsBody.class, @selector(applyImpulse:));
+        if (m) {
+            OriginalApplyImpulse = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)HookedApplyImpulse);
+        }
+    });
 }
 
 static void EmberWritePracticeStatus(NSString *state) {
@@ -82,8 +84,6 @@ static void EmberWritePracticeStatus(NSString *state) {
 @property (nonatomic, assign) NSInteger frames;
 @property (nonatomic, assign) CFTimeInterval lastFrameTime;
 @property (nonatomic, assign) double currentFPS;
-@property (nonatomic, assign) NSInteger gamesPlayed;
-@property (nonatomic, assign) NSInteger sessionBestScore;
 
 @property (nonatomic, strong) NSMapTable<SKScene *, NSNumber *> *originalSpeeds;
 @property (nonatomic, strong) NSMapTable<SKScene *, NSValue *> *originalGravities;
@@ -208,21 +208,10 @@ static void EmberWritePracticeStatus(NSString *state) {
     for (SKNode *child in node.children) [self visitNode:child block:block];
 }
 
-- (void)scaleBirdVelocityInScene:(SKScene *)scene from:(CGFloat)oldFactor to:(CGFloat)newFactor {
-    if (oldFactor <= 0 || fabs(oldFactor - newFactor) < 0.001) return;
-    CGFloat ratio = newFactor / oldFactor;
-    [self visitNode:scene block:^(SKNode *node) {
-        SKPhysicsBody *body = node.physicsBody;
-        if (!EmberIsFlappyBirdBody(body)) return;
-        CGVector velocity = body.velocity;
-        body.velocity = CGVectorMake(velocity.dx * ratio, velocity.dy * ratio);
-    }];
-}
-
 - (void)applySpeedAndGravityToScene:(SKScene *)scene {
     NSNumber *originalSpeed = [self.originalSpeeds objectForKey:scene];
     if (!originalSpeed) {
-        originalSpeed = @(scene.speed);
+        originalSpeed = @(scene.speed > 0.001 ? scene.speed : 1.0);
         [self.originalSpeeds setObject:originalSpeed forKey:scene];
     }
     NSValue *originalGravity = [self.originalGravities objectForKey:scene];
@@ -230,10 +219,6 @@ static void EmberWritePracticeStatus(NSString *state) {
         originalGravity = [NSValue valueWithCGVector:scene.physicsWorld.gravity];
         [self.originalGravities setObject:originalGravity forKey:scene];
     }
-    NSNumber *lastFactor = [self.appliedSpeedFactors objectForKey:scene];
-    CGFloat previous = lastFactor ? lastFactor.doubleValue : 1.0;
-    [self scaleBirdVelocityInScene:scene from:previous to:self.speedFactor];
-    [self.appliedSpeedFactors setObject:@(self.speedFactor) forKey:scene];
     
     scene.speed = originalSpeed.doubleValue * self.speedFactor;
     CGVector gravity = originalGravity.CGVectorValue;
@@ -241,9 +226,15 @@ static void EmberWritePracticeStatus(NSString *state) {
     scene.physicsWorld.gravity = CGVectorMake(gravity.dx * effectiveSpeedSq, gravity.dy * effectiveSpeedSq * self.gravityFactor);
 }
 
+- (void)applySpeedAndGravityToAllScenes {
+    for (SKScene *scene in [self visibleSpriteKitScenes]) {
+        [self applySpeedAndGravityToScene:scene];
+    }
+}
+
 - (void)adjustPipeChildrenOfNode:(SKNode *)parent {
     NSMutableArray<SKNode *> *pipes = [NSMutableArray new];
-    for (SKNode *child in parent.children) if (child.physicsBody.categoryBitMask == 4) [pipes addObject:child];
+    for (SKNode *child in parent.children) if (child.physicsBody && child.physicsBody.categoryBitMask == 4) [pipes addObject:child];
     if (pipes.count < 2) return;
     [pipes sortUsingComparator:^NSComparisonResult(SKNode *a, SKNode *b) {
         NSValue *aSaved = [self.originalPipePositions objectForKey:a];
@@ -276,8 +267,9 @@ static void EmberWritePracticeStatus(NSString *state) {
 - (void)applyGhostModeToScene:(SKScene *)scene {
     [self visitNode:scene block:^(SKNode *node) {
         SKPhysicsBody *body = node.physicsBody;
+        if (!body) return;
         uint32_t category = body.categoryBitMask;
-        if (!body || (category != 1 && category != 2 && category != 4)) return;
+        if (category != 1 && category != 2 && category != 4) return;
         if (![self.originalMasks objectForKey:body]) {
             [self.originalMasks setObject:@[@(body.collisionBitMask), @(body.contactTestBitMask)] forKey:body];
         }
@@ -314,7 +306,7 @@ static void EmberWritePracticeStatus(NSString *state) {
     __block NSMutableArray<SKNode *> *activePipes = [NSMutableArray new];
     
     [self visitNode:scene block:^(SKNode *node) {
-        if (node.physicsBody.categoryBitMask == 1) {
+        if (node.physicsBody && node.physicsBody.categoryBitMask == 1) {
             birdNode = node;
             if (self.birdTrailEnabled) {
                 if (![node childNodeWithName:@"EmberTrail"]) {
@@ -336,7 +328,7 @@ static void EmberWritePracticeStatus(NSString *state) {
                 [[node childNodeWithName:@"EmberTrail"] removeFromParent];
             }
         }
-        if (node.physicsBody.categoryBitMask == 4 && [node isKindOfClass:SKSpriteNode.class]) {
+        if (node.physicsBody && node.physicsBody.categoryBitMask == 4 && [node isKindOfClass:SKSpriteNode.class]) {
             [activePipes addObject:node];
             SKSpriteNode *sprite = (SKSpriteNode *)node;
             if (self.pipeTintEnabled) {
@@ -374,10 +366,10 @@ static void EmberWritePracticeStatus(NSString *state) {
         SKNode *nearestPipe = nil;
         CGFloat minDistance = 99999.0;
         for (SKNode *pipe in activePipes) {
-            CGPoint worldPos = [scene convertPoint:pipe.position fromNode:pipe.parent ?: scene];
+            CGPoint pipePos = [scene convertPoint:pipe.position fromNode:pipe.parent ?: scene];
             CGPoint birdPos = [scene convertPoint:birdNode.position fromNode:birdNode.parent ?: scene];
-            CGFloat dx = worldPos.x - birdPos.x;
-            if (dx > -30 && dx < minDistance) {
+            CGFloat dx = pipePos.x - birdPos.x;
+            if (dx > -40 && dx < minDistance) {
                 minDistance = dx;
                 nearestPipe = pipe;
             }
@@ -387,9 +379,9 @@ static void EmberWritePracticeStatus(NSString *state) {
             targetY = pipeWorld.y;
         }
         CGPoint currentBirdPos = [scene convertPoint:birdNode.position fromNode:birdNode.parent ?: scene];
-        if (currentBirdPos.y < targetY - 20.0 && birdNode.physicsBody.velocity.dy < 20) {
+        if (currentBirdPos.y < targetY - 15.0 && birdNode.physicsBody.velocity.dy < 30) {
             birdNode.physicsBody.velocity = CGVectorMake(birdNode.physicsBody.velocity.dx, 0);
-            [birdNode.physicsBody applyImpulse:CGVectorMake(0, 9.0 * self.flapFactor)];
+            [birdNode.physicsBody applyImpulse:CGVectorMake(0, 9.0 * self.flapFactor * self.speedFactor)];
         }
     }
 }
@@ -398,10 +390,15 @@ static void EmberWritePracticeStatus(NSString *state) {
     gEmberSpeedFactor = self.speedFactor;
     gEmberGravityFactor = self.gravityFactor;
     gEmberFlapFactor = self.flapFactor;
+    
     for (SKScene *scene in [self visibleSpriteKitScenes]) {
         [self applySpeedAndGravityToScene:scene];
-        if (self.wideGapsEnabled) [self visitNode:scene block:^(SKNode *node) { [self adjustPipeChildrenOfNode:node]; }];
-        if (self.ghostModeEnabled) [self applyGhostModeToScene:scene];
+        if (self.wideGapsEnabled) {
+            [self visitNode:scene block:^(SKNode *node) { [self adjustPipeChildrenOfNode:node]; }];
+        }
+        if (self.ghostModeEnabled) {
+            [self applyGhostModeToScene:scene];
+        }
         [self applyVisualsAndAutoPilotToScene:scene];
     }
 }
@@ -414,7 +411,9 @@ static void EmberWritePracticeStatus(NSString *state) {
         self.frames = 0;
         self.lastFrameTime = link.timestamp;
     }
+    
     [self maintainEnabledTweaks];
+    
     if (self.statsHudEnabled && self.statsHudLabel && self.statsHud) {
         self.statsHud.hidden = NO;
         self.statsHudLabel.text = [NSString stringWithFormat:@"FPS: %.0f\nSpd: %.2gx  Grv: %.2gx\nFlp: %.2gx  Gap: %@",
@@ -435,6 +434,10 @@ static void EmberWritePracticeStatus(NSString *state) {
 
 - (UIViewController *)topViewController {
     UIViewController *controller = self.hostWindow.rootViewController;
+    if (!controller) {
+        UIWindow *window = [self guestWindow];
+        controller = window.rootViewController;
+    }
     while (controller.presentedViewController) controller = controller.presentedViewController;
     return controller;
 }
@@ -445,23 +448,56 @@ static void EmberWritePracticeStatus(NSString *state) {
 
 - (void)setPracticeSpeed:(CGFloat)factor {
     self.speedFactor = factor;
+    gEmberSpeedFactor = factor;
     [self saveSettings];
+    [self applySpeedAndGravityToAllScenes];
     [self updateButtonTitle];
     EmberWritePracticeStatus(@"speed-changed");
 }
 
 - (void)setPracticeGravity:(CGFloat)factor {
     self.gravityFactor = factor;
+    gEmberGravityFactor = factor;
     [self saveSettings];
+    [self applySpeedAndGravityToAllScenes];
     [self updateButtonTitle];
     EmberWritePracticeStatus(@"gravity-changed");
 }
 
 - (void)setPracticeFlap:(CGFloat)factor {
     self.flapFactor = factor;
+    gEmberFlapFactor = factor;
     [self saveSettings];
     [self updateButtonTitle];
     EmberWritePracticeStatus(@"flap-changed");
+}
+
+- (void)toggleWideGaps {
+    self.wideGapsEnabled = !self.wideGapsEnabled;
+    if (self.wideGapsEnabled) {
+        for (SKScene *scene in [self visibleSpriteKitScenes]) {
+            [self visitNode:scene block:^(SKNode *node) { [self adjustPipeChildrenOfNode:node]; }];
+        }
+    } else {
+        [self restorePipePositions];
+    }
+    [self saveSettings];
+    [self updateButtonTitle];
+    EmberWritePracticeStatus(self.wideGapsEnabled ? @"wide-gaps-on" : @"wide-gaps-off");
+}
+
+- (void)toggleGhostMode {
+    self.ghostModeEnabled = !self.ghostModeEnabled;
+    if (self.ghostModeEnabled) {
+        for (SKScene *scene in [self visibleSpriteKitScenes]) {
+            [self applyGhostModeToScene:scene];
+        }
+    } else {
+        [self restoreCollisionMasks];
+    }
+    [self saveSettings];
+    [self updateButtonTitle];
+    EmberWritePracticeStatus(self.ghostModeEnabled ? @"ghost-mode-on" : @"ghost-mode-off");
 }
 
 - (void)resetAllTweaks {
@@ -479,6 +515,7 @@ static void EmberWritePracticeStatus(NSString *state) {
     self.statsHudEnabled = NO;
     [self restorePipePositions];
     [self restoreCollisionMasks];
+    [self applySpeedAndGravityToAllScenes];
     [self saveSettings];
     [self updateButtonTitle];
     EmberWritePracticeStatus(@"reset");
@@ -564,13 +601,42 @@ static void EmberWritePracticeStatus(NSString *state) {
     UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Practice Profiles" message:@"Quickly apply balanced presets." preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
     [menu addAction:[UIAlertAction actionWithTitle:@"Easy Mode (0.5x, Low Gravity, Wide Gaps)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.speedFactor = 0.5; weakSelf.gravityFactor = 0.5; weakSelf.flapFactor = 1.5; weakSelf.wideGapsEnabled = YES; weakSelf.ghostModeEnabled = NO; [weakSelf saveSettings]; [weakSelf updateButtonTitle];
+        weakSelf.speedFactor = gEmberSpeedFactor = 0.5;
+        weakSelf.gravityFactor = gEmberGravityFactor = 0.5;
+        weakSelf.flapFactor = gEmberFlapFactor = 1.5;
+        weakSelf.wideGapsEnabled = YES;
+        weakSelf.ghostModeEnabled = NO;
+        [weakSelf applySpeedAndGravityToAllScenes];
+        for (SKScene *scene in [weakSelf visibleSpriteKitScenes]) {
+            [weakSelf visitNode:scene block:^(SKNode *node) { [weakSelf adjustPipeChildrenOfNode:node]; }];
+        }
+        [weakSelf saveSettings];
+        [weakSelf updateButtonTitle];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Speed Run Mode (1.5x Speed, Normal Physics)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.speedFactor = 1.5; weakSelf.gravityFactor = 1.0; weakSelf.flapFactor = 1.0; weakSelf.wideGapsEnabled = NO; weakSelf.ghostModeEnabled = NO; [weakSelf restorePipePositions]; [weakSelf saveSettings]; [weakSelf updateButtonTitle];
+        weakSelf.speedFactor = gEmberSpeedFactor = 1.5;
+        weakSelf.gravityFactor = gEmberGravityFactor = 1.0;
+        weakSelf.flapFactor = gEmberFlapFactor = 1.0;
+        weakSelf.wideGapsEnabled = NO;
+        weakSelf.ghostModeEnabled = NO;
+        [weakSelf restorePipePositions];
+        [weakSelf applySpeedAndGravityToAllScenes];
+        [weakSelf saveSettings];
+        [weakSelf updateButtonTitle];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Ghost Practice (0.75x, Wide Gaps, No Crash)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.speedFactor = 0.75; weakSelf.gravityFactor = 0.75; weakSelf.flapFactor = 1.0; weakSelf.wideGapsEnabled = YES; weakSelf.ghostModeEnabled = YES; [weakSelf saveSettings]; [weakSelf updateButtonTitle];
+        weakSelf.speedFactor = gEmberSpeedFactor = 0.75;
+        weakSelf.gravityFactor = gEmberGravityFactor = 0.75;
+        weakSelf.flapFactor = gEmberFlapFactor = 1.0;
+        weakSelf.wideGapsEnabled = YES;
+        weakSelf.ghostModeEnabled = YES;
+        [weakSelf applySpeedAndGravityToAllScenes];
+        for (SKScene *scene in [weakSelf visibleSpriteKitScenes]) {
+            [weakSelf visitNode:scene block:^(SKNode *node) { [weakSelf adjustPipeChildrenOfNode:node]; }];
+            [weakSelf applyGhostModeToScene:scene];
+        }
+        [weakSelf saveSettings];
+        [weakSelf updateButtonTitle];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Back" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) { [weakSelf tapped]; }]];
     menu.popoverPresentationController.sourceView = self.button;
@@ -590,10 +656,10 @@ static void EmberWritePracticeStatus(NSString *state) {
     NSString *flpStr = (fabs(self.flapFactor - 1.0) < 0.01) ? @"Normal (1.0x)" : [NSString stringWithFormat:@"%.2gx", self.flapFactor];
     [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Flap Power: %@  ▶", flpStr] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf showFlapMenu]; }]];
     [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Wide pipe gaps" selected:self.wideGapsEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.wideGapsEnabled = !weakSelf.wideGapsEnabled; if (!weakSelf.wideGapsEnabled) [weakSelf restorePipePositions]; [weakSelf saveSettings]; [weakSelf updateButtonTitle]; EmberWritePracticeStatus(weakSelf.wideGapsEnabled ? @"wide-gaps-on" : @"wide-gaps-off");
+        [weakSelf toggleWideGaps];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Ghost mode (no crashes)" selected:self.ghostModeEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.ghostModeEnabled = !weakSelf.ghostModeEnabled; if (!weakSelf.ghostModeEnabled) [weakSelf restoreCollisionMasks]; [weakSelf saveSettings]; [weakSelf updateButtonTitle]; EmberWritePracticeStatus(weakSelf.ghostModeEnabled ? @"ghost-mode-on" : @"ghost-mode-off");
+        [weakSelf toggleGhostMode];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Auto-Pilot (Auto-flap)" selected:self.autoPilotEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { weakSelf.autoPilotEnabled = !weakSelf.autoPilotEnabled; [weakSelf saveSettings]; [weakSelf updateButtonTitle]; }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Visual Effects & HUD  ▶" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf showVisualsMenu]; }]];
@@ -605,32 +671,24 @@ static void EmberWritePracticeStatus(NSString *state) {
     [presenter presentViewController:menu animated:YES completion:nil];
 }
 
-static const NSInteger kEmberFlappyButtonTag = 0xECF1A9;
-static const NSInteger kEmberFlappyHudTag = 0xECF1AA;
-
 - (void)install {
     UIWindow *host = [self guestWindow];
     if (!host) return;
     
-    for (UIView *subview in host.subviews) {
-        if (subview.tag == kEmberFlappyButtonTag && subview != self.button) {
-            [subview removeFromSuperview];
-        }
-        if (subview.tag == kEmberFlappyHudTag && subview != self.statsHud) {
-            [subview removeFromSuperview];
-        }
-    }
-    
-    if (self.button && self.button.superview == host) {
+    UIView *existing = [host viewWithTag:EMBER_FLAPPY_BUTTON_TAG];
+    if (existing && [existing isKindOfClass:UIButton.class]) {
+        self.button = (UIButton *)existing;
         [host bringSubviewToFront:self.button];
         if (self.statsHud) [host bringSubviewToFront:self.statsHud];
+        [self updateButtonTitle];
         [self maintainEnabledTweaks];
         return;
     }
     
     [self.button removeFromSuperview];
+    
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    button.tag = kEmberFlappyButtonTag;
+    button.tag = EMBER_FLAPPY_BUTTON_TAG;
     button.frame = CGRectMake(MAX(8, CGRectGetWidth(host.bounds) - 84), MAX(8, CGRectGetHeight(host.bounds) - 108), 72, 40);
     button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
     button.layer.cornerRadius = 12;
@@ -643,20 +701,23 @@ static const NSInteger kEmberFlappyHudTag = 0xECF1AA;
     [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
     button.accessibilityLabel = @"Flappy Practice menu";
-    button.accessibilityHint = @"Opens speed, wide gap, and ghost mode controls";
     [button addTarget:self action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
+    
     [host addSubview:button];
     [host bringSubviewToFront:button];
     self.button = button;
     self.hostWindow = host;
+    
     if (!self.statsHud) {
         UIView *hud = [[UIView alloc] initWithFrame:CGRectMake(12, 44, 150, 68)];
+        hud.tag = EMBER_FLAPPY_HUD_TAG;
         hud.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
         hud.layer.cornerRadius = 8;
         hud.layer.borderWidth = 1;
         hud.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
         hud.userInteractionEnabled = NO;
         hud.hidden = YES;
+        
         UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, 134, 60)];
         label.numberOfLines = 0;
         label.textColor = [UIColor whiteColor];
@@ -669,6 +730,7 @@ static const NSInteger kEmberFlappyHudTag = 0xECF1AA;
         [host addSubview:self.statsHud];
         [host bringSubviewToFront:self.statsHud];
     }
+    
     [self updateButtonTitle];
     [self maintainEnabledTweaks];
     EmberWritePracticeStatus(@"practice-menu-installed");
@@ -699,6 +761,5 @@ static void EmberFlappyPracticeInit(void) {
         [controller start];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
     });
 }

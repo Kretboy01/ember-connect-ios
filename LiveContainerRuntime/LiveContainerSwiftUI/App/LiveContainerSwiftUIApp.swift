@@ -72,12 +72,18 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
             // load tweak folders
             try fm.createDirectory(at: LCPath.tweakPath, withIntermediateDirectories: true)
             
-            // Auto-deploy bundled game tweaks (Flappy Practice & Getting Over It)
+            // Auto-deploy bundled game tweaks (Flappy Practice & Getting Over It) to their app folders
             let bundledTweaks: [(String, String, [String], [String])] = [
                 ("FlappyPractice", "Flappy Practice", ["org.brandonplank.flappybird"], ["flappy"]),
                 ("GettingOverIt", "Getting Over It", ["com.bennettfoddy.gettingoverit", "com.noodlecake.gettingoverit", "com.noodlecake.gettingoveritios"], ["getting over it", "gettingoverit", "bennettfoddy"])
             ]
             for (tweakFile, folderName, bundleIds, keywords) in bundledTweaks {
+                // Remove loose root dylib if it exists from older installs to prevent double injection
+                let globalDest = LCPath.tweakPath.appendingPathComponent("\(tweakFile).dylib")
+                if fm.fileExists(atPath: globalDest.path) {
+                    try? fm.removeItem(at: globalDest)
+                }
+                
                 if let source = Bundle.main.url(forResource: tweakFile, withExtension: "dylib", subdirectory: "EmberTweaks") {
                     let folderUrl = LCPath.tweakPath.appendingPathComponent(folderName)
                     try? fm.createDirectory(at: folderUrl, withIntermediateDirectories: true)
@@ -87,11 +93,6 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                         LCParseMachO((destUrl.path as NSString).utf8String, false) { path, header, _, _ in
                             LCPatchAddRPath(path, header)
                         }
-                    }
-                    // Clean up loose global copy to prevent duplicate loading
-                    let globalDest = LCPath.tweakPath.appendingPathComponent("\(tweakFile).dylib")
-                    if fm.fileExists(atPath: globalDest.path) {
-                        try? fm.removeItem(at: globalDest)
                     }
                     for app in tempApps {
                         let bId = app.bundleIdentifier.lowercased()
