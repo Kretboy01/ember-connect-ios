@@ -1,0 +1,13 @@
+{
+  "project": "Ember Connect Mobile",
+  "platform": "ios",
+  "github": {
+    "owner": "Kretboy01",
+    "repo": "ember-connect-ios"
+  },
+  "ios": {
+    "path": ".",
+    "scheme": "LiveContainer",
+    "configuration": "Release"
+  }
+}
