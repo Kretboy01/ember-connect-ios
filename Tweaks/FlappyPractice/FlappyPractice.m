@@ -22,28 +22,63 @@ static NSString *const kEmberBirdTrailKey = @"EmberFlappyPractice.birdTrail";
 static NSString *const kEmberPipeTintKey = @"EmberFlappyPractice.pipeTint";
 static NSString *const kEmberHitboxKey = @"EmberFlappyPractice.hitbox";
 static NSString *const kEmberStatsHudKey = @"EmberFlappyPractice.statsHud";
+static NSString *const kEmberFreezeKey   = @"EmberFlappyPractice.freeze";
+static NSString *const kEmberRainbowKey  = @"EmberFlappyPractice.rainbow";
 
 static const CGFloat EmberExtraGap = 34.0;
 
-// MARK: - Global Variables for Physics Hook
-static CGFloat gEmberSpeedFactor = 1.0;
-static CGFloat gEmberGravityFactor = 1.0;
-static CGFloat gEmberFlapFactor = 1.0;
+// MARK: - Physics hook
+//
+// The bird's flap goes through -[SKPhysicsBody applyImpulse:], so amplifying
+// or damping it is a matter of scaling `impulse.dy` before the call reaches
+// the framework. `applyImpulse:atPoint:` is hooked too, for games that use
+// the point-anchored variant.
+//
+// The auto-pilot injects its own flap through this same call. Left alone,
+// the hook would then scale that injection by `flapFactor` a second time —
+// which is what made auto-pilot fly the bird straight into the ceiling on
+// any non-1.0 flap setting. `gEmberBypassScaling` opts the caller out for one
+// call, and every internal use goes through `EmberApplyImpulseUnscaled`.
+
+static CGFloat gEmberSpeedFactor    = 1.0;
+static CGFloat gEmberGravityFactor  = 1.0;
+static CGFloat gEmberFlapFactor     = 1.0;
+static _Thread_local BOOL gEmberBypassScaling = NO;
+
 static void (*OriginalApplyImpulse)(SKPhysicsBody *, SEL, CGVector) = NULL;
+static void (*OriginalApplyImpulseAtPoint)(SKPhysicsBody *, SEL, CGVector, CGPoint) = NULL;
+
+static inline void EmberScaleImpulse(SKPhysicsBody *body, CGVector *impulse) {
+    if (gEmberBypassScaling) return;
+    if (!body || body.categoryBitMask != 1) return;
+    if (gEmberSpeedFactor < 0.999) {
+        impulse->dx *= gEmberSpeedFactor;
+        impulse->dy *= gEmberSpeedFactor;
+    }
+    if (impulse->dy > 0 && fabs(gEmberFlapFactor - 1.0) > 0.001) {
+        impulse->dy *= gEmberFlapFactor;
+    }
+}
 
 static void HookedApplyImpulse(SKPhysicsBody *body, SEL selector, CGVector impulse) {
-    if (body && body.categoryBitMask == 1) {
-        if (gEmberSpeedFactor < 0.999) {
-            impulse.dx *= gEmberSpeedFactor;
-            impulse.dy *= gEmberSpeedFactor;
-        }
-        if (impulse.dy > 0 && fabs(gEmberFlapFactor - 1.0) > 0.001) {
-            impulse.dy *= gEmberFlapFactor;
-        }
-    }
-    if (OriginalApplyImpulse) {
-        OriginalApplyImpulse(body, selector, impulse);
-    }
+    EmberScaleImpulse(body, &impulse);
+    if (OriginalApplyImpulse) OriginalApplyImpulse(body, selector, impulse);
+}
+
+static void HookedApplyImpulseAtPoint(SKPhysicsBody *body, SEL selector, CGVector impulse, CGPoint point) {
+    EmberScaleImpulse(body, &impulse);
+    if (OriginalApplyImpulseAtPoint) OriginalApplyImpulseAtPoint(body, selector, impulse, point);
+}
+
+/// Applies an impulse from *our* code without triggering the hook's scaling.
+///
+/// Auto-pilot and one-off nudges have already computed the effective impulse;
+/// letting the hook re-scale would double the factor.
+static void EmberApplyImpulseUnscaled(SKPhysicsBody *body, CGVector impulse) {
+    if (!body) return;
+    gEmberBypassScaling = YES;
+    [body applyImpulse:impulse];
+    gEmberBypassScaling = NO;
 }
 
 static void EmberInstallPhysicsHook(void) {
@@ -53,6 +88,11 @@ static void EmberInstallPhysicsHook(void) {
         if (m) {
             OriginalApplyImpulse = (void *)method_getImplementation(m);
             method_setImplementation(m, (IMP)HookedApplyImpulse);
+        }
+        Method m2 = class_getInstanceMethod(SKPhysicsBody.class, @selector(applyImpulse:atPoint:));
+        if (m2) {
+            OriginalApplyImpulseAtPoint = (void *)method_getImplementation(m2);
+            method_setImplementation(m2, (IMP)HookedApplyImpulseAtPoint);
         }
     });
 }
@@ -103,6 +143,9 @@ static void EmberWritePracticeStatus(NSString *state) {
 @property (nonatomic, assign) BOOL pipeTintEnabled;
 @property (nonatomic, assign) BOOL hitboxVisualizerEnabled;
 @property (nonatomic, assign) BOOL statsHudEnabled;
+@property (nonatomic, assign) BOOL freezeEnabled;
+@property (nonatomic, assign) BOOL rainbowTrailEnabled;
+@property (nonatomic, assign) CGFloat rainbowHue;
 
 + (instancetype)sharedController;
 @end
@@ -137,6 +180,9 @@ static void EmberWritePracticeStatus(NSString *state) {
         controller.pipeTintEnabled = [defaults boolForKey:kEmberPipeTintKey];
         controller.hitboxVisualizerEnabled = [defaults boolForKey:kEmberHitboxKey];
         controller.statsHudEnabled = [defaults boolForKey:kEmberStatsHudKey];
+        controller.freezeEnabled       = [defaults boolForKey:kEmberFreezeKey];
+        controller.rainbowTrailEnabled = [defaults boolForKey:kEmberRainbowKey];
+        controller.rainbowHue          = 0;
         
         gEmberSpeedFactor = controller.speedFactor;
         gEmberGravityFactor = controller.gravityFactor;
@@ -162,6 +208,8 @@ static void EmberWritePracticeStatus(NSString *state) {
     [defaults setBool:self.pipeTintEnabled forKey:kEmberPipeTintKey];
     [defaults setBool:self.hitboxVisualizerEnabled forKey:kEmberHitboxKey];
     [defaults setBool:self.statsHudEnabled forKey:kEmberStatsHudKey];
+    [defaults setBool:self.freezeEnabled       forKey:kEmberFreezeKey];
+    [defaults setBool:self.rainbowTrailEnabled forKey:kEmberRainbowKey];
 }
 
 - (UIWindow *)guestWindow {
@@ -220,10 +268,19 @@ static void EmberWritePracticeStatus(NSString *state) {
         [self.originalGravities setObject:originalGravity forKey:scene];
     }
     
-    scene.speed = originalSpeed.doubleValue * self.speedFactor;
+    // Freeze overrides the speed slider: scene.speed of 0 stops SKAction
+    // and the physics simulation, which is exactly what "pause" means for
+    // a SpriteKit game like Brandon Plank's Flappy Bird. The original speed
+    // is still remembered so unfreezing snaps back to whatever the slider says.
+    if (self.freezeEnabled) {
+        scene.speed = 0.0;
+    } else {
+        scene.speed = originalSpeed.doubleValue * self.speedFactor;
+    }
     CGVector gravity = originalGravity.CGVectorValue;
     CGFloat effectiveSpeedSq = self.speedFactor * self.speedFactor;
-    scene.physicsWorld.gravity = CGVectorMake(gravity.dx * effectiveSpeedSq, gravity.dy * effectiveSpeedSq * self.gravityFactor);
+    scene.physicsWorld.gravity = CGVectorMake(gravity.dx * effectiveSpeedSq,
+                                              gravity.dy * effectiveSpeedSq * self.gravityFactor);
 }
 
 - (void)applySpeedAndGravityToAllScenes {
@@ -309,13 +366,13 @@ static void EmberWritePracticeStatus(NSString *state) {
         if (node.physicsBody && node.physicsBody.categoryBitMask == 1) {
             birdNode = node;
             if (self.birdTrailEnabled) {
-                if (![node childNodeWithName:@"EmberTrail"]) {
-                    SKEmitterNode *emitter = [SKEmitterNode new];
+                SKEmitterNode *emitter = (SKEmitterNode *)[node childNodeWithName:@"EmberTrail"];
+                if (!emitter) {
+                    emitter = [SKEmitterNode new];
                     emitter.name = @"EmberTrail";
                     emitter.particleBirthRate = 40;
                     emitter.particleLifetime = 0.6;
                     emitter.particlePositionRange = CGVectorMake(6, 6);
-                    emitter.particleColor = [UIColor orangeColor];
                     emitter.particleColorBlendFactor = 1.0;
                     emitter.particleAlpha = 0.8;
                     emitter.particleAlphaSpeed = -1.2;
@@ -324,6 +381,9 @@ static void EmberWritePracticeStatus(NSString *state) {
                     emitter.zPosition = -1;
                     [node addChild:emitter];
                 }
+                emitter.particleColor = self.rainbowTrailEnabled
+                    ? [UIColor colorWithHue:self.rainbowHue saturation:0.9 brightness:1.0 alpha:1.0]
+                    : [UIColor orangeColor];
             } else {
                 [[node childNodeWithName:@"EmberTrail"] removeFromParent];
             }
@@ -381,7 +441,11 @@ static void EmberWritePracticeStatus(NSString *state) {
         CGPoint currentBirdPos = [scene convertPoint:birdNode.position fromNode:birdNode.parent ?: scene];
         if (currentBirdPos.y < targetY - 15.0 && birdNode.physicsBody.velocity.dy < 30) {
             birdNode.physicsBody.velocity = CGVectorMake(birdNode.physicsBody.velocity.dx, 0);
-            [birdNode.physicsBody applyImpulse:CGVectorMake(0, 9.0 * self.flapFactor * self.speedFactor)];
+            // Unscaled: this impulse has already had the game speed baked in;
+            // routing it through the hook would multiply flapFactor twice and
+            // fire the bird into the ceiling on anything above 1.0x flap.
+            EmberApplyImpulseUnscaled(birdNode.physicsBody,
+                                      CGVectorMake(0, 9.0 * self.flapFactor * self.speedFactor));
         }
     }
 }
@@ -390,6 +454,10 @@ static void EmberWritePracticeStatus(NSString *state) {
     gEmberSpeedFactor = self.speedFactor;
     gEmberGravityFactor = self.gravityFactor;
     gEmberFlapFactor = self.flapFactor;
+    if (self.rainbowTrailEnabled) {
+        self.rainbowHue += 0.008;
+        if (self.rainbowHue > 1.0) self.rainbowHue -= 1.0;
+    }
     
     for (SKScene *scene in [self visibleSpriteKitScenes]) {
         [self applySpeedAndGravityToScene:scene];
@@ -404,6 +472,7 @@ static void EmberWritePracticeStatus(NSString *state) {
 }
 
 - (void)tick:(CADisplayLink *)link {
+    if (self.lastFrameTime == 0) self.lastFrameTime = link.timestamp;
     CFTimeInterval dt = link.timestamp - self.lastFrameTime;
     self.frames++;
     if (dt >= 1.0) {
@@ -428,7 +497,7 @@ static void EmberWritePracticeStatus(NSString *state) {
     if (!self.button) return;
     NSString *title = (fabs(self.speedFactor - 1.0) < 0.01) ? @"EC 1x" : [NSString stringWithFormat:@"EC %.2gx", self.speedFactor];
     [self.button setTitle:title forState:UIControlStateNormal];
-    BOOL active = (fabs(self.speedFactor - 1.0) >= 0.01) || (fabs(self.gravityFactor - 1.0) >= 0.01) || (fabs(self.flapFactor - 1.0) >= 0.01) || self.wideGapsEnabled || self.ghostModeEnabled || self.autoPilotEnabled || self.nightModeEnabled || self.birdTrailEnabled || self.pipeTintEnabled || self.hitboxVisualizerEnabled || (self.scoreMultiplier > 1);
+    BOOL active = (fabs(self.speedFactor - 1.0) >= 0.01) || (fabs(self.gravityFactor - 1.0) >= 0.01) || (fabs(self.flapFactor - 1.0) >= 0.01) || self.wideGapsEnabled || self.ghostModeEnabled || self.autoPilotEnabled || self.nightModeEnabled || self.birdTrailEnabled || self.pipeTintEnabled || self.hitboxVisualizerEnabled || (self.scoreMultiplier > 1) || self.freezeEnabled || self.rainbowTrailEnabled;
     self.button.backgroundColor = active ? [UIColor colorWithRed:0.98 green:0.38 blue:0.10 alpha:0.94] : [UIColor colorWithWhite:0.10 alpha:0.82];
 }
 
@@ -513,6 +582,8 @@ static void EmberWritePracticeStatus(NSString *state) {
     self.pipeTintEnabled = NO;
     self.hitboxVisualizerEnabled = NO;
     self.statsHudEnabled = NO;
+    self.freezeEnabled = NO;
+    self.rainbowTrailEnabled = NO;
     [self restorePipePositions];
     [self restoreCollisionMasks];
     [self applySpeedAndGravityToAllScenes];
@@ -658,6 +729,14 @@ static void EmberWritePracticeStatus(NSString *state) {
     [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Wide pipe gaps" selected:self.wideGapsEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [weakSelf toggleWideGaps];
     }]];
+    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:(self.freezeEnabled ? @"Resume Game" : @"Freeze / Pause Game")
+                                                        selected:self.freezeEnabled]
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *action) {
+        weakSelf.freezeEnabled = !weakSelf.freezeEnabled;
+        [weakSelf saveSettings]; [weakSelf applySpeedAndGravityToAllScenes]; [weakSelf updateButtonTitle];
+    }]];
+
     [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Ghost mode (no crashes)" selected:self.ghostModeEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [weakSelf toggleGhostMode];
     }]];

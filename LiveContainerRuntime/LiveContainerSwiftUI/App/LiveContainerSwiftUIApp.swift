@@ -88,7 +88,17 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                     let folderUrl = LCPath.tweakPath.appendingPathComponent(folderName)
                     try? fm.createDirectory(at: folderUrl, withIntermediateDirectories: true)
                     let destUrl = folderUrl.appendingPathComponent("\(tweakFile).dylib")
-                    if !fm.fileExists(atPath: destUrl.path) {
+
+                    // Replace when the bundled dylib is newer than what is on
+                    // disk. The previous check skipped whenever any file was
+                    // present, which meant every rebuild's bug-fixes were
+                    // ignored until the user deleted the tweak folder by hand.
+                    let bundledMTime  = (try? source.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                    let existingMTime = (try? destUrl.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                    let shouldReplace = !fm.fileExists(atPath: destUrl.path)
+                        || (bundledMTime != nil && existingMTime != nil && bundledMTime! > existingMTime!)
+                    if shouldReplace {
+                        try? fm.removeItem(at: destUrl)
                         try? fm.copyItem(at: source, to: destUrl)
                         LCParseMachO((destUrl.path as NSString).utf8String, false) { path, header, _, _ in
                             LCPatchAddRPath(path, header)

@@ -1,97 +1,299 @@
-// GettingOverIt.m — Ember Connect practice controls for Getting Over It with Bennett Foddy.
+// GettingOverIt.m — Ember Connect practice controls for Getting Over It.
+//
+// # What went wrong before this rewrite
+//
+// The previous build never worked because IL2CPP resolution was a one-shot
+// inside a `dispatch_once` in `+sharedController`, and that ran the moment the
+// tweak's constructor did. UnityFramework is not loaded that early — Unity's
+// framework link is lazy, resolved by the game's own bootstrap after
+// `main` — so every icall lookup returned NULL and stayed NULL for the rest
+// of the session. The tick then called `applyTimeScale` and `applyGravity`
+// with nothing behind them.
+//
+// It also called `usleep()` on the main thread every frame to fake slow
+// motion, which stalls the render loop without actually slowing the Unity
+// engine, and used `dlopen("UnityFramework.framework/UnityFramework", …)`,
+// which does not resolve at all when the framework is under `@rpath` inside
+// the app bundle.
+//
+// # Design of the new resolver
+//
+// Resolution is now a **repeating attempt** driven from `tick:`, gated by a
+// state flag so it stops as soon as it succeeds. Handles are opened by
+// absolute path from `NSBundle.mainBundle.privateFrameworksPath`, which is
+// the only place the game's Unity framework actually lives. Once icalls are
+// found, `applyTimeScale` / `applyGravity` are pushed once immediately and
+// then any time the user changes a setting.
+//
+// Frame pacing is gone. Slowing time is done through `Time::set_timeScale` on
+// the Unity side, which is the only place slow motion actually means anything
+// for the game's physics; slowing the render loop achieved neither.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <dlfcn.h>
-#import <objc/runtime.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
+#import <dlfcn.h>
 
 #define EMBER_GOI_BUTTON_TAG 0xFB003
 #define EMBER_GOI_HUD_TAG    0xFB004
 
-// MARK: - Unity / IL2CPP Types
+#pragma mark - Unity / IL2CPP surface
+
 typedef void Il2CppDomain;
 typedef void Il2CppAssembly;
 typedef void Il2CppImage;
 typedef void Il2CppClass;
 typedef void MethodInfo;
-typedef void FieldInfo;
 typedef void Il2CppObject;
 typedef void Il2CppThread;
+typedef void Il2CppString;
 
-typedef struct { float x; float y; float z; } Vector3;
-typedef struct { float x; float y; } Vector2;
+typedef struct { float x; float y; float z; } EmberVector3;
+typedef struct { float x; float y; } EmberVector2;
 
-typedef void (*SetTimeScaleFunc)(float);
+typedef void  (*SetTimeScaleFunc)(float);
 typedef float (*GetTimeScaleFunc)(void);
-typedef void (*SetFixedDeltaTimeFunc)(float);
+typedef void  (*SetFixedDeltaTimeFunc)(float);
+typedef void  (*Set3DGravityDirectFunc)(EmberVector3);
+typedef void  (*Set3DGravityInjectedFunc)(EmberVector3 *);
+typedef void  (*Set2DGravityDirectFunc)(EmberVector2);
+typedef void  (*Set2DGravityInjectedFunc)(EmberVector2 *);
+typedef void  (*UnitySendMessageFunc)(const char *, const char *, const char *);
 
-typedef void (*Set3DGravityInjectedFunc)(Vector3*);
-typedef void (*Set3DGravityDirectFunc)(Vector3);
+static void         *(*g_il2cpp_resolve_icall)(const char *)                              = NULL;
+static Il2CppDomain *(*g_il2cpp_domain_get)(void)                                         = NULL;
+static Il2CppThread *(*g_il2cpp_thread_attach)(Il2CppDomain *)                            = NULL;
+static Il2CppAssembly **(*g_il2cpp_domain_get_assemblies)(const Il2CppDomain *, size_t *) = NULL;
+static const Il2CppImage *(*g_il2cpp_assembly_get_image)(const Il2CppAssembly *)          = NULL;
+static Il2CppClass *(*g_il2cpp_class_from_name)(const Il2CppImage *, const char *, const char *)   = NULL;
+static const MethodInfo *(*g_il2cpp_class_get_method_from_name)(Il2CppClass *, const char *, int)  = NULL;
+static Il2CppObject *(*g_il2cpp_runtime_invoke)(const MethodInfo *, void *, void **, Il2CppObject **) = NULL;
+static Il2CppString *(*g_il2cpp_string_new)(const char *)                                 = NULL;
 
-typedef void (*Set2DGravityInjectedFunc)(Vector2*);
-typedef void (*Set2DGravityDirectFunc)(Vector2);
+static UnitySendMessageFunc      g_unity_send_message         = NULL;
+static SetTimeScaleFunc          g_set_time_scale             = NULL;
+static GetTimeScaleFunc          g_get_time_scale             = NULL;
+static SetFixedDeltaTimeFunc     g_set_fixed_delta_time       = NULL;
+static Set3DGravityInjectedFunc  g_set_3d_gravity_injected    = NULL;
+static Set3DGravityDirectFunc    g_set_3d_gravity_direct      = NULL;
+static Set2DGravityInjectedFunc  g_set_2d_gravity_injected    = NULL;
+static Set2DGravityDirectFunc    g_set_2d_gravity_direct      = NULL;
 
-typedef void (*UnitySendMessageFunc)(const char*, const char*, const char*);
+// Reflection fallback: when icalls are not exported.
+static const MethodInfo *g_set_time_scale_method       = NULL;
+static const MethodInfo *g_set_fixed_delta_time_method = NULL;
+static const MethodInfo *g_set_3d_gravity_method       = NULL;
+static const MethodInfo *g_set_2d_gravity_method       = NULL;
+static const MethodInfo *g_load_scene_int_method       = NULL;
+static const MethodInfo *g_load_scene_string_method    = NULL;
 
-// MARK: - Constants & Settings Keys
-static NSString *const kEmberSpeedKey = @"EmberGettingOverIt.speed";
-static NSString *const kEmberGravityKey = @"EmberGettingOverIt.gravity";
-static NSString *const kEmberGhostModeKey = @"EmberGettingOverIt.ghostMode";
-static NSString *const kEmberSuperGripKey = @"EmberGettingOverIt.superGrip";
-static NSString *const kEmberStatsHudKey = @"EmberGettingOverIt.statsHud";
+/// Reports whether the icall pointer table is populated enough to control the
+/// game. Reflection alone is not counted, since `runtime_invoke` needs a
+/// managed thread and much heavier setup.
+static BOOL EmberIcallsResolved(void) {
+    return g_set_time_scale != NULL || g_set_3d_gravity_direct != NULL || g_set_3d_gravity_injected != NULL;
+}
 
-// MARK: - IL2CPP Function Pointers
-static void* (*g_il2cpp_resolve_icall)(const char*) = NULL;
-static Il2CppDomain* (*il2cpp_domain_get)(void) = NULL;
-static Il2CppThread* (*il2cpp_thread_attach)(Il2CppDomain* domain) = NULL;
-static Il2CppAssembly** (*il2cpp_domain_get_assemblies)(const Il2CppDomain* domain, size_t* size) = NULL;
-static const Il2CppImage* (*il2cpp_assembly_get_image)(const Il2CppAssembly* assembly) = NULL;
-static Il2CppClass* (*il2cpp_class_from_name)(const Il2CppImage* image, const char* namespaze, const char* name) = NULL;
-static const MethodInfo* (*il2cpp_class_get_method_from_name)(Il2CppClass* klass, const char* name, int argsCount) = NULL;
-static Il2CppObject* (*il2cpp_runtime_invoke)(const MethodInfo* method, void* obj, void** params, Il2CppObject** exc) = NULL;
+static BOOL EmberReflectionResolved(void) {
+    return g_set_time_scale_method != NULL || g_set_3d_gravity_method != NULL;
+}
 
-static UnitySendMessageFunc g_UnitySendMessage = NULL;
+static NSString *g_resolvedSource = @"none";
+static NSMutableSet<NSString *> *g_resolvedIcalls;
 
-static SetTimeScaleFunc g_setTimeScale = NULL;
-static GetTimeScaleFunc g_getTimeScale = NULL;
-static SetFixedDeltaTimeFunc g_setFixedDeltaTime = NULL;
+#pragma mark - Symbol probing
 
-static Set3DGravityInjectedFunc g_set3DGravityInjected = NULL;
-static Set3DGravityDirectFunc g_set3DGravityDirect = NULL;
+/// Tries to fill in every not-yet-known symbol from `handle`.
+///
+/// Called for every candidate handle, so unfound symbols get another chance
+/// from the next one. `label` is recorded only on the first successful
+/// resolution — that is what tells us where the exports actually live.
+static void EmberProbeHandle(void *handle, NSString *label) {
+    if (!handle) return;
 
-static Set2DGravityInjectedFunc g_set2DGravityInjected = NULL;
-static Set2DGravityDirectFunc g_set2DGravityDirect = NULL;
+#define TRY(var, name) do { \
+    if (!var) { \
+        void *sym = dlsym(handle, name); \
+        if (sym) { \
+            var = sym; \
+            if ([g_resolvedSource isEqualToString:@"none"]) g_resolvedSource = label; \
+        } \
+    } \
+} while (0)
 
-static const MethodInfo* set_timeScale_method = NULL;
-static const MethodInfo* set_fixedDeltaTime_method = NULL;
-static const MethodInfo* set_3d_gravity_method = NULL;
-static const MethodInfo* set_2d_gravity_method = NULL;
-static const MethodInfo* load_scene_method = NULL;
+    TRY(g_il2cpp_resolve_icall,               "il2cpp_resolve_icall");
+    TRY(g_il2cpp_domain_get,                  "il2cpp_domain_get");
+    TRY(g_il2cpp_thread_attach,               "il2cpp_thread_attach");
+    TRY(g_il2cpp_domain_get_assemblies,       "il2cpp_domain_get_assemblies");
+    TRY(g_il2cpp_assembly_get_image,          "il2cpp_assembly_get_image");
+    TRY(g_il2cpp_class_from_name,             "il2cpp_class_from_name");
+    TRY(g_il2cpp_class_get_method_from_name,  "il2cpp_class_get_method_from_name");
+    TRY(g_il2cpp_runtime_invoke,              "il2cpp_runtime_invoke");
+    TRY(g_il2cpp_string_new,                  "il2cpp_string_new");
+    TRY(g_unity_send_message,                 "UnitySendMessage");
 
-static BOOL il2cpp_resolved = NO;
-static NSString *resolvedSource = @"Native / IL2CPP";
-static NSMutableDictionary *classesResolved;
+#undef TRY
+}
 
-// MARK: - Main Controller
-@interface EmberGettingOverItController : NSObject <UIGestureRecognizerDelegate>
-@property (nonatomic, weak) UIButton *button;
-@property (nonatomic, weak) UIWindow *hostWindow;
-@property (nonatomic, strong) UIView *statsHud;
-@property (nonatomic, strong) UILabel *statsHudLabel;
+/// Every framework the game bundle carries, at absolute paths.
+///
+/// `dlopen("UnityFramework.framework/UnityFramework")` — the previous
+/// resolver's approach — never finds anything, because the framework lives
+/// under `@rpath`. The bundle knows the real path; use it.
+static NSArray<NSString *> *EmberFrameworkCandidates(void) {
+    NSMutableArray<NSString *> *out = [NSMutableArray new];
+    NSString *root = NSBundle.mainBundle.privateFrameworksPath;
+    if (!root) return out;
+
+    NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:root error:nil];
+    for (NSString *name in names) {
+        if (![name.pathExtension isEqualToString:@"framework"]) continue;
+        NSString *base = [name stringByDeletingPathExtension];
+        [out addObject:[[root stringByAppendingPathComponent:name] stringByAppendingPathComponent:base]];
+    }
+    return out;
+}
+
+static void EmberProbeIL2CPPSymbols(void) {
+    // Any of these may contain the symbols. Try each even after some are
+    // found, so a mixed-load process gets its pointers filled in.
+    EmberProbeHandle(RTLD_DEFAULT,           @"RTLD_DEFAULT");
+    EmberProbeHandle(RTLD_MAIN_ONLY,         @"main executable");
+    EmberProbeHandle(RTLD_NEXT,              @"next");
+
+    void *self_handle = dlopen(NULL, RTLD_LAZY | RTLD_NOLOAD);
+    EmberProbeHandle(self_handle, @"self (no-load)");
+    // dlopen(NULL) does not add a reference, so this dlclose is a no-op —
+    // included for the analyser's sake.
+    if (self_handle) dlclose(self_handle);
+
+    for (NSString *path in EmberFrameworkCandidates()) {
+        // RTLD_NOLOAD first: query without pulling the framework in, so we do
+        // not affect the game's own loader sequence.
+        void *handle = dlopen(path.UTF8String, RTLD_LAZY | RTLD_NOLOAD);
+        if (!handle) {
+            handle = dlopen(path.UTF8String, RTLD_LAZY);
+        }
+        EmberProbeHandle(handle, [NSString stringWithFormat:@"framework: %@", path.lastPathComponent]);
+    }
+}
+
+static void EmberResolveMethods(void) {
+    if (!g_il2cpp_domain_get || !g_il2cpp_domain_get_assemblies ||
+        !g_il2cpp_assembly_get_image || !g_il2cpp_class_from_name ||
+        !g_il2cpp_class_get_method_from_name) return;
+
+    Il2CppDomain *domain = g_il2cpp_domain_get();
+    if (!domain) return;
+
+    size_t count = 0;
+    Il2CppAssembly **assemblies = g_il2cpp_domain_get_assemblies(domain, &count);
+    if (!assemblies || count == 0) return;
+
+    for (size_t i = 0; i < count; i++) {
+        const Il2CppImage *image = g_il2cpp_assembly_get_image(assemblies[i]);
+        if (!image) continue;
+
+        if (!g_set_time_scale_method) {
+            Il2CppClass *cls = g_il2cpp_class_from_name(image, "UnityEngine", "Time");
+            if (cls) {
+                g_set_time_scale_method       = g_il2cpp_class_get_method_from_name(cls, "set_timeScale", 1);
+                g_set_fixed_delta_time_method = g_il2cpp_class_get_method_from_name(cls, "set_fixedDeltaTime", 1);
+            }
+        }
+        if (!g_set_3d_gravity_method) {
+            Il2CppClass *cls = g_il2cpp_class_from_name(image, "UnityEngine", "Physics");
+            if (cls) g_set_3d_gravity_method = g_il2cpp_class_get_method_from_name(cls, "set_gravity", 1);
+        }
+        if (!g_set_2d_gravity_method) {
+            Il2CppClass *cls = g_il2cpp_class_from_name(image, "UnityEngine", "Physics2D");
+            if (cls) g_set_2d_gravity_method = g_il2cpp_class_get_method_from_name(cls, "set_gravity", 1);
+        }
+        if (!g_load_scene_int_method || !g_load_scene_string_method) {
+            Il2CppClass *cls = g_il2cpp_class_from_name(image, "UnityEngine.SceneManagement", "SceneManager");
+            if (cls) {
+                if (!g_load_scene_int_method)
+                    g_load_scene_int_method = g_il2cpp_class_get_method_from_name(cls, "LoadScene", 1);
+                if (!g_load_scene_string_method) {
+                    // Same name, same overload count from IL2CPP's point of
+                    // view; the returned pointer might correspond to either
+                    // overload depending on which the linker kept. Store it
+                    // separately so a caller can prefer the int form.
+                    g_load_scene_string_method = g_il2cpp_class_get_method_from_name(cls, "LoadSceneAsync", 1);
+                }
+            }
+        }
+    }
+}
+
+static void EmberResolveIcalls(void) {
+    if (!g_il2cpp_resolve_icall) return;
+
+    void (^tryIcall)(const char *, void **) = ^(const char *name, void **slot) {
+        if (*slot) return;
+        void *fn = g_il2cpp_resolve_icall(name);
+        if (fn) {
+            *slot = fn;
+            [g_resolvedIcalls addObject:[NSString stringWithUTF8String:name]];
+        }
+    };
+
+    tryIcall("UnityEngine.Time::set_timeScale(System.Single)",              (void **)&g_set_time_scale);
+    tryIcall("UnityEngine.Time::set_timeScale",                             (void **)&g_set_time_scale);
+    tryIcall("UnityEngine.Time::get_timeScale()",                           (void **)&g_get_time_scale);
+    tryIcall("UnityEngine.Time::get_timeScale",                             (void **)&g_get_time_scale);
+    tryIcall("UnityEngine.Time::set_fixedDeltaTime(System.Single)",         (void **)&g_set_fixed_delta_time);
+    tryIcall("UnityEngine.Time::set_fixedDeltaTime",                        (void **)&g_set_fixed_delta_time);
+
+    tryIcall("UnityEngine.Physics::set_gravity_Injected(UnityEngine.Vector3&)",
+             (void **)&g_set_3d_gravity_injected);
+    tryIcall("UnityEngine.Physics::set_gravity(UnityEngine.Vector3)",       (void **)&g_set_3d_gravity_direct);
+    tryIcall("UnityEngine.Physics::set_gravity",                            (void **)&g_set_3d_gravity_direct);
+
+    tryIcall("UnityEngine.Physics2D::set_gravity_Injected(UnityEngine.Vector2&)",
+             (void **)&g_set_2d_gravity_injected);
+    tryIcall("UnityEngine.Physics2D::set_gravity(UnityEngine.Vector2)",     (void **)&g_set_2d_gravity_direct);
+    tryIcall("UnityEngine.Physics2D::set_gravity",                          (void **)&g_set_2d_gravity_direct);
+}
+
+/// A single attempt at fully resolving. Returns YES once anything useful is in
+/// place so the tick can stop retrying.
+static BOOL EmberTryResolve(void) {
+    EmberProbeIL2CPPSymbols();
+    EmberResolveIcalls();
+    EmberResolveMethods();
+    return EmberIcallsResolved() || EmberReflectionResolved();
+}
+
+static void EmberEnsureThreadAttached(void) {
+    if (g_il2cpp_thread_attach && g_il2cpp_domain_get) {
+        Il2CppDomain *domain = g_il2cpp_domain_get();
+        if (domain) g_il2cpp_thread_attach(domain);
+    }
+}
+
+#pragma mark - Controller
+
+@interface EmberGettingOverItController : NSObject
+@property (nonatomic, weak)   UIButton      *button;
+@property (nonatomic, weak)   UIWindow      *hostWindow;
+@property (nonatomic, strong) UIView        *statsHud;
+@property (nonatomic, strong) UILabel       *statsHudLabel;
 @property (nonatomic, strong) CADisplayLink *displayLink;
-@property (nonatomic, strong) NSTimer *keepAliveTimer;
-@property (nonatomic, strong) UIPanGestureRecognizer *assistPanGesture;
+@property (nonatomic, strong) NSTimer       *keepAliveTimer;
 
-@property (nonatomic, assign) NSInteger frames;
-@property (nonatomic, assign) CFTimeInterval lastFrameTime;
-@property (nonatomic, assign) double currentFPS;
+@property (nonatomic, assign) NSInteger      frames;
+@property (nonatomic, assign) CFTimeInterval fpsBucketStart;
+@property (nonatomic, assign) double         currentFPS;
+@property (nonatomic, assign) BOOL           resolved;
+@property (nonatomic, assign) NSTimeInterval nextResolveAttempt;
 
 @property (nonatomic, assign) CGFloat speedFactor;
 @property (nonatomic, assign) CGFloat gravityFactor;
-@property (nonatomic, assign) BOOL ghostModeEnabled;
-@property (nonatomic, assign) BOOL superGripEnabled;
-@property (nonatomic, assign) BOOL statsHudEnabled;
+@property (nonatomic, assign) BOOL    ghostModeEnabled;
+@property (nonatomic, assign) BOOL    superGripEnabled;
+@property (nonatomic, assign) BOOL    statsHudEnabled;
 
 + (instancetype)sharedController;
 @end
@@ -100,297 +302,187 @@ static NSMutableDictionary *classesResolved;
 
 + (instancetype)sharedController {
     static EmberGettingOverItController *controller;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         controller = [EmberGettingOverItController new];
+        g_resolvedIcalls = [NSMutableSet set];
         [controller loadSettings];
-        [controller resolveIL2CPP];
-        
+
         controller.displayLink = [CADisplayLink displayLinkWithTarget:controller selector:@selector(tick:)];
-        [controller.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        [controller.displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     });
     return controller;
 }
 
+#pragma mark Settings
+
 - (void)loadSettings {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    NSNumber *savedSpeed = [defaults objectForKey:kEmberSpeedKey];
-    self.speedFactor = savedSpeed ? savedSpeed.doubleValue : 1.0;
-    NSNumber *savedGravity = [defaults objectForKey:kEmberGravityKey];
-    self.gravityFactor = savedGravity ? savedGravity.doubleValue : 1.0;
-    self.ghostModeEnabled = [defaults boolForKey:kEmberGhostModeKey];
-    self.superGripEnabled = [defaults boolForKey:kEmberSuperGripKey];
-    self.statsHudEnabled = [defaults boolForKey:kEmberStatsHudKey];
+    self.speedFactor      = [defaults objectForKey:@"EmberGettingOverIt.speed"]   ? [defaults doubleForKey:@"EmberGettingOverIt.speed"]   : 1.0;
+    self.gravityFactor    = [defaults objectForKey:@"EmberGettingOverIt.gravity"] ? [defaults doubleForKey:@"EmberGettingOverIt.gravity"] : 1.0;
+    self.ghostModeEnabled = [defaults boolForKey:@"EmberGettingOverIt.ghostMode"];
+    self.superGripEnabled = [defaults boolForKey:@"EmberGettingOverIt.superGrip"];
+    self.statsHudEnabled  = [defaults boolForKey:@"EmberGettingOverIt.statsHud"];
 }
 
 - (void)saveSettings {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    [defaults setDouble:self.speedFactor forKey:kEmberSpeedKey];
-    [defaults setDouble:self.gravityFactor forKey:kEmberGravityKey];
-    [defaults setBool:self.ghostModeEnabled forKey:kEmberGhostModeKey];
-    [defaults setBool:self.superGripEnabled forKey:kEmberSuperGripKey];
-    [defaults setBool:self.statsHudEnabled forKey:kEmberStatsHudKey];
+    [defaults setDouble:self.speedFactor   forKey:@"EmberGettingOverIt.speed"];
+    [defaults setDouble:self.gravityFactor forKey:@"EmberGettingOverIt.gravity"];
+    [defaults setBool:self.ghostModeEnabled forKey:@"EmberGettingOverIt.ghostMode"];
+    [defaults setBool:self.superGripEnabled forKey:@"EmberGettingOverIt.superGrip"];
+    [defaults setBool:self.statsHudEnabled  forKey:@"EmberGettingOverIt.statsHud"];
 }
 
-static void TryProbeHandle(void *h, const char *sourceLabel) {
-    if (!h) return;
-    
-    if (!g_il2cpp_resolve_icall) {
-        g_il2cpp_resolve_icall = dlsym(h, "il2cpp_resolve_icall");
-        if (g_il2cpp_resolve_icall) resolvedSource = [NSString stringWithUTF8String:sourceLabel];
-    }
-    if (!il2cpp_domain_get) {
-        il2cpp_domain_get = dlsym(h, "il2cpp_domain_get");
-        if (il2cpp_domain_get) resolvedSource = [NSString stringWithUTF8String:sourceLabel];
-    }
-    if (!il2cpp_thread_attach) il2cpp_thread_attach = dlsym(h, "il2cpp_thread_attach");
-    if (!il2cpp_domain_get_assemblies) il2cpp_domain_get_assemblies = dlsym(h, "il2cpp_domain_get_assemblies");
-    if (!il2cpp_assembly_get_image) il2cpp_assembly_get_image = dlsym(h, "il2cpp_assembly_get_image");
-    if (!il2cpp_class_from_name) il2cpp_class_from_name = dlsym(h, "il2cpp_class_from_name");
-    if (!il2cpp_class_get_method_from_name) il2cpp_class_get_method_from_name = dlsym(h, "il2cpp_class_get_method_from_name");
-    if (!il2cpp_runtime_invoke) il2cpp_runtime_invoke = dlsym(h, "il2cpp_runtime_invoke");
-    if (!g_UnitySendMessage) g_UnitySendMessage = dlsym(h, "UnitySendMessage");
-}
+#pragma mark Applying game state
 
-static void ProbeIL2CPPSymbols(void) {
-    if (g_il2cpp_resolve_icall && il2cpp_domain_get) return;
-    
-    // Check targeted handles only (avoid scanning entire shared cache)
-    TryProbeHandle(RTLD_DEFAULT, "RTLD_DEFAULT");
-    TryProbeHandle(dlopen(NULL, RTLD_LAZY), "Main Executable");
-    TryProbeHandle(dlopen("UnityFramework.framework/UnityFramework", RTLD_LAZY), "UnityFramework");
-    TryProbeHandle(dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_LAZY), "UnityFramework");
-}
-
-- (void)ensureThreadAttached {
-    if (il2cpp_thread_attach && il2cpp_domain_get) {
-        Il2CppDomain *domain = il2cpp_domain_get();
-        if (domain) {
-            il2cpp_thread_attach(domain);
-        }
-    }
-}
-
-- (BOOL)resolveIL2CPP {
-    ProbeIL2CPPSymbols();
-    [self ensureThreadAttached];
-    
-    if (!classesResolved) {
-        classesResolved = [NSMutableDictionary dictionary];
-    }
-    
-    // 1. Direct icall resolution
-    if (g_il2cpp_resolve_icall) {
-        if (!g_setTimeScale) {
-            g_setTimeScale = (SetTimeScaleFunc)g_il2cpp_resolve_icall("UnityEngine.Time::set_timeScale(System.Single)");
-            if (!g_setTimeScale) g_setTimeScale = (SetTimeScaleFunc)g_il2cpp_resolve_icall("UnityEngine.Time::set_timeScale");
-            if (g_setTimeScale) classesResolved[@"icall:Time::set_timeScale"] = @YES;
-        }
-        if (!g_getTimeScale) {
-            g_getTimeScale = (GetTimeScaleFunc)g_il2cpp_resolve_icall("UnityEngine.Time::get_timeScale()");
-            if (!g_getTimeScale) g_getTimeScale = (GetTimeScaleFunc)g_il2cpp_resolve_icall("UnityEngine.Time::get_timeScale");
-            if (g_getTimeScale) classesResolved[@"icall:Time::get_timeScale"] = @YES;
-        }
-        if (!g_setFixedDeltaTime) {
-            g_setFixedDeltaTime = (SetFixedDeltaTimeFunc)g_il2cpp_resolve_icall("UnityEngine.Time::set_fixedDeltaTime(System.Single)");
-            if (!g_setFixedDeltaTime) g_setFixedDeltaTime = (SetFixedDeltaTimeFunc)g_il2cpp_resolve_icall("UnityEngine.Time::set_fixedDeltaTime");
-            if (g_setFixedDeltaTime) classesResolved[@"icall:Time::set_fixedDeltaTime"] = @YES;
-        }
-        
-        // 3D Physics
-        if (!g_set3DGravityInjected && !g_set3DGravityDirect) {
-            g_set3DGravityInjected = (Set3DGravityInjectedFunc)g_il2cpp_resolve_icall("UnityEngine.Physics::set_gravity_Injected(UnityEngine.Vector3&)");
-            if (!g_set3DGravityInjected) g_set3DGravityDirect = (Set3DGravityDirectFunc)g_il2cpp_resolve_icall("UnityEngine.Physics::set_gravity(UnityEngine.Vector3)");
-            if (!g_set3DGravityInjected && !g_set3DGravityDirect) g_set3DGravityDirect = (Set3DGravityDirectFunc)g_il2cpp_resolve_icall("UnityEngine.Physics::set_gravity");
-            if (g_set3DGravityInjected || g_set3DGravityDirect) classesResolved[@"icall:Physics::set_gravity"] = @YES;
-        }
-        
-        // 2D Physics
-        if (!g_set2DGravityInjected && !g_set2DGravityDirect) {
-            g_set2DGravityInjected = (Set2DGravityInjectedFunc)g_il2cpp_resolve_icall("UnityEngine.Physics2D::set_gravity_Injected(UnityEngine.Vector2&)");
-            if (!g_set2DGravityInjected) g_set2DGravityDirect = (Set2DGravityDirectFunc)g_il2cpp_resolve_icall("UnityEngine.Physics2D::set_gravity(UnityEngine.Vector2)");
-            if (g_set2DGravityInjected || g_set2DGravityDirect) classesResolved[@"icall:Physics2D::set_gravity"] = @YES;
-        }
-    }
-    
-    // 2. Reflection fallback via assemblies
-    if (il2cpp_domain_get && il2cpp_class_from_name && il2cpp_runtime_invoke) {
-        Il2CppDomain* domain = il2cpp_domain_get();
-        if (domain) {
-            size_t count = 0;
-            Il2CppAssembly** assemblies = il2cpp_domain_get_assemblies ? il2cpp_domain_get_assemblies(domain, &count) : NULL;
-            if (assemblies && count > 0) {
-                for (size_t i = 0; i < count; i++) {
-                    const Il2CppImage* image = il2cpp_assembly_get_image ? il2cpp_assembly_get_image(assemblies[i]) : NULL;
-                    if (!image) continue;
-                    
-                    if (!set_timeScale_method) {
-                        Il2CppClass* timeClass = il2cpp_class_from_name(image, "UnityEngine", "Time");
-                        if (timeClass) {
-                            set_timeScale_method = il2cpp_class_get_method_from_name(timeClass, "set_timeScale", 1);
-                            set_fixedDeltaTime_method = il2cpp_class_get_method_from_name(timeClass, "set_fixedDeltaTime", 1);
-                            if (set_timeScale_method) classesResolved[@"UnityEngine.Time"] = @YES;
-                        }
-                    }
-                    if (!set_3d_gravity_method) {
-                        Il2CppClass* physicsClass = il2cpp_class_from_name(image, "UnityEngine", "Physics");
-                        if (physicsClass) {
-                            set_3d_gravity_method = il2cpp_class_get_method_from_name(physicsClass, "set_gravity", 1);
-                            if (set_3d_gravity_method) classesResolved[@"UnityEngine.Physics"] = @YES;
-                        }
-                    }
-                    if (!set_2d_gravity_method) {
-                        Il2CppClass* physics2DClass = il2cpp_class_from_name(image, "UnityEngine", "Physics2D");
-                        if (physics2DClass) {
-                            set_2d_gravity_method = il2cpp_class_get_method_from_name(physics2DClass, "set_gravity", 1);
-                            if (set_2d_gravity_method) classesResolved[@"UnityEngine.Physics2D"] = @YES;
-                        }
-                    }
-                    if (!load_scene_method) {
-                        Il2CppClass* sceneManagerClass = il2cpp_class_from_name(image, "UnityEngine.SceneManagement", "SceneManager");
-                        if (sceneManagerClass) {
-                            load_scene_method = il2cpp_class_get_method_from_name(sceneManagerClass, "LoadScene", 1);
-                            if (load_scene_method) classesResolved[@"UnityEngine.SceneManagement.SceneManager"] = @YES;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    il2cpp_resolved = (g_setTimeScale != NULL || set_timeScale_method != NULL || g_set3DGravityInjected != NULL || set_3d_gravity_method != NULL);
-    [self updateStatusPlist];
-    return il2cpp_resolved;
+- (CGFloat)effectiveGravityFactor {
+    if (self.ghostModeEnabled)     return 0.0;
+    if (self.superGripEnabled)     return MIN(self.gravityFactor, 0.45);
+    return self.gravityFactor;
 }
 
 - (void)applyTimeScale {
-    [self ensureThreadAttached];
+    if (!self.resolved) return;
+    EmberEnsureThreadAttached();
+
     float speed = (float)self.speedFactor;
-    float fixedDt = 0.02f * speed;
-    
-    if (g_setTimeScale) {
-        g_setTimeScale(speed);
-        if (g_setFixedDeltaTime) g_setFixedDeltaTime(fixedDt);
-    } else if (set_timeScale_method && il2cpp_runtime_invoke) {
-        void* args[1] = { &speed };
+    float fixed = 0.02f * speed;
+
+    if (g_set_time_scale) {
+        g_set_time_scale(speed);
+        if (g_set_fixed_delta_time) g_set_fixed_delta_time(fixed);
+    } else if (g_set_time_scale_method && g_il2cpp_runtime_invoke) {
+        void *args[1] = { &speed };
         Il2CppObject *exc = NULL;
-        il2cpp_runtime_invoke(set_timeScale_method, NULL, args, &exc);
-        
-        if (set_fixedDeltaTime_method) {
-            void* dtArgs[1] = { &fixedDt };
-            il2cpp_runtime_invoke(set_fixedDeltaTime_method, NULL, dtArgs, &exc);
+        g_il2cpp_runtime_invoke(g_set_time_scale_method, NULL, args, &exc);
+        if (g_set_fixed_delta_time_method) {
+            void *dtArgs[1] = { &fixed };
+            g_il2cpp_runtime_invoke(g_set_fixed_delta_time_method, NULL, dtArgs, &exc);
         }
     }
 }
 
 - (void)applyGravity {
-    [self ensureThreadAttached];
-    CGFloat factor = self.gravityFactor;
-    if (self.ghostModeEnabled) {
-        factor = 0.0;
-    } else if (self.superGripEnabled) {
-        factor = MIN(factor, 0.45);
-    }
-    
-    // 3D PhysX Gravity
-    Vector3 grav3 = { 0.0f, -9.81f * (float)factor, 0.0f };
-    if (g_set3DGravityInjected) {
-        g_set3DGravityInjected(&grav3);
-    } else if (g_set3DGravityDirect) {
-        g_set3DGravityDirect(grav3);
-    } else if (set_3d_gravity_method && il2cpp_runtime_invoke) {
-        void* args[1] = { &grav3 };
+    if (!self.resolved) return;
+    EmberEnsureThreadAttached();
+
+    float factor = (float)[self effectiveGravityFactor];
+
+    EmberVector3 g3 = { 0.0f, -9.81f * factor, 0.0f };
+    if (g_set_3d_gravity_injected) {
+        g_set_3d_gravity_injected(&g3);
+    } else if (g_set_3d_gravity_direct) {
+        g_set_3d_gravity_direct(g3);
+    } else if (g_set_3d_gravity_method && g_il2cpp_runtime_invoke) {
+        void *args[1] = { &g3 };
         Il2CppObject *exc = NULL;
-        il2cpp_runtime_invoke(set_3d_gravity_method, NULL, args, &exc);
+        g_il2cpp_runtime_invoke(g_set_3d_gravity_method, NULL, args, &exc);
     }
-    
-    // 2D Box2D Gravity
-    Vector2 grav2 = { 0.0f, -9.81f * (float)factor };
-    if (g_set2DGravityInjected) {
-        g_set2DGravityInjected(&grav2);
-    } else if (g_set2DGravityDirect) {
-        g_set2DGravityDirect(grav2);
-    } else if (set_2d_gravity_method && il2cpp_runtime_invoke) {
-        void* args[1] = { &grav2 };
+
+    // Also apply on the 2D world, in case the game uses it — Getting Over It
+    // historically has, and there is no harm in setting both.
+    EmberVector2 g2 = { 0.0f, -9.81f * factor };
+    if (g_set_2d_gravity_injected) {
+        g_set_2d_gravity_injected(&g2);
+    } else if (g_set_2d_gravity_direct) {
+        g_set_2d_gravity_direct(g2);
+    } else if (g_set_2d_gravity_method && g_il2cpp_runtime_invoke) {
+        void *args[1] = { &g2 };
         Il2CppObject *exc = NULL;
-        il2cpp_runtime_invoke(set_2d_gravity_method, NULL, args, &exc);
+        g_il2cpp_runtime_invoke(g_set_2d_gravity_method, NULL, args, &exc);
     }
 }
 
-- (void)reloadActiveScene {
-    [self ensureThreadAttached];
-    if (load_scene_method && il2cpp_runtime_invoke) {
-        int sceneIndex = 0;
-        void* args[1] = { &sceneIndex };
-        Il2CppObject *exc = NULL;
-        il2cpp_runtime_invoke(load_scene_method, NULL, args, &exc);
-    }
-}
-
-- (void)maintainEnabledTweaks {
+- (void)pushAllSettingsNow {
     [self applyTimeScale];
     [self applyGravity];
 }
 
-- (void)tick:(CADisplayLink *)link {
-    CFTimeInterval dt = link.timestamp - self.lastFrameTime;
-    self.frames++;
-    if (dt >= 1.0) {
-        self.currentFPS = self.frames / dt;
-        self.frames = 0;
-        self.lastFrameTime = link.timestamp;
+/// Reloads scene 0. Best-effort — Unity may reject a bare integer overload
+/// depending on how the game was built.
+- (void)reloadActiveScene {
+    if (!self.resolved) return;
+    EmberEnsureThreadAttached();
+    if (g_load_scene_int_method && g_il2cpp_runtime_invoke) {
+        int sceneIndex = 0;
+        void *args[1] = { &sceneIndex };
+        Il2CppObject *exc = NULL;
+        g_il2cpp_runtime_invoke(g_load_scene_int_method, NULL, args, &exc);
     }
-    
-    // Frame pacing / slow motion throttling
-    if (self.speedFactor < 0.99) {
-        // Regulate frame pacing when running in slow-mo
-        useconds_t sleepTime = (useconds_t)((1.0 - self.speedFactor) * 12000.0);
-        if (sleepTime > 0 && sleepTime < 30000) {
-            usleep(sleepTime);
+}
+
+#pragma mark Frame tick
+
+- (void)tick:(CADisplayLink *)link {
+    // Frame counter with an initialised bucket start, so the first reading is
+    // sane rather than reporting the ridiculous rate that comes from
+    // `now - 0` on the very first tick.
+    if (self.fpsBucketStart == 0) self.fpsBucketStart = link.timestamp;
+    self.frames++;
+    CFTimeInterval elapsed = link.timestamp - self.fpsBucketStart;
+    if (elapsed >= 1.0) {
+        self.currentFPS = self.frames / elapsed;
+        self.frames = 0;
+        self.fpsBucketStart = link.timestamp;
+    }
+
+    // Keep trying to resolve until we succeed. UnityFramework loads lazily
+    // after the game's own `main` runs, so the first few hundred milliseconds
+    // will nearly always fail — retrying is the whole point. Once resolved,
+    // this branch is inert.
+    if (!self.resolved && link.timestamp >= self.nextResolveAttempt) {
+        if (EmberTryResolve()) {
+            self.resolved = YES;
+            [self pushAllSettingsNow];
+        } else {
+            // Back off a little to keep the display link out of dlsym.
+            self.nextResolveAttempt = link.timestamp + 0.5;
         }
     }
-    
-    [self maintainEnabledTweaks];
-    
+
+    // Once a session, iOS may reset scene state (e.g. when the game itself
+    // sets Time.timeScale back to 1 on a scene load). Cheap to re-push.
+    if (self.resolved) {
+        [self applyTimeScale];
+        // Gravity is intentionally not pushed every frame — Unity's physics
+        // world takes it as authoritative until something writes it again, and
+        // pushing it every frame competes with the game's own respawn code.
+    }
+
     if (self.statsHudEnabled && self.statsHudLabel && self.statsHud) {
         self.statsHud.hidden = NO;
-        NSString *status = (g_setTimeScale || set_timeScale_method || g_set3DGravityInjected || set_3d_gravity_method) ? @"Active (PhysX)" : @"Active (Pacing)";
-        self.statsHudLabel.text = [NSString stringWithFormat:@"FPS: %.0f\nSpd: %.2gx  Grv: %.2gx\nEngine: %@\nGrip: %@  Ghost: %@",
-                                   self.currentFPS, self.speedFactor, self.gravityFactor,
-                                   status,
-                                   self.superGripEnabled ? @"ON" : @"OFF",
-                                   self.ghostModeEnabled ? @"ON" : @"OFF"];
+        NSString *engine = EmberIcallsResolved()      ? [NSString stringWithFormat:@"icalls (%@)", g_resolvedSource]
+                        : EmberReflectionResolved()   ? [NSString stringWithFormat:@"reflection (%@)", g_resolvedSource]
+                                                      : @"waiting for Unity…";
+        self.statsHudLabel.text = [NSString stringWithFormat:
+            @"FPS: %.0f\nSpd: %.2gx  Grv: %.2gx\nEngine: %@\nGrip: %@  Ghost: %@",
+            self.currentFPS, self.speedFactor, [self effectiveGravityFactor],
+            engine,
+            self.superGripEnabled ? @"ON" : @"OFF",
+            self.ghostModeEnabled ? @"ON" : @"OFF"];
     } else if (self.statsHud) {
         self.statsHud.hidden = YES;
     }
 }
+
+#pragma mark UI plumbing
 
 - (UIWindow *)guestWindow {
     UIWindow *best = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-            if (window.hidden || !window.rootViewController || window.windowLevel > UIWindowLevelNormal) continue;
+            if (window.hidden || !window.rootViewController) continue;
+            if (window.windowLevel > UIWindowLevelNormal) continue;
             if (!best || window.isKeyWindow) best = window;
         }
     }
-    if (best) return best;
-    
-    for (UIWindow *window in UIApplication.sharedApplication.windows) {
-        if (window.hidden || !window.rootViewController || window.windowLevel > UIWindowLevelNormal) continue;
-        if (!best || window.isKeyWindow) best = window;
-    }
-    if (best) return best;
-    
-    return UIApplication.sharedApplication.keyWindow;
+    return best ?: UIApplication.sharedApplication.keyWindow;
 }
 
 - (UIViewController *)topViewController {
-    UIViewController *controller = self.hostWindow.rootViewController;
-    if (!controller) {
-        UIWindow *window = [self guestWindow];
-        controller = window.rootViewController;
-    }
+    UIViewController *controller = self.hostWindow.rootViewController ?: [self guestWindow].rootViewController;
     while (controller.presentedViewController) controller = controller.presentedViewController;
     return controller;
 }
@@ -401,11 +493,19 @@ static void ProbeIL2CPPSymbols(void) {
 
 - (void)updateButtonTitle {
     if (!self.button) return;
-    NSString *title = (fabs(self.speedFactor - 1.0) < 0.01) ? @"EC 1x" : [NSString stringWithFormat:@"EC %.2gx", self.speedFactor];
+    NSString *title = (fabs(self.speedFactor - 1.0) < 0.01)
+        ? @"EC 1x" : [NSString stringWithFormat:@"EC %.2gx", self.speedFactor];
     [self.button setTitle:title forState:UIControlStateNormal];
-    BOOL active = (fabs(self.speedFactor - 1.0) >= 0.01) || (fabs(self.gravityFactor - 1.0) >= 0.01) || self.ghostModeEnabled || self.superGripEnabled;
-    self.button.backgroundColor = active ? [UIColor colorWithRed:0.98 green:0.38 blue:0.10 alpha:0.94] : [UIColor colorWithWhite:0.10 alpha:0.82];
+    BOOL active = fabs(self.speedFactor - 1.0)   >= 0.01
+                || fabs(self.gravityFactor - 1.0) >= 0.01
+                || self.ghostModeEnabled
+                || self.superGripEnabled;
+    self.button.backgroundColor = active
+        ? [UIColor colorWithRed:0.98 green:0.38 blue:0.10 alpha:0.94]
+        : [UIColor colorWithWhite:0.10 alpha:0.82];
 }
+
+#pragma mark Menu actions
 
 - (void)setPracticeSpeed:(CGFloat)factor {
     self.speedFactor = factor;
@@ -422,29 +522,32 @@ static void ProbeIL2CPPSymbols(void) {
 }
 
 - (void)resetAllTweaks {
-    self.speedFactor = 1.0;
-    self.gravityFactor = 1.0;
+    self.speedFactor      = 1.0;
+    self.gravityFactor    = 1.0;
     self.ghostModeEnabled = NO;
     self.superGripEnabled = NO;
-    self.statsHudEnabled = NO;
     [self saveSettings];
-    [self applyTimeScale];
-    [self applyGravity];
+    [self pushAllSettingsNow];
     [self updateButtonTitle];
 }
 
 - (void)showSpeedMenu {
     UIViewController *presenter = [self topViewController];
     if (!presenter) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Game Speed" message:@"Coordinates game simulation speed and frame pacing." preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController
+        alertControllerWithTitle:@"Game Speed"
+                         message:@"Sets UnityEngine.Time.timeScale — the whole simulation runs slower or faster."
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+
     __weak typeof(self) weakSelf = self;
-    NSArray *speeds = @[@0.25, @0.5, @0.75, @1.0, @1.25, @1.5, @2.0];
-    for (NSNumber *spd in speeds) {
-        CGFloat val = spd.doubleValue;
+    for (NSNumber *num in @[@0.25, @0.5, @0.75, @1.0, @1.25, @1.5, @2.0]) {
+        CGFloat val = num.doubleValue;
         NSString *name = (fabs(val - 1.0) < 0.01) ? @"1.0x (Normal)" : [NSString stringWithFormat:@"%.2gx", val];
-        [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:name selected:fabs(self.speedFactor - val) < 0.01] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf setPracticeSpeed:val]; }]];
+        [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:name selected:fabs(self.speedFactor - val) < 0.01]
+                                                 style:UIAlertActionStyleDefault
+                                               handler:^(UIAlertAction *a) { [weakSelf setPracticeSpeed:val]; }]];
     }
-    [menu addAction:[UIAlertAction actionWithTitle:@"Back" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) { [weakSelf tapped]; }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Back" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) { [weakSelf tapped]; }]];
     menu.popoverPresentationController.sourceView = self.button;
     menu.popoverPresentationController.sourceRect = self.button.bounds;
     [presenter presentViewController:menu animated:YES completion:nil];
@@ -453,15 +556,22 @@ static void ProbeIL2CPPSymbols(void) {
 - (void)showGravityMenu {
     UIViewController *presenter = [self topViewController];
     if (!presenter) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Gravity Multiplier" message:@"Adjusts 3D PhysX gravity acceleration." preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController
+        alertControllerWithTitle:@"Gravity Multiplier"
+                         message:@"Scales UnityEngine.Physics.gravity. Ghost mode overrides to zero."
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+
     __weak typeof(self) weakSelf = self;
-    NSArray *gravities = @[@0.0, @0.25, @0.5, @0.75, @1.0, @1.5];
-    for (NSNumber *num in gravities) {
+    for (NSNumber *num in @[@0.0, @0.25, @0.5, @0.75, @1.0, @1.5]) {
         CGFloat val = num.doubleValue;
-        NSString *name = (fabs(val - 1.0) < 0.01) ? @"1.0x (Normal)" : (val < 0.01 ? @"0.0x (Zero-G Float)" : [NSString stringWithFormat:@"%.2gx", val]);
-        [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:name selected:fabs(self.gravityFactor - val) < 0.01] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf setPracticeGravity:val]; }]];
+        NSString *name = (fabs(val - 1.0) < 0.01) ? @"1.0x (Normal)"
+                       : (val < 0.01)             ? @"0.0x (Zero-G Float)"
+                                                  : [NSString stringWithFormat:@"%.2gx", val];
+        [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:name selected:fabs(self.gravityFactor - val) < 0.01]
+                                                 style:UIAlertActionStyleDefault
+                                               handler:^(UIAlertAction *a) { [weakSelf setPracticeGravity:val]; }]];
     }
-    [menu addAction:[UIAlertAction actionWithTitle:@"Back" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) { [weakSelf tapped]; }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Back" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) { [weakSelf tapped]; }]];
     menu.popoverPresentationController.sourceView = self.button;
     menu.popoverPresentationController.sourceRect = self.button.bounds;
     [presenter presentViewController:menu animated:YES completion:nil];
@@ -470,21 +580,37 @@ static void ProbeIL2CPPSymbols(void) {
 - (void)showProfilesMenu {
     UIViewController *presenter = [self topViewController];
     if (!presenter) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Practice Profiles" message:@"Presets for Getting Over It practice." preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Practice Profiles"
+                                                                  message:nil
+                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+
     __weak typeof(self) weakSelf = self;
-    [menu addAction:[UIAlertAction actionWithTitle:@"Easy Climb (0.65x Speed, 0.45x Low Gravity, Super Grip)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.speedFactor = 0.65; weakSelf.gravityFactor = 0.45; weakSelf.superGripEnabled = YES; weakSelf.ghostModeEnabled = NO;
-        [weakSelf saveSettings]; [weakSelf applyTimeScale]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
-    }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Moon Jump (0.3x Low Gravity)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.speedFactor = 1.0; weakSelf.gravityFactor = 0.3; weakSelf.superGripEnabled = NO; weakSelf.ghostModeEnabled = NO;
-        [weakSelf saveSettings]; [weakSelf applyTimeScale]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
-    }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Speed Run Mode (1.5x Speed)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.speedFactor = 1.5; weakSelf.gravityFactor = 1.0; weakSelf.superGripEnabled = NO; weakSelf.ghostModeEnabled = NO;
-        [weakSelf saveSettings]; [weakSelf applyTimeScale]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
-    }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Back" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) { [weakSelf tapped]; }]];
+    void (^apply)(CGFloat, CGFloat, BOOL, BOOL) = ^(CGFloat s, CGFloat g, BOOL grip, BOOL ghost) {
+        weakSelf.speedFactor      = s;
+        weakSelf.gravityFactor    = g;
+        weakSelf.superGripEnabled = grip;
+        weakSelf.ghostModeEnabled = ghost;
+        [weakSelf saveSettings];
+        [weakSelf pushAllSettingsNow];
+        [weakSelf updateButtonTitle];
+    };
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Easy Climb — 0.65x speed, 0.45x gravity, grip"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { apply(0.65, 0.45, YES,  NO); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Moon Jump — 0.3x gravity"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { apply(1.0,  0.3,  NO,   NO); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Zero-G Float — no gravity"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { apply(1.0,  1.0,  NO,   YES); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Speed Run — 1.5x speed"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { apply(1.5,  1.0,  NO,   NO); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Ultra Slow — 0.25x for tricky moves"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { apply(0.25, 1.0,  NO,   NO); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Back" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) { [weakSelf tapped]; }]];
     menu.popoverPresentationController.sourceView = self.button;
     menu.popoverPresentationController.sourceRect = self.button.bounds;
     [presenter presentViewController:menu animated:YES completion:nil];
@@ -493,80 +619,117 @@ static void ProbeIL2CPPSymbols(void) {
 - (void)tapped {
     UIViewController *presenter = [self topViewController];
     if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Getting Over It Tools" message:@"Practice controls & physics mods." preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSString *header = self.resolved
+        ? @"Practice controls & physics mods."
+        : @"Waiting for Unity to finish loading. Menu is live but changes only apply once the engine is ready.";
+
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Getting Over It Tools"
+                                                                  message:header
+                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+
     __weak typeof(self) weakSelf = self;
-    NSString *spdStr = (fabs(self.speedFactor - 1.0) < 0.01) ? @"Normal (1.0x)" : [NSString stringWithFormat:@"%.2gx", self.speedFactor];
-    [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Speed: %@  ▶", spdStr] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf showSpeedMenu]; }]];
-    NSString *grvStr = (fabs(self.gravityFactor - 1.0) < 0.01) ? @"Normal (1.0x)" : (self.gravityFactor < 0.01 ? @"Zero-G" : [NSString stringWithFormat:@"%.2gx", self.gravityFactor]);
-    [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Gravity: %@  ▶", grvStr] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf showGravityMenu]; }]];
-    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Ghost Mode (Zero-G Float)" selected:self.ghostModeEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.ghostModeEnabled = !weakSelf.ghostModeEnabled; [weakSelf saveSettings]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
+    NSString *speedText = (fabs(self.speedFactor - 1.0) < 0.01) ? @"Normal (1.0x)" : [NSString stringWithFormat:@"%.2gx", self.speedFactor];
+    [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Speed: %@  ▶", speedText]
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { [weakSelf showSpeedMenu]; }]];
+    NSString *gravText = (fabs(self.gravityFactor - 1.0) < 0.01) ? @"Normal (1.0x)"
+                       : (self.gravityFactor < 0.01)             ? @"Zero-G"
+                                                                 : [NSString stringWithFormat:@"%.2gx", self.gravityFactor];
+    [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Gravity: %@  ▶", gravText]
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { [weakSelf showGravityMenu]; }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Ghost Mode (zero-G float)" selected:self.ghostModeEnabled]
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) {
+        weakSelf.ghostModeEnabled = !weakSelf.ghostModeEnabled;
+        [weakSelf saveSettings]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
     }]];
-    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Super Grip (Touch Assist)" selected:self.superGripEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.superGripEnabled = !weakSelf.superGripEnabled; [weakSelf saveSettings]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
+    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Super Grip (touch assist)" selected:self.superGripEnabled]
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) {
+        weakSelf.superGripEnabled = !weakSelf.superGripEnabled;
+        [weakSelf saveSettings]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
     }]];
-    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Live Stats HUD Overlay" selected:self.statsHudEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.statsHudEnabled = !weakSelf.statsHudEnabled; [weakSelf saveSettings]; [weakSelf updateButtonTitle];
+    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Live Stats HUD" selected:self.statsHudEnabled]
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) {
+        weakSelf.statsHudEnabled = !weakSelf.statsHudEnabled;
+        [weakSelf saveSettings]; [weakSelf updateButtonTitle];
     }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Practice Profiles  ▶" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf showProfilesMenu]; }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Restart / Reload Scene" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf reloadActiveScene]; }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Reset all mods" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) { [weakSelf resetAllTweaks]; }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Practice Profiles  ▶" style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { [weakSelf showProfilesMenu]; }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Restart / Reload Scene" style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { [weakSelf reloadActiveScene]; }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Force Re-Resolve Unity" style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) {
+        weakSelf.resolved = NO;
+        weakSelf.nextResolveAttempt = 0;
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Reset all mods" style:UIAlertActionStyleDestructive
+                                           handler:^(UIAlertAction *a) { [weakSelf resetAllTweaks]; }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
+
     menu.popoverPresentationController.sourceView = self.button;
     menu.popoverPresentationController.sourceRect = self.button.bounds;
     [presenter presentViewController:menu animated:YES completion:nil];
 }
 
+#pragma mark Attach
+
 - (void)install {
     UIWindow *host = [self guestWindow];
     if (!host) return;
-    
+
     UIView *existing = [host viewWithTag:EMBER_GOI_BUTTON_TAG];
     if (existing && [existing isKindOfClass:UIButton.class]) {
         self.button = (UIButton *)existing;
         [host bringSubviewToFront:self.button];
         if (self.statsHud) [host bringSubviewToFront:self.statsHud];
         [self updateButtonTitle];
-        [self maintainEnabledTweaks];
         return;
     }
-    
+
     [self.button removeFromSuperview];
-    
+
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.tag = EMBER_GOI_BUTTON_TAG;
-    button.frame = CGRectMake(MAX(8, CGRectGetWidth(host.bounds) - 84), MAX(8, CGRectGetHeight(host.bounds) - 108), 72, 40);
-    button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+    button.frame = CGRectMake(MAX(8, CGRectGetWidth(host.bounds) - 84),
+                              MAX(8, CGRectGetHeight(host.bounds) - 108), 72, 40);
+    button.autoresizingMask  = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
     button.layer.cornerRadius = 12;
-    button.layer.borderWidth = 1;
-    button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.24].CGColor;
-    button.layer.shadowColor = UIColor.blackColor.CGColor;
+    button.layer.borderWidth  = 1;
+    button.layer.borderColor  = [UIColor colorWithWhite:1 alpha:0.24].CGColor;
+    button.layer.shadowColor  = UIColor.blackColor.CGColor;
     button.layer.shadowOpacity = 0.3;
-    button.layer.shadowRadius = 4;
+    button.layer.shadowRadius  = 4;
     button.tintColor = UIColor.whiteColor;
     [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
+    button.titleLabel.font   = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
     button.accessibilityLabel = @"Getting Over It Tools menu";
     [button addTarget:self action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
-    
+
     [host addSubview:button];
     [host bringSubviewToFront:button];
     self.button = button;
     self.hostWindow = host;
-    
+
     if (!self.statsHud) {
-        UIView *hud = [[UIView alloc] initWithFrame:CGRectMake(12, 44, 160, 88)];
+        UIView *hud = [[UIView alloc] initWithFrame:CGRectMake(12, 44, 190, 92)];
         hud.tag = EMBER_GOI_HUD_TAG;
         hud.backgroundColor = [UIColor colorWithWhite:0 alpha:0.65];
         hud.layer.cornerRadius = 8;
-        hud.layer.borderWidth = 1;
-        hud.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
+        hud.layer.borderWidth  = 1;
+        hud.layer.borderColor  = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
         hud.userInteractionEnabled = NO;
         hud.hidden = YES;
-        
-        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, 144, 80)];
+
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, 174, 84)];
         label.numberOfLines = 0;
-        label.textColor = [UIColor whiteColor];
+        label.textColor = UIColor.whiteColor;
         label.font = [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightMedium];
         [hud addSubview:label];
         self.statsHudLabel = label;
@@ -576,40 +739,22 @@ static void ProbeIL2CPPSymbols(void) {
         [host addSubview:self.statsHud];
         [host bringSubviewToFront:self.statsHud];
     }
-    
+
     [self updateButtonTitle];
-    [self maintainEnabledTweaks];
 }
 
 - (void)start {
     [self install];
     [self.keepAliveTimer invalidate];
     __weak typeof(self) weakSelf = self;
-    self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) { [weakSelf install]; }];
+    self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                          repeats:YES
+                                                            block:^(NSTimer *timer) { [weakSelf install]; }];
 }
 
 - (void)stop {
     [self.keepAliveTimer invalidate];
     self.keepAliveTimer = nil;
-}
-
-- (void)updateStatusPlist {
-    NSString *cacheDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
-    if (!cacheDir) return;
-    NSString *emberDir = [cacheDir stringByAppendingPathComponent:@"EmberConnect"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:emberDir withIntermediateDirectories:YES attributes:nil error:nil];
-    
-    NSString *plistPath = [emberDir stringByAppendingPathComponent:@"GettingOverItStatus.plist"];
-    NSDictionary *status = @{
-        @"state": @"active",
-        @"il2cppResolved": @(il2cpp_resolved),
-        @"resolvedSource": resolvedSource ?: @"None",
-        @"classesResolved": classesResolved ?: @{},
-        @"speed": @(self.speedFactor),
-        @"gravity": @(self.gravityFactor),
-        @"updatedAt": @([NSDate.date timeIntervalSince1970])
-    };
-    [status writeToFile:plistPath atomically:YES];
 }
 
 @end
@@ -618,10 +763,18 @@ __attribute__((constructor))
 static void EmberGettingOverItInit(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         EmberGettingOverItController *controller = [EmberGettingOverItController sharedController];
-        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { [controller start]; }];
-        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { [controller stop]; }];
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                        object:nil
+                                                         queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *note) { [controller start]; }];
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification
+                                                        object:nil
+                                                         queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *note) { [controller stop]; }];
         [controller start];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [controller start]; });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [controller start]; });
     });
 }
