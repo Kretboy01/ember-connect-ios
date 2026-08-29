@@ -268,7 +268,7 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
         @"PayloadUUID": NSUUID.UUID.UUIDString,
         @"PayloadVersion": @(1),
         @"Precomposed": @NO,
-        @"toPayloadOrganization": @"LiveContainer",
+        @"toPayloadOrganization": @"Ember Connect",
         @"URL": appClipUrl
     };
     return @{
@@ -279,7 +279,7 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
         @"PayloadDescription": payload[@"PayloadDescription"],
         @"PayloadDisplayName": self.displayName,
         @"PayloadIdentifier": self.bundleIdentifier,
-        @"PayloadOrganization": @"LiveContainer",
+        @"PayloadOrganization": @"Ember Connect",
         @"PayloadRemovalDisallowed": @(NO),
         @"PayloadType": @"Configuration",
         @"PayloadUUID": @"345097fb-d4f7-4a34-ab90-2e3f1ad62eed",

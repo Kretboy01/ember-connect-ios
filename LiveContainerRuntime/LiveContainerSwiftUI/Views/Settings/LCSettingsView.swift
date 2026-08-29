@@ -22,9 +22,9 @@ enum JITEnablerType : Int, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .StikJIT: "StikDebug"
-        case .StikJITLC: "StikDebug (Another LiveContainer)"
+        case .StikJITLC: "StikDebug (Another Ember Connect)"
         case .StosDebug: "StosDebug"
-        case .StosDebugLC: "StosDebug (Another LiveContainer)"
+        case .StosDebugLC: "StosDebug (Another Ember Connect)"
         case .SideStore: "SideStore"
         case .JITStreamerEBLegacy: "JitStreamer-EB (Relaunch)"
         case .SideJITServer: "SideJITServer/JITStreamer 2.0"
