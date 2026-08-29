@@ -71,6 +71,12 @@ static const MethodInfo *(*g_il2cpp_class_get_method_from_name)(Il2CppClass *, c
 static Il2CppObject *(*g_il2cpp_runtime_invoke)(const MethodInfo *, void *, void **, Il2CppObject **) = NULL;
 static Il2CppString *(*g_il2cpp_string_new)(const char *)                                 = NULL;
 
+// Mono fallback (older Unity). Exposes the same conceptual API under a
+// different set of names; we probe for it in case IL2CPP is not present.
+static void *(*g_mono_get_root_domain)(void)                     = NULL;
+static void *(*g_mono_domain_get)(void)                          = NULL;
+static void *(*g_mono_thread_attach)(void *)                     = NULL;
+
 static UnitySendMessageFunc      g_unity_send_message         = NULL;
 static SetTimeScaleFunc          g_set_time_scale             = NULL;
 static GetTimeScaleFunc          g_get_time_scale             = NULL;
@@ -100,6 +106,32 @@ static BOOL EmberReflectionResolved(void) {
 }
 
 static NSString *g_resolvedSource = @"none";
+static NSMutableString *g_diagLog;
+static NSString *g_diagPath;
+static void EmberLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+static void EmberLog(NSString *fmt, ...) {
+    if (!g_diagLog) g_diagLog = [NSMutableString new];
+    va_list args; va_start(args, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *stamp = [NSString stringWithFormat:@"[%.2f] %@\n",
+                       CACurrentMediaTime(), line];
+    NSLog(@"[Ember/GOI] %@", line);
+    @synchronized(g_diagLog) { [g_diagLog appendString:stamp]; }
+    if (!g_diagPath) {
+        NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        if (dirs.count > 0) {
+            NSString *dir = [dirs.firstObject stringByAppendingPathComponent:@"EmberConnect"];
+            [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            g_diagPath = [dir stringByAppendingPathComponent:@"GettingOverIt-diag.log"];
+        }
+    }
+    if (g_diagPath) {
+        @synchronized(g_diagLog) {
+            [g_diagLog writeToFile:g_diagPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    }
+}
 static NSMutableSet<NSString *> *g_resolvedIcalls;
 
 #pragma mark - Symbol probing
@@ -132,6 +164,10 @@ static void EmberProbeHandle(void *handle, NSString *label) {
     TRY(g_il2cpp_runtime_invoke,              "il2cpp_runtime_invoke");
     TRY(g_il2cpp_string_new,                  "il2cpp_string_new");
     TRY(g_unity_send_message,                 "UnitySendMessage");
+
+    TRY(g_mono_get_root_domain,               "mono_get_root_domain");
+    TRY(g_mono_domain_get,                    "mono_domain_get");
+    TRY(g_mono_thread_attach,                 "mono_thread_attach");
 
 #undef TRY
 }
@@ -172,11 +208,15 @@ static void EmberProbeIL2CPPSymbols(void) {
         // RTLD_NOLOAD first: query without pulling the framework in, so we do
         // not affect the game's own loader sequence.
         void *handle = dlopen(path.UTF8String, RTLD_LAZY | RTLD_NOLOAD);
-        if (!handle) {
-            handle = dlopen(path.UTF8String, RTLD_LAZY);
-        }
+        BOOL wasLoaded = handle != NULL;
+        if (!handle) handle = dlopen(path.UTF8String, RTLD_LAZY);
+        EmberLog(@"framework %@: loaded=%d handle=%p", path.lastPathComponent, wasLoaded, handle);
         EmberProbeHandle(handle, [NSString stringWithFormat:@"framework: %@", path.lastPathComponent]);
     }
+    EmberLog(@"symbols: il2cpp_resolve_icall=%p domain_get=%p thread_attach=%p"
+              " mono_root=%p mono_domain=%p unitySend=%p",
+             g_il2cpp_resolve_icall, g_il2cpp_domain_get, g_il2cpp_thread_attach,
+             g_mono_get_root_domain, g_mono_domain_get, g_unity_send_message);
 }
 
 static void EmberResolveMethods(void) {
@@ -434,10 +474,15 @@ static void EmberEnsureThreadAttached(void) {
     if (!self.resolved && link.timestamp >= self.nextResolveAttempt) {
         if (EmberTryResolve()) {
             self.resolved = YES;
+            EmberLog(@"resolved (icalls=%d reflection=%d source=%@)",
+                     EmberIcallsResolved(), EmberReflectionResolved(), g_resolvedSource);
             [self pushAllSettingsNow];
         } else {
-            // Back off a little to keep the display link out of dlsym.
-            self.nextResolveAttempt = link.timestamp + 0.5;
+            // Aggressive early: retry every 150 ms for the first 6 s so Unity's
+            // usual "load a few hundred ms after main" case is covered fast.
+            // After that, back off to 500 ms to keep the display link out of dlsym.
+            NSTimeInterval age = link.timestamp - self.fpsBucketStart;
+            self.nextResolveAttempt = link.timestamp + (age < 6.0 ? 0.15 : 0.5);
         }
     }
 
@@ -761,6 +806,11 @@ static void EmberEnsureThreadAttached(void) {
 
 __attribute__((constructor))
 static void EmberGettingOverItInit(void) {
+    // Written before the runloop even exists, so its presence proves the
+    // dylib got injected — the first thing to check when "nothing works".
+    EmberLog(@"constructor ran; bundle=%@ exec=%s",
+             NSBundle.mainBundle.bundleIdentifier,
+             getprogname());
     dispatch_async(dispatch_get_main_queue(), ^{
         EmberGettingOverItController *controller = [EmberGettingOverItController sharedController];
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification

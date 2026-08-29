@@ -48,9 +48,18 @@ static _Thread_local BOOL gEmberBypassScaling = NO;
 static void (*OriginalApplyImpulse)(SKPhysicsBody *, SEL, CGVector) = NULL;
 static void (*OriginalApplyImpulseAtPoint)(SKPhysicsBody *, SEL, CGVector, CGPoint) = NULL;
 
+/// Remembered from the player's own flap taps, so auto-play can reproduce
+/// them at the same magnitude. Reset each session; the game may recompute
+/// its impulse per screen size.
+static CGFloat gEmberLearnedFlapDy = 0.0;
+
 static inline void EmberScaleImpulse(SKPhysicsBody *body, CGVector *impulse) {
     if (gEmberBypassScaling) return;
     if (!body || body.categoryBitMask != 1) return;
+    // Every non-bypassed upward impulse on the bird is a real tap.
+    // Record the largest one seen; the game may issue a small residual
+    // impulse for other reasons and we want the actual flap magnitude.
+    if (impulse->dy > gEmberLearnedFlapDy) gEmberLearnedFlapDy = impulse->dy;
     if (gEmberSpeedFactor < 0.999) {
         impulse->dx *= gEmberSpeedFactor;
         impulse->dy *= gEmberSpeedFactor;
@@ -145,6 +154,7 @@ static void EmberWritePracticeStatus(NSString *state) {
 @property (nonatomic, assign) BOOL statsHudEnabled;
 @property (nonatomic, assign) BOOL freezeEnabled;
 @property (nonatomic, assign) BOOL rainbowTrailEnabled;
+@property (nonatomic, assign) NSTimeInterval lastAutopilotFlap;
 @property (nonatomic, assign) CGFloat rainbowHue;
 
 + (instancetype)sharedController;
@@ -422,30 +432,69 @@ static void EmberWritePracticeStatus(NSString *state) {
     }];
     
     if (self.autoPilotEnabled && birdNode && birdNode.physicsBody) {
-        CGFloat targetY = scene.size.height * 0.5;
-        SKNode *nearestPipe = nil;
-        CGFloat minDistance = 99999.0;
+        // Group pipes into columns by X: Flappy pipes come as top/bottom
+        // pairs sharing a scroll column, and the *gap* between them is the
+        // safe zone. The previous version aimed at one pipe's centre Y,
+        // which put the bird straight through solid geometry.
+        CGPoint birdPos = [scene convertPoint:birdNode.position fromNode:birdNode.parent ?: scene];
+
+        typedef struct { CGFloat x; CGFloat topY; CGFloat bottomY; int count; } EmberColumn;
+        NSMutableArray<NSValue *> *columns = [NSMutableArray new];
         for (SKNode *pipe in activePipes) {
-            CGPoint pipePos = [scene convertPoint:pipe.position fromNode:pipe.parent ?: scene];
-            CGPoint birdPos = [scene convertPoint:birdNode.position fromNode:birdNode.parent ?: scene];
-            CGFloat dx = pipePos.x - birdPos.x;
-            if (dx > -40 && dx < minDistance) {
-                minDistance = dx;
-                nearestPipe = pipe;
+            CGPoint w = [scene convertPoint:pipe.position fromNode:pipe.parent ?: scene];
+            BOOL merged = NO;
+            for (NSUInteger i = 0; i < columns.count; i++) {
+                EmberColumn c; [columns[i] getValue:&c];
+                if (fabs(c.x - w.x) < 30.0) {
+                    if (w.y > c.topY)    c.topY    = w.y;
+                    if (w.y < c.bottomY) c.bottomY = w.y;
+                    c.count++;
+                    columns[i] = [NSValue valueWithBytes:&c objCType:@encode(EmberColumn)];
+                    merged = YES;
+                    break;
+                }
+            }
+            if (!merged) {
+                EmberColumn c = { w.x, w.y, w.y, 1 };
+                [columns addObject:[NSValue valueWithBytes:&c objCType:@encode(EmberColumn)]];
             }
         }
-        if (nearestPipe) {
-            CGPoint pipeWorld = [scene convertPoint:nearestPipe.position fromNode:nearestPipe.parent ?: scene];
-            targetY = pipeWorld.y;
+
+        // Nearest column whose right edge is still ahead of the bird.
+        CGFloat bestDx = CGFLOAT_MAX;
+        CGFloat gapCentreY = scene.size.height * 0.5;
+        for (NSValue *value in columns) {
+            EmberColumn c; [value getValue:&c];
+            CGFloat dx = c.x - birdPos.x;
+            if (dx < -20.0) continue;
+            if (dx < bestDx) {
+                bestDx = dx;
+                gapCentreY = (c.count >= 2) ? (c.topY + c.bottomY) * 0.5 : c.topY;
+            }
         }
-        CGPoint currentBirdPos = [scene convertPoint:birdNode.position fromNode:birdNode.parent ?: scene];
-        if (currentBirdPos.y < targetY - 15.0 && birdNode.physicsBody.velocity.dy < 30) {
-            birdNode.physicsBody.velocity = CGVectorMake(birdNode.physicsBody.velocity.dx, 0);
-            // Unscaled: this impulse has already had the game speed baked in;
-            // routing it through the hook would multiply flapFactor twice and
-            // fire the bird into the ceiling on anything above 1.0x flap.
-            EmberApplyImpulseUnscaled(birdNode.physicsBody,
-                                      CGVectorMake(0, 9.0 * self.flapFactor * self.speedFactor));
+
+        // Learn the flap magnitude from any real tap the player has issued.
+        // Falls back to a sensible default until the first real flap is seen.
+        CGFloat impulseDy = gEmberLearnedFlapDy > 0.5 ? gEmberLearnedFlapDy : 6.0;
+
+        // Cooldown: a live physics engine will keep meeting the trigger every
+        // frame until the impulse has visibly moved the bird up, so without a
+        // gap between flaps the bird accumulates absurd upward velocity.
+        NSTimeInterval now = CACurrentMediaTime();
+        NSTimeInterval cooldown = 0.28 / MAX(self.speedFactor, 0.25);
+        BOOL canFlap = (now - self.lastAutopilotFlap) >= cooldown;
+
+        // A small buffer below the gap centre gives the bird room to fall
+        // through the middle instead of catching the top pipe on rise.
+        CGFloat aimY = gapCentreY - 24.0;
+        CGVector velocity = birdNode.physicsBody.velocity;
+
+        if (canFlap && birdPos.y < aimY && velocity.dy < impulseDy * 0.35) {
+            // Zero the falling velocity first so a real-sized impulse produces
+            // a real-sized flap regardless of how fast we were dropping.
+            birdNode.physicsBody.velocity = CGVectorMake(velocity.dx, 0);
+            EmberApplyImpulseUnscaled(birdNode.physicsBody, CGVectorMake(0, impulseDy));
+            self.lastAutopilotFlap = now;
         }
     }
 }
@@ -584,6 +633,8 @@ static void EmberWritePracticeStatus(NSString *state) {
     self.statsHudEnabled = NO;
     self.freezeEnabled = NO;
     self.rainbowTrailEnabled = NO;
+    gEmberLearnedFlapDy = 0.0;
+    self.lastAutopilotFlap = 0;
     [self restorePipePositions];
     [self restoreCollisionMasks];
     [self applySpeedAndGravityToAllScenes];
