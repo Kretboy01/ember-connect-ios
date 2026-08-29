@@ -1,0 +1,33 @@
+name: Build injection stub dylib
+
+# Builds a minimal arm64 iOS dylib that stands in for a mod's library at the
+# path a game already loads. Separate from the app build so it can be run on
+# its own, and because it needs no Xcode project at all.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'StubDylib/**'
+      - '.github/workflows/build-stub-dylib.yml'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64 -dynamiclib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -install_name @rpath/80pool.dylib \
+            -o 80pool.dylib StubDylib/80pool.c
+          otool -L 80pool.dylib
+          file 80pool.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stub-dylib
+          path: 80pool.dylib
