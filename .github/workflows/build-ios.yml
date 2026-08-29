@@ -65,6 +65,7 @@ jobs:
             -framework UIKit \
             -framework SpriteKit \
             -framework QuartzCore \
+            -framework CoreGraphics \
             -install_name @rpath/FlappyPractice.dylib \
             -o BuiltTweaks/FlappyPractice.dylib
 
