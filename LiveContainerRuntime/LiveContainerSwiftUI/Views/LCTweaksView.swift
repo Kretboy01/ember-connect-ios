@@ -24,6 +24,17 @@ struct LCTweakItem : Hashable {
     static let disabledSuffix = ".disabled"
 }
 
+struct BundledTweakPreset: Identifiable {
+    let id: String
+    let name: String
+    let dylibName: String
+    let folderName: String
+    let targetBundleIdentifiers: [String]
+    let targetNameKeywords: [String]
+    let icon: String
+    let description: String
+}
+
 struct LCTweakFolderView : View {
     @State var baseUrl : URL
     @State var tweakItems : [LCTweakItem]
@@ -41,8 +52,28 @@ struct LCTweakFolderView : View {
     
     @State private var isTweakSigning = false
 
-    private static let exampleFolderName = "Flappy Practice"
-    private static let exampleBundleIdentifier = "org.brandonplank.flappybird"
+    private static let bundledPresets: [BundledTweakPreset] = [
+        BundledTweakPreset(
+            id: "flappy",
+            name: "Flappy Practice",
+            dylibName: "FlappyPractice.dylib",
+            folderName: "Flappy Practice",
+            targetBundleIdentifiers: ["org.brandonplank.flappybird"],
+            targetNameKeywords: ["flappy"],
+            icon: "speedometer",
+            description: "Practice controls for Flappy Bird: speed/gravity/flap power, ghost mode, wide gaps, auto-pilot, and HUD."
+        ),
+        BundledTweakPreset(
+            id: "gettingoverit",
+            name: "Getting Over It Tools",
+            dylibName: "GettingOverIt.dylib",
+            folderName: "Getting Over It",
+            targetBundleIdentifiers: ["com.BennettFoddy.GettingOverIt", "com.noodlecake.gettingoverit", "com.noodlecake.gettingoveritios"],
+            targetNameKeywords: ["getting over it", "gettingoverit", "bennettfoddy"],
+            icon: "figure.climbing",
+            description: "Practice tools for Getting Over It: Time.timeScale speed control, Physics2D gravity control, ghost mode, and HUD."
+        )
+    ]
     
     init(baseUrl: URL, isRoot: Bool = false, tweakFolders: Binding<[String]>) {
         _baseUrl = State(initialValue: baseUrl)
@@ -86,16 +117,37 @@ struct LCTweakFolderView : View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                }
 
-                    Button {
-                        installBundledExample()
-                    } label: {
-                        Label(exampleIsInstalled ? "Reinstall & Assign Flappy Practice"
-                                                 : "Install & Assign Flappy Practice",
-                              systemImage: "speedometer")
+                Section("Bundled Game Tweaks") {
+                    ForEach(Self.bundledPresets) { preset in
+                        let isInstalled = isPresetInstalled(preset)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Label(preset.name, systemImage: preset.icon)
+                                    .font(.headline)
+                                Spacer()
+                                Button {
+                                    installBundledPreset(preset)
+                                } label: {
+                                    Text(isInstalled ? "Reinstall" : "Install & Assign")
+                                        .font(.subheadline.bold())
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 4)
+                                        .background(isInstalled ? Color.orange.opacity(0.15) : Color.blue.opacity(0.15))
+                                        .foregroundColor(isInstalled ? .orange : .blue)
+                                        .cornerRadius(8)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            Text(preset.description)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
                     }
                 } footer: {
-                    Text("The example adds a 0.55x speed toggle and automatically assigns itself to the installed org.brandonplank.flappybird app. Relaunch Flappy Bird after installing it.")
+                    Text("Installing a bundled tweak creates its app folder, patches RPATH, and automatically assigns the folder to matching installed guest apps. Relaunch the game after installing.")
                 }
             }
 
@@ -248,23 +300,24 @@ struct LCTweakFolderView : View {
         })
     }
 
-    private var exampleIsInstalled: Bool {
-        tweakItems.contains { $0.isFolder && $0.displayName == Self.exampleFolderName }
+    private func isPresetInstalled(_ preset: BundledTweakPreset) -> Bool {
+        tweakItems.contains { $0.isFolder && $0.displayName == preset.folderName }
     }
 
-    func installBundledExample() {
-        guard let source = Bundle.main.url(forResource: "FlappyPractice",
+    func installBundledPreset(_ preset: BundledTweakPreset) {
+        let baseDylibName = preset.dylibName.hasSuffix(".dylib") ? String(preset.dylibName.dropLast(6)) : preset.dylibName
+        guard let source = Bundle.main.url(forResource: baseDylibName,
                                            withExtension: "dylib",
                                            subdirectory: "EmberTweaks") else {
             errorShow = true
-            errorInfo = "The bundled Flappy Practice tweak is missing. Rebuild Ember Connect Mobile and try again."
+            errorInfo = "The bundled \(preset.name) tweak is missing from EmberTweaks. Rebuild Ember Connect Mobile and try again."
             return
         }
 
         let fm = FileManager.default
-        let folder = baseUrl.appendingPathComponent(Self.exampleFolderName)
-        let disabledFolder = baseUrl.appendingPathComponent(Self.exampleFolderName + LCTweakItem.disabledSuffix)
-        let destination = folder.appendingPathComponent("FlappyPractice.dylib")
+        let folder = baseUrl.appendingPathComponent(preset.folderName)
+        let disabledFolder = baseUrl.appendingPathComponent(preset.folderName + LCTweakItem.disabledSuffix)
+        let destination = folder.appendingPathComponent(preset.dylibName)
 
         do {
             if !fm.fileExists(atPath: folder.path), fm.fileExists(atPath: disabledFolder.path) {
@@ -280,7 +333,7 @@ struct LCTweakFolderView : View {
             }
 
             if let existing = tweakItems.firstIndex(where: {
-                $0.isFolder && $0.displayName == Self.exampleFolderName
+                $0.isFolder && $0.displayName == preset.folderName
             }) {
                 tweakItems[existing] = LCTweakItem(fileUrl: folder,
                                                     isFolder: true,
@@ -294,13 +347,23 @@ struct LCTweakFolderView : View {
                                               isTweak: false,
                                               isEnabled: true))
             }
-            if !tweakFolders.contains(Self.exampleFolderName) {
-                tweakFolders.append(Self.exampleFolderName)
+            if !tweakFolders.contains(preset.folderName) {
+                tweakFolders.append(preset.folderName)
             }
-            if let flappy = DataManager.shared.model.apps.first(where: {
-                $0.bundleIdentifier == Self.exampleBundleIdentifier
-            }) {
-                flappy.uiTweakFolder = Self.exampleFolderName
+            
+            // Assign to any matching installed guest app
+            let matchingApps = DataManager.shared.model.apps.filter { app in
+                let bundleId = app.bundleIdentifier.lowercased()
+                let appName = (app.appInfo.name ?? "").lowercased()
+                let targetIds = preset.targetBundleIdentifiers.map { $0.lowercased() }
+                if targetIds.contains(bundleId) { return true }
+                for keyword in preset.targetNameKeywords {
+                    if bundleId.contains(keyword) || appName.contains(keyword) { return true }
+                }
+                return false
+            }
+            for matchingApp in matchingApps {
+                matchingApp.uiTweakFolder = preset.folderName
             }
         } catch {
             errorShow = true
