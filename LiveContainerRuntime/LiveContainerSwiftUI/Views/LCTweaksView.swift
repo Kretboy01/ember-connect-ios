@@ -40,6 +40,8 @@ struct LCTweakFolderView : View {
     @State private var choosingTweak = false
     
     @State private var isTweakSigning = false
+
+    private static let exampleFolderName = "Flappy Practice"
     
     init(baseUrl: URL, isRoot: Bool = false, tweakFolders: Binding<[String]>) {
         _baseUrl = State(initialValue: baseUrl)
@@ -70,6 +72,32 @@ struct LCTweakFolderView : View {
 
     var body: some View {
         List {
+            if isRoot {
+                Section {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("How tweaks work", systemImage: "lightbulb.fill")
+                            .font(.headline)
+
+                        Text("A tweak is an arm64 .dylib or framework that Ember Connect signs, injects, and loads inside a guest app when it starts.")
+                            .font(.subheadline)
+
+                        Text("Keep app-specific tweaks in a folder, then choose that folder in the guest app's Settings. Loose dylibs and frameworks at this top level are global and load into every guest app.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Button {
+                        installBundledExample()
+                    } label: {
+                        Label(exampleIsInstalled ? "Reinstall Flappy Practice (SpriteKit)"
+                                                 : "Install Flappy Practice (SpriteKit)",
+                              systemImage: "speedometer")
+                    }
+                } footer: {
+                    Text("The example adds a 0.55x speed toggle to SpriteKit games. After installing it, select “Flappy Practice” in the game's Settings and relaunch the game.")
+                }
+            }
+
             Section {
                 ForEach(tweakItems, id:\.self) { tweakItem in
                     HStack {
@@ -217,6 +245,61 @@ struct LCTweakFolderView : View {
         }, onDismiss: {
             choosingTweak = false
         })
+    }
+
+    private var exampleIsInstalled: Bool {
+        tweakItems.contains { $0.isFolder && $0.displayName == Self.exampleFolderName }
+    }
+
+    func installBundledExample() {
+        guard let source = Bundle.main.url(forResource: "FlappyPractice",
+                                           withExtension: "dylib",
+                                           subdirectory: "EmberTweaks") else {
+            errorShow = true
+            errorInfo = "The bundled Flappy Practice tweak is missing. Rebuild Ember Connect Mobile and try again."
+            return
+        }
+
+        let fm = FileManager.default
+        let folder = baseUrl.appendingPathComponent(Self.exampleFolderName)
+        let disabledFolder = baseUrl.appendingPathComponent(Self.exampleFolderName + LCTweakItem.disabledSuffix)
+        let destination = folder.appendingPathComponent("FlappyPractice.dylib")
+
+        do {
+            if !fm.fileExists(atPath: folder.path), fm.fileExists(atPath: disabledFolder.path) {
+                try fm.moveItem(at: disabledFolder, to: folder)
+            }
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            if fm.fileExists(atPath: destination.path) {
+                try fm.removeItem(at: destination)
+            }
+            try fm.copyItem(at: source, to: destination)
+            LCParseMachO((destination.path as NSString).utf8String, false) { path, header, _, _ in
+                LCPatchAddRPath(path, header)
+            }
+
+            if let existing = tweakItems.firstIndex(where: {
+                $0.isFolder && $0.displayName == Self.exampleFolderName
+            }) {
+                tweakItems[existing] = LCTweakItem(fileUrl: folder,
+                                                    isFolder: true,
+                                                    isFramework: false,
+                                                    isTweak: false,
+                                                    isEnabled: true)
+            } else {
+                tweakItems.append(LCTweakItem(fileUrl: folder,
+                                              isFolder: true,
+                                              isFramework: false,
+                                              isTweak: false,
+                                              isEnabled: true))
+            }
+            if !tweakFolders.contains(Self.exampleFolderName) {
+                tweakFolders.append(Self.exampleFolderName)
+            }
+        } catch {
+            errorShow = true
+            errorInfo = error.localizedDescription
+        }
     }
     
     func setTweakEnabled(tweakItem: LCTweakItem, enabled: Bool) {
