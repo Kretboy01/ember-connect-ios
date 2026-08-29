@@ -51,9 +51,11 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             EXCLUDED_ARCHS="armv7"
 
-      - name: Build bundled example tweak
+      - name: Build bundled tweaks
         run: |
           mkdir -p BuiltTweaks
+
+          # FlappyPractice — SpriteKit mod for Brandon Plank's Flappy Bird
           xcrun --sdk iphoneos clang \
             -arch arm64 \
             -miphoneos-version-min=15.0 \
@@ -71,6 +73,24 @@ jobs:
 
           file BuiltTweaks/FlappyPractice.dylib
           xcrun otool -L BuiltTweaks/FlappyPractice.dylib
+
+          # GettingOverIt — Unity/IL2CPP mod for Getting Over It with Bennett Foddy
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -fblocks \
+            -dynamiclib \
+            Tweaks/GettingOverIt/GettingOverIt.m \
+            -framework Foundation \
+            -framework UIKit \
+            -framework QuartzCore \
+            -framework CoreGraphics \
+            -install_name @rpath/GettingOverIt.dylib \
+            -o BuiltTweaks/GettingOverIt.dylib
+
+          file BuiltTweaks/GettingOverIt.dylib
+          xcrun otool -L BuiltTweaks/GettingOverIt.dylib
 
       - name: Assemble Ember container host
         run: |
@@ -94,6 +114,7 @@ jobs:
           cp -R "$BROADCAST" "$APP/PlugIns/"
           mkdir -p "$APP/EmberTweaks"
           cp BuiltTweaks/FlappyPractice.dylib "$APP/EmberTweaks/"
+          cp BuiltTweaks/GettingOverIt.dylib "$APP/EmberTweaks/"
 
       - name: Verify container, branding, and App ID usage
         run: |
@@ -113,6 +134,7 @@ jobs:
           test -f "$APP/Frameworks/LiveContainerSwiftUI.framework/LiveContainerSwiftUI"
           test -f "$APP/Frameworks/ZSign.dylib"
           test -f "$APP/EmberTweaks/FlappyPractice.dylib"
+          test -f "$APP/EmberTweaks/GettingOverIt.dylib"
 
           echo "Verified Ember Connect host with one ReplayKit extension."
 
@@ -131,3 +153,4 @@ jobs:
           path: |
             EmberConnectMobile.ipa
             BuiltTweaks/FlappyPractice.dylib
+            BuiltTweaks/GettingOverIt.dylib

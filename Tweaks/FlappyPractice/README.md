@@ -1,44 +1,33 @@
-# Flappy Practice (SpriteKit)
+# FlappyPractice
 
-This is Ember Connect's example game-specific tweak. It adds a compact `EC`
-button to the bottom-right of Brandon Plank's Flappy Bird. Tapping it opens a
-practice menu with:
+An advanced practice and modification tweak for Brandon Plank's Flappy Bird (org.brandonplank.flappybird). Injected via LiveContainer's TweakLoader.
 
-- coordinated `1x`, `0.75x`, and `0.5x` speed presets;
-- wider pipe gaps; and
-- ghost mode, which disables crash contacts while leaving score gates active.
+## Features
 
-The speed presets affect both parts of the game. SpriteKit scene actions slow
-the scenery and pipes, while the tweak scales gravity, current bird velocity,
-and flap impulses so the bird follows the same arc over the slower timeline.
+### Floating Panel UI
+- **Draggable floating button**: Accessible anywhere on screen via a pan gesture.
+- **Settings Panel**: Expanding visual effect view organized into distinct settings categories with smooth slide animations.
 
-The implementation deliberately targets the SpriteKit physics categories and
-`GameScene` used by `org.brandonplank.flappybird`; it is not advertised as a
-generic tweak for unrelated Flappy clones.
+### Physics & Speed
+- **Speed Slider (0.25x - 2.0x)**: Change the speed of the game scene dynamically.
+- **Gravity Slider (0.25x - 3.0x)**: Independent control over the physics world gravity.
+- **Flap Power (0.5x - 3.0x)**: Modifies the bird's jump impulse.
 
-## What it demonstrates
+### Gameplay Mods
+- **Wide Gaps**: Increases the vertical distance between top and bottom pipes.
+- **Ghost Mode (No Clip)**: Disables physics collisions for the bird.
+- **Auto-Pilot**: Automatically flaps when the bird drops below a safe threshold.
+- **Instant Restart**: Triggers a fast restart upon failure.
+- **Score Multiplier**: Scales your displayed score dynamically.
 
-1. The Tweaks tab copies the bundled `FlappyPractice.dylib` into an
-   app-specific `Tweaks/Flappy Practice` folder.
-2. The sample installer finds `org.brandonplank.flappybird` and stores that
-   folder name as the app's `LCTweakFolder` automatically.
-3. Before launch, Ember Connect patches and signs the dylib with the same local
-   certificate used for the guest app.
-4. `TweakLoader.dylib` is injected into the guest executable and recursively
-   loads enabled dylibs from the selected folder with `dlopen`.
-5. The Objective-C constructor above runs inside the guest process and adds the
-   practice control.
+### Visual Effects
+- **Night Mode**: Darkens the environment to simulate nighttime.
+- **Bird Trail**: Emits fiery particles from the bird.
+- **Pipe Tint**: Blends pipes with a custom purple color.
+- **Hitbox Visualizer**: Renders debug outlines over all physics bodies.
 
-The tweak uses UIKit and SpriteKit APIs plus a narrow `applyImpulse:` hook for
-the bird physics body. It does not patch stored scores, purchases, or network
-calls.
+### Stats HUD
+- On-screen overlay presenting frames per second (FPS), current modifiers, games played, and best session score. Updates twice a second.
 
-For diagnosis it records its last lifecycle state in the guest app's
-`Library/Caches/EmberConnect/FlappyPracticeStatus.plist`. This distinguishes a
-load/signing problem from a button-attachment or SpriteKit-discovery problem.
-
-## Build
-
-The GitHub Actions workflow compiles the arm64 dylib with the iPhoneOS SDK and
-embeds it at `EmberTweaks/FlappyPractice.dylib` inside the Ember Connect app.
-It also publishes the standalone dylib in the workflow artifact for inspection.
+### Profiles
+- Save, Load, and switch between standard presets: **Easy**, **Speed Run**, and **Practice**.
