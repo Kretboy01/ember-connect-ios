@@ -88,12 +88,10 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                             LCPatchAddRPath(path, header)
                         }
                     }
+                    // Clean up loose global copy to prevent duplicate loading
                     let globalDest = LCPath.tweakPath.appendingPathComponent("\(tweakFile).dylib")
-                    if !fm.fileExists(atPath: globalDest.path) {
-                        try? fm.copyItem(at: source, to: globalDest)
-                        LCParseMachO((globalDest.path as NSString).utf8String, false) { path, header, _, _ in
-                            LCPatchAddRPath(path, header)
-                        }
+                    if fm.fileExists(atPath: globalDest.path) {
+                        try? fm.removeItem(at: globalDest)
                     }
                     for app in tempApps {
                         let bId = app.bundleIdentifier.lowercased()

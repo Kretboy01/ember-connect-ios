@@ -605,17 +605,32 @@ static void EmberWritePracticeStatus(NSString *state) {
     [presenter presentViewController:menu animated:YES completion:nil];
 }
 
+static const NSInteger kEmberFlappyButtonTag = 0xECF1A9;
+static const NSInteger kEmberFlappyHudTag = 0xECF1AA;
+
 - (void)install {
     UIWindow *host = [self guestWindow];
     if (!host) return;
-    if (self.button.superview == host) {
+    
+    for (UIView *subview in host.subviews) {
+        if (subview.tag == kEmberFlappyButtonTag && subview != self.button) {
+            [subview removeFromSuperview];
+        }
+        if (subview.tag == kEmberFlappyHudTag && subview != self.statsHud) {
+            [subview removeFromSuperview];
+        }
+    }
+    
+    if (self.button && self.button.superview == host) {
         [host bringSubviewToFront:self.button];
         if (self.statsHud) [host bringSubviewToFront:self.statsHud];
         [self maintainEnabledTweaks];
         return;
     }
+    
     [self.button removeFromSuperview];
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.tag = kEmberFlappyButtonTag;
     button.frame = CGRectMake(MAX(8, CGRectGetWidth(host.bounds) - 84), MAX(8, CGRectGetHeight(host.bounds) - 108), 72, 40);
     button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
     button.layer.cornerRadius = 12;

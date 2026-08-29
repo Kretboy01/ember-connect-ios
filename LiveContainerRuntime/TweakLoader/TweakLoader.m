@@ -4,12 +4,22 @@
 #include <objc/runtime.h>
 #include "utils.h"
 
+static NSMutableSet<NSString *> *loadedTweakNames;
+
 static NSString *loadTweakAtURL(NSURL *url) {
     NSString *tweakPath = url.path;
     NSString *tweak = tweakPath.lastPathComponent;
     if (![tweakPath hasSuffix:@".dylib"] && ![tweakPath hasSuffix:@".framework"]) {
         return nil;
     }
+    if (!loadedTweakNames) {
+        loadedTweakNames = [NSMutableSet new];
+    }
+    if ([loadedTweakNames containsObject:tweak]) {
+        NSLog(@"[TweakLoader] Skipping duplicate tweak load: %@", tweak);
+        return nil;
+    }
+    [loadedTweakNames addObject:tweak];
     if ([tweakPath hasSuffix:@".framework"]) {
         NSURL* infoPlistURL = [url URLByAppendingPathComponent:@"Info.plist"];
         NSDictionary* infoDict = [NSDictionary dictionaryWithContentsOfURL:infoPlistURL];

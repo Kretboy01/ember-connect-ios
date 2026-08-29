@@ -535,11 +535,23 @@ static void ResolveIL2CPPSymbols(void) {
 
 // MARK: - UI Installation & Lifecycle
 
+static const NSInteger kEmberGettingOverItButtonTag = 0xEC9017;
+static const NSInteger kEmberGettingOverItHudTag = 0xEC9018;
+
 - (void)install {
     UIWindow *host = [self guestWindow];
     if (!host) return;
     
-    if (self.button.superview == host) {
+    for (UIView *subview in host.subviews) {
+        if (subview.tag == kEmberGettingOverItButtonTag && subview != self.button) {
+            [subview removeFromSuperview];
+        }
+        if (subview.tag == kEmberGettingOverItHudTag && subview != self.statsHud) {
+            [subview removeFromSuperview];
+        }
+    }
+    
+    if (self.button && self.button.superview == host) {
         [host bringSubviewToFront:self.button];
         if (self.statsHud) [host bringSubviewToFront:self.statsHud];
         [self maintainEnabledTweaks];
@@ -548,6 +560,7 @@ static void ResolveIL2CPPSymbols(void) {
     
     [self.button removeFromSuperview];
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.tag = kEmberGettingOverItButtonTag;
     button.frame = CGRectMake(MAX(8, CGRectGetWidth(host.bounds) - 84), MAX(8, CGRectGetHeight(host.bounds) - 108), 72, 40);
     button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
     button.layer.cornerRadius = 12;
