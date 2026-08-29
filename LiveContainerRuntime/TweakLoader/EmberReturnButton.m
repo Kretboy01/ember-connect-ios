@@ -16,6 +16,22 @@
 //  handing the URL to iOS, so the guest never gets `applicationWillTerminate`
 //  and cannot flush unsaved state. That is why a tap asks first.
 //
+//  ## Why this is a subview and not its own window
+//
+//  It used to live in a dedicated full-screen `UIWindow`, which broke
+//  landscape games. When iOS decides which orientations an app supports it
+//  consults a window's root view controller, and a plain `UIViewController`
+//  answers `UIInterfaceOrientationMaskAllButUpsideDown`. A full-screen
+//  overlay window at a high window level is a candidate for that lookup, so
+//  the overlay's answer quietly replaced the game's own landscape-only
+//  constraint: the app became freely rotatable, its scene was sized for an
+//  orientation the game had not asked for, and the game ended up drawn into a
+//  portrait-shaped box in the corner of a landscape screen.
+//
+//  Hanging the button off the app's existing window removes the whole class
+//  of problem — there is no second root view controller for iOS to ask, and
+//  the button rotates with the app for free.
+//
 
 @import UIKit;
 @import ObjectiveC;
@@ -36,27 +52,9 @@ static const CGFloat kIdleAlpha = 0.35;
 static const CGFloat kActiveAlpha = 1.0;
 static const NSTimeInterval kIdleDelay = 3.0;
 
-#pragma mark - Window
-
-/// Only the button itself is interactive; every other point falls through to
-/// the guest app, which is otherwise unaware this window exists.
-@interface EmberReturnWindow : UIWindow
-@end
-
-@implementation EmberReturnWindow
-
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    return hit == self || hit == self.rootViewController.view ? nil : hit;
-}
-
-@end
-
-#pragma mark - Controller
-
 @interface EmberReturnButtonController : NSObject
-@property (nonatomic, strong) EmberReturnWindow *window;
-@property (nonatomic, strong) UIButton *button;
+@property (nonatomic, weak) UIButton *button;
+@property (nonatomic, weak) UIWindow *host;
 @property (nonatomic, strong) NSTimer *idleTimer;
 @end
 
@@ -69,36 +67,36 @@ static const NSTimeInterval kIdleDelay = 3.0;
     return shared;
 }
 
-- (UIWindowScene *)activeScene {
+/// The app's own front-most window. Deliberately picks the app's, never one
+/// of ours, and skips windows with no root view controller — a game engine
+/// often keeps a spare around.
+- (UIWindow *)hostWindow {
+    UIWindow *best = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if ([scene isKindOfClass:UIWindowScene.class] &&
-            scene.activationState == UISceneActivationStateForegroundActive) {
-            return (UIWindowScene *)scene;
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        for (UIWindow *window in windowScene.windows) {
+            if (window.hidden || !window.rootViewController) continue;
+            if (!best || window.windowLevel >= best.windowLevel) best = window;
         }
     }
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if ([scene isKindOfClass:UIWindowScene.class]) return (UIWindowScene *)scene;
-    }
-    return nil;
+    return best;
 }
 
 - (void)install {
-    if (self.window) {
-        // The guest may have created windows above ours since last time.
-        [self raise];
+    UIWindow *host = [self hostWindow];
+    if (!host) return;
+
+    UIButton *button = self.button;
+    if (button && button.superview == host) {
+        // Already in place; just make sure the game has not covered it.
+        [host bringSubviewToFront:button];
+        [self clampIntoBounds];
         return;
     }
-    UIWindowScene *scene = [self activeScene];
-    if (!scene) return;
+    [button removeFromSuperview];
 
-    EmberReturnWindow *window = [[EmberReturnWindow alloc] initWithWindowScene:scene];
-    window.backgroundColor = UIColor.clearColor;
-    window.rootViewController = [UIViewController new];
-    window.rootViewController.view.backgroundColor = UIColor.clearColor;
-    window.userInteractionEnabled = YES;
-    window.hidden = NO;
-
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+    button = [UIButton buttonWithType:UIButtonTypeCustom];
     button.frame = CGRectMake(0, 0, kButtonSize, kButtonSize);
     button.backgroundColor = [UIColor colorWithRed:0.98 green:0.42 blue:0.13 alpha:1.0];
     button.layer.cornerRadius = kButtonSize / 2.0;
@@ -108,6 +106,9 @@ static const NSTimeInterval kIdleDelay = 3.0;
     button.layer.shadowOffset = CGSizeMake(0, 2);
     button.tintColor = UIColor.whiteColor;
     button.accessibilityLabel = @"Return to Ember Connect";
+    // Pinned to the top-left corner: the button is positioned by frame, and a
+    // resizing mask would fight that every time the app rotates.
+    button.autoresizingMask = UIViewAutoresizingNone;
 
     UIImage *glyph = nil;
     if (@available(iOS 13.0, *)) {
@@ -127,31 +128,24 @@ static const NSTimeInterval kIdleDelay = 3.0;
     [button addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self
                                                                         action:@selector(panned:)]];
 
-    [window.rootViewController.view addSubview:button];
-    self.window = window;
+    [host addSubview:button];
+    [host bringSubviewToFront:button];
     self.button = button;
+    self.host = host;
 
     [self restorePosition];
-    [self raise];
     [self markActive];
-}
-
-- (void)raise {
-    // Above everything the guest is likely to create, but below the system
-    // alert level so its own dialogs still win.
-    self.window.windowLevel = UIWindowLevelAlert - 1;
-    self.window.hidden = NO;
 }
 
 #pragma mark - Position
 
-- (CGRect)sceneBounds {
-    UIWindowScene *scene = self.window.windowScene ?: [self activeScene];
-    return scene ? scene.coordinateSpace.bounds : UIScreen.mainScreen.bounds;
+- (CGRect)hostBounds {
+    UIWindow *host = self.host ?: [self hostWindow];
+    return host ? host.bounds : UIScreen.mainScreen.bounds;
 }
 
 - (void)restorePosition {
-    CGRect bounds = [self sceneBounds];
+    CGRect bounds = [self hostBounds];
     NSUserDefaults *defaults = NSUserDefaults.lcUserDefaults;
     id storedY = [defaults objectForKey:kEmberReturnButtonYKey];
     CGFloat y = storedY ? [storedY doubleValue] : CGRectGetMidY(bounds) - kButtonSize / 2.0;
@@ -162,21 +156,37 @@ static const NSTimeInterval kIdleDelay = 3.0;
     self.button.frame = CGRectMake(x, y, kButtonSize, kButtonSize);
 }
 
+/// Keeps the button on screen after the app rotates, since the window's
+/// bounds swap underneath it.
+- (void)clampIntoBounds {
+    if (!self.button) return;
+    CGRect bounds = [self hostBounds];
+    CGRect frame = self.button.frame;
+    BOOL onLeft = [NSUserDefaults.lcUserDefaults boolForKey:kEmberReturnButtonLeftKey];
+
+    CGFloat maxY = MAX(kEdgeInset, CGRectGetHeight(bounds) - kButtonSize - kEdgeInset);
+    frame.origin.y = MAX(kEdgeInset, MIN(frame.origin.y, maxY));
+    frame.origin.x = onLeft ? kEdgeInset : CGRectGetWidth(bounds) - kButtonSize - kEdgeInset;
+    self.button.frame = frame;
+}
+
 - (void)panned:(UIPanGestureRecognizer *)pan {
-    CGRect bounds = [self sceneBounds];
-    CGPoint translation = [pan translationInView:self.window.rootViewController.view];
+    UIView *host = self.button.superview;
+    if (!host) return;
+    CGRect bounds = [self hostBounds];
+    CGPoint translation = [pan translationInView:host];
     CGRect frame = self.button.frame;
 
     frame.origin.x += translation.x;
     frame.origin.y += translation.y;
-    [pan setTranslation:CGPointZero inView:self.window.rootViewController.view];
+    [pan setTranslation:CGPointZero inView:host];
     self.button.frame = frame;
     [self markActive];
 
     if (pan.state == UIGestureRecognizerStateEnded ||
         pan.state == UIGestureRecognizerStateCancelled) {
-        // Snap to whichever edge is nearer, so it never floats mid-screen
-        // over something the user is trying to tap.
+        // Snap to whichever edge is nearer, so it never floats mid-screen over
+        // something the user is trying to tap.
         BOOL onLeft = CGRectGetMidX(frame) < CGRectGetMidX(bounds);
         CGFloat y = MAX(kEdgeInset,
                         MIN(frame.origin.y, CGRectGetHeight(bounds) - kButtonSize - kEdgeInset));
@@ -197,11 +207,12 @@ static const NSTimeInterval kIdleDelay = 3.0;
 - (void)markActive {
     [self.idleTimer invalidate];
     self.button.alpha = kActiveAlpha;
+    __weak typeof(self) weakSelf = self;
     self.idleTimer = [NSTimer scheduledTimerWithTimeInterval:kIdleDelay
                                                      repeats:NO
                                                        block:^(NSTimer *timer) {
         [UIView animateWithDuration:0.4 animations:^{
-            self.button.alpha = kIdleAlpha;
+            weakSelf.button.alpha = kIdleAlpha;
         }];
     }];
 }
@@ -215,6 +226,13 @@ static const NSTimeInterval kIdleDelay = 3.0;
     if (!scheme) return;
     NSURL *url = [NSURL URLWithString:
                   [NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=ui", scheme]];
+
+    UIViewController *presenter = self.button.window.rootViewController;
+    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+    if (!presenter) {
+        [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithURL:url];
+        return;
+    }
 
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Return to Ember Connect"
@@ -230,7 +248,7 @@ static const NSTimeInterval kIdleDelay = 3.0;
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
-    [self.window.rootViewController presentViewController:alert animated:YES completion:nil];
+    [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 @end
@@ -256,14 +274,23 @@ static void EmberReturnButtonInit(void) {
     // The guest has no windows yet at constructor time. Wait for it to come
     // up, then re-assert on every activation: a guest that creates its own
     // window later would otherwise cover the button.
+    for (NSNotificationName name in @[UIApplicationDidBecomeActiveNotification,
+                                      UISceneDidActivateNotification]) {
+        [NSNotificationCenter.defaultCenter addObserverForName:name
+                                                        object:nil
+                                                         queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *note) {
+            EmberInstallReturnButton();
+        }];
+    }
+
+    // Rotation swaps the host window's bounds underneath the button, which
+    // would otherwise leave it pinned to a coordinate that is now off screen.
     [NSNotificationCenter.defaultCenter
-        addObserverForName:UIApplicationDidBecomeActiveNotification
+        addObserverForName:UIApplicationDidChangeStatusBarOrientationNotification
                     object:nil
                      queue:NSOperationQueue.mainQueue
-                usingBlock:^(NSNotification *note) { EmberInstallReturnButton(); }];
-    [NSNotificationCenter.defaultCenter
-        addObserverForName:UISceneDidActivateNotification
-                    object:nil
-                     queue:NSOperationQueue.mainQueue
-                usingBlock:^(NSNotification *note) { EmberInstallReturnButton(); }];
+                usingBlock:^(NSNotification *note) {
+        [[EmberReturnButtonController shared] clampIntoBounds];
+    }];
 }
