@@ -120,6 +120,7 @@ static void EmberInstallFrameHooks(void) {
 @property (nonatomic, weak) UIWindow *host;
 @property (nonatomic, strong) NSTimer *idleTimer;
 @property (nonatomic, strong) NSTimer *fpsTimer;
+@property (nonatomic, strong) NSTimer *keepAliveTimer;
 @property (nonatomic, assign) uint64_t lastFrameCount;
 @property (nonatomic, assign) NSTimeInterval lastFrameSampleAt;
 @end
@@ -133,28 +134,61 @@ static void EmberInstallFrameHooks(void) {
     return shared;
 }
 
-/// The app's own front-most window. Deliberately picks the app's, and skips
-/// windows with no root view controller — a game engine often keeps a spare.
+/// The app's own content window.
+///
+/// Levels above `UIWindowLevelNormal` are excluded on purpose. Alerts — the
+/// container's own included, which sit at `lastObject.windowLevel + 1` — are
+/// transient windows above the content, and attaching to one would put the
+/// button somewhere that disappears the moment the alert is dismissed, taking
+/// the button with it.
+///
+/// Windows with no root view controller are skipped too; a game engine often
+/// keeps a spare around.
 - (UIWindow *)hostWindow {
     UIWindow *best = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
             if (window.hidden || !window.rootViewController) continue;
+            if (window.windowLevel > UIWindowLevelNormal) continue;
+            if (window == self.button.superview) { best = window; break; }
             if (!best || window.windowLevel >= best.windowLevel) best = window;
         }
     }
     return best;
 }
 
+/// Re-asserts the overlay while the app is in the foreground.
+///
+/// Attaching once on activation is not enough: a game that moves to another
+/// screen may build a fresh window, or simply add its own views over ours, and
+/// either way the button is gone or buried with nothing to bring it back. A
+/// one-second re-assert is cheap — usually a `bringSubviewToFront:` on a view
+/// that is already at the front — and it is the only thing that survives
+/// engines whose view hierarchy we cannot predict.
+- (void)startKeepAlive {
+    [self.keepAliveTimer invalidate];
+    __weak typeof(self) weakSelf = self;
+    self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                          repeats:YES
+                                                            block:^(NSTimer *timer) {
+        [weakSelf install];
+    }];
+}
+
+- (void)stopKeepAlive {
+    [self.keepAliveTimer invalidate];
+    self.keepAliveTimer = nil;
+}
+
 - (void)install {
+    if ([NSUserDefaults.lcUserDefaults boolForKey:kEmberHideReturnButtonKey]) return;
     UIWindow *host = [self hostWindow];
     if (!host) return;
 
     if (self.button && self.button.superview == host) {
         [host bringSubviewToFront:self.button];
-        if (self.fpsLabel) [host bringSubviewToFront:self.fpsLabel];
-        [self clampIntoBounds];
+        if (self.fpsLabel && !self.fpsLabel.hidden) [host bringSubviewToFront:self.fpsLabel];
         return;
     }
     [self.button removeFromSuperview];
@@ -522,9 +556,10 @@ static void EmberInstallFrameHooks(void) {
                                               style:UIAlertActionStyleDestructive
                                             handler:^(UIAlertAction *a) {
         [NSUserDefaults.lcUserDefaults setBool:YES forKey:kEmberHideReturnButtonKey];
+        [self stopKeepAlive];
+        [self stopFPS];
         [self.button removeFromSuperview];
         [self.fpsLabel removeFromSuperview];
-        [self stopFPS];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Keep"
                                               style:UIAlertActionStyleCancel
@@ -553,8 +588,14 @@ static void EmberReturnButtonInit(void) {
     if (NSUserDefaults.isLiveProcess) return;
     if ([NSUserDefaults.lcUserDefaults boolForKey:kEmberHideReturnButtonKey]) return;
 
+    // Attach on activation, and again whenever a window appears or takes key —
+    // that is what a game moving between screens usually looks like from out
+    // here, and waiting for the next activation would leave the button gone
+    // for the rest of the session.
     for (NSNotificationName name in @[UIApplicationDidBecomeActiveNotification,
-                                      UISceneDidActivateNotification]) {
+                                      UISceneDidActivateNotification,
+                                      UIWindowDidBecomeVisibleNotification,
+                                      UIWindowDidBecomeKeyNotification]) {
         [NSNotificationCenter.defaultCenter addObserverForName:name
                                                         object:nil
                                                          queue:NSOperationQueue.mainQueue
@@ -562,6 +603,24 @@ static void EmberReturnButtonInit(void) {
             EmberInstallOverlay();
         }];
     }
+
+    // Notifications cover a new window; they do not cover a game that simply
+    // draws its own views over ours in the window we are already in. The
+    // re-assert runs only while the app is in the foreground.
+    [NSNotificationCenter.defaultCenter
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification *note) {
+        [[EmberReturnButtonController shared] startKeepAlive];
+    }];
+    [NSNotificationCenter.defaultCenter
+        addObserverForName:UIApplicationWillResignActiveNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification *note) {
+        [[EmberReturnButtonController shared] stopKeepAlive];
+    }];
 
     [NSNotificationCenter.defaultCenter
         addObserverForName:UIApplicationDidChangeStatusBarOrientationNotification
