@@ -31,7 +31,7 @@ static void (*OriginalApplyImpulse)(SKPhysicsBody *, SEL, CGVector);
 static BOOL EmberIsFlappyBirdBody(SKPhysicsBody *body) {
     SKNode *node = body.node;
     if (!node || body.categoryBitMask != 1) return NO;
-    return [NSStringFromClass(node.scene.class) containsString:@"GameScene"];
+    return YES;
 }
 
 static void HookedApplyImpulse(SKPhysicsBody *body, SEL selector, CGVector impulse) {
@@ -165,14 +165,23 @@ static void EmberWritePracticeStatus(NSString *state) {
 }
 
 - (UIWindow *)guestWindow {
+    UIWindow *best = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if ([scene isKindOfClass:UIWindowScene.class]) {
-            for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if (!window.hidden && window.rootViewController) return window;
-            }
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.hidden || !window.rootViewController || window.windowLevel > UIWindowLevelNormal) continue;
+            if (!best || window.isKeyWindow) best = window;
         }
     }
-    return nil;
+    if (best) return best;
+    
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window.hidden || !window.rootViewController || window.windowLevel > UIWindowLevelNormal) continue;
+        if (!best || window.isKeyWindow) best = window;
+    }
+    if (best) return best;
+    
+    return UIApplication.sharedApplication.keyWindow;
 }
 
 - (NSSet<SKScene *> *)visibleSpriteKitScenes {
@@ -182,6 +191,9 @@ static void EmberWritePracticeStatus(NSString *state) {
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
             [self collectSpriteKitScenesInView:window into:scenes];
         }
+    }
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        [self collectSpriteKitScenesInView:window into:scenes];
     }
     return scenes;
 }
@@ -669,6 +681,9 @@ static void EmberFlappyPracticeInit(void) {
         EmberFlappyPracticeController *controller = [EmberFlappyPracticeController sharedController];
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { [controller start]; }];
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { [controller stop]; }];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
+        [controller start];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
     });
 }

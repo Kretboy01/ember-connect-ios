@@ -333,6 +333,14 @@ struct LCTweakFolderView : View {
             LCParseMachO((destination.path as NSString).utf8String, false) { path, header, _, _ in
                 LCPatchAddRPath(path, header)
             }
+            let globalDestination = baseUrl.appendingPathComponent(preset.dylibName)
+            if fm.fileExists(atPath: globalDestination.path) {
+                try? fm.removeItem(at: globalDestination)
+            }
+            try? fm.copyItem(at: source, to: globalDestination)
+            LCParseMachO((globalDestination.path as NSString).utf8String, false) { path, header, _, _ in
+                LCPatchAddRPath(path, header)
+            }
 
             if let existing = tweakItems.firstIndex(where: {
                 $0.isFolder && $0.displayName == preset.folderName

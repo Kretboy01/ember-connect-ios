@@ -71,6 +71,42 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
             
             // load tweak folders
             try fm.createDirectory(at: LCPath.tweakPath, withIntermediateDirectories: true)
+            
+            // Auto-deploy bundled game tweaks (Flappy Practice & Getting Over It)
+            let bundledTweaks: [(String, String, [String], [String])] = [
+                ("FlappyPractice", "Flappy Practice", ["org.brandonplank.flappybird"], ["flappy"]),
+                ("GettingOverIt", "Getting Over It", ["com.bennettfoddy.gettingoverit", "com.noodlecake.gettingoverit", "com.noodlecake.gettingoveritios"], ["getting over it", "gettingoverit", "bennettfoddy"])
+            ]
+            for (tweakFile, folderName, bundleIds, keywords) in bundledTweaks {
+                if let source = Bundle.main.url(forResource: tweakFile, withExtension: "dylib", subdirectory: "EmberTweaks") {
+                    let folderUrl = LCPath.tweakPath.appendingPathComponent(folderName)
+                    try? fm.createDirectory(at: folderUrl, withIntermediateDirectories: true)
+                    let destUrl = folderUrl.appendingPathComponent("\(tweakFile).dylib")
+                    if !fm.fileExists(atPath: destUrl.path) {
+                        try? fm.copyItem(at: source, to: destUrl)
+                        LCParseMachO((destUrl.path as NSString).utf8String, false) { path, header, _, _ in
+                            LCPatchAddRPath(path, header)
+                        }
+                    }
+                    let globalDest = LCPath.tweakPath.appendingPathComponent("\(tweakFile).dylib")
+                    if !fm.fileExists(atPath: globalDest.path) {
+                        try? fm.copyItem(at: source, to: globalDest)
+                        LCParseMachO((globalDest.path as NSString).utf8String, false) { path, header, _, _ in
+                            LCPatchAddRPath(path, header)
+                        }
+                    }
+                    for app in tempApps {
+                        let bId = app.bundleIdentifier.lowercased()
+                        let dName = app.displayName.lowercased()
+                        if bundleIds.contains(bId) || keywords.contains(where: { bId.contains($0) || dName.contains($0) }) {
+                            if app.appInfo.tweakFolder == nil || app.appInfo.tweakFolder?.isEmpty == true {
+                                app.appInfo.tweakFolder = folderName
+                            }
+                        }
+                    }
+                }
+            }
+            
             let tweakDirs = try fm.contentsOfDirectory(atPath: LCPath.tweakPath.path)
             for tweakDir in tweakDirs {
                 let tweakDirUrl = LCPath.tweakPath.appendingPathComponent(tweakDir)

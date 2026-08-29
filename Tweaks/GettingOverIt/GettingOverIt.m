@@ -103,40 +103,63 @@ static const MethodInfo* load_scene_method = NULL;
     [defaults setBool:self.statsHudEnabled forKey:kEmberStatsHudKey];
 }
 
-- (void)resolveIL2CPP {
-    classesResolved = [NSMutableDictionary dictionary];
-    void* handle = RTLD_DEFAULT;
+static void ResolveIL2CPPSymbols(void) {
+    if (il2cpp_domain_get && il2cpp_class_from_name && il2cpp_runtime_invoke) return;
     
-    il2cpp_domain_get = dlsym(handle, "il2cpp_domain_get");
-    il2cpp_domain_get_assemblies = dlsym(handle, "il2cpp_domain_get_assemblies");
-    il2cpp_assembly_get_image = dlsym(handle, "il2cpp_assembly_get_image");
-    il2cpp_class_from_name = dlsym(handle, "il2cpp_class_from_name");
-    il2cpp_class_get_method_from_name = dlsym(handle, "il2cpp_class_get_method_from_name");
-    il2cpp_class_get_field_from_name = dlsym(handle, "il2cpp_class_get_field_from_name");
-    il2cpp_field_static_get_value = dlsym(handle, "il2cpp_field_static_get_value");
-    il2cpp_field_static_set_value = dlsym(handle, "il2cpp_field_static_set_value");
-    il2cpp_runtime_invoke = dlsym(handle, "il2cpp_runtime_invoke");
-
-    if (il2cpp_domain_get && il2cpp_class_from_name) {
-        il2cpp_resolved = YES;
-        [self resolveUnityClasses];
-    } else {
-        NSLog(@"[EmberConnect] IL2CPP symbols not directly found in global namespace");
+    void *handles[] = {
+        RTLD_DEFAULT,
+        dlopen(NULL, RTLD_LAZY),
+        dlopen("UnityFramework.framework/UnityFramework", RTLD_NOLOAD | RTLD_LAZY),
+        dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_NOLOAD | RTLD_LAZY),
+        dlopen("Frameworks/UnityFramework.framework/UnityFramework", RTLD_NOLOAD | RTLD_LAZY)
+    };
+    
+    for (int i = 0; i < sizeof(handles)/sizeof(handles[0]); i++) {
+        void *h = handles[i];
+        if (!h) continue;
+        if (!il2cpp_domain_get) il2cpp_domain_get = dlsym(h, "il2cpp_domain_get");
+        if (!il2cpp_domain_get_assemblies) il2cpp_domain_get_assemblies = dlsym(h, "il2cpp_domain_get_assemblies");
+        if (!il2cpp_assembly_get_image) il2cpp_assembly_get_image = dlsym(h, "il2cpp_assembly_get_image");
+        if (!il2cpp_class_from_name) il2cpp_class_from_name = dlsym(h, "il2cpp_class_from_name");
+        if (!il2cpp_class_get_method_from_name) il2cpp_class_get_method_from_name = dlsym(h, "il2cpp_class_get_method_from_name");
+        if (!il2cpp_class_get_field_from_name) il2cpp_class_get_field_from_name = dlsym(h, "il2cpp_class_get_field_from_name");
+        if (!il2cpp_field_static_get_value) il2cpp_field_static_get_value = dlsym(h, "il2cpp_field_static_get_value");
+        if (!il2cpp_field_static_set_value) il2cpp_field_static_set_value = dlsym(h, "il2cpp_field_static_set_value");
+        if (!il2cpp_runtime_invoke) il2cpp_runtime_invoke = dlsym(h, "il2cpp_runtime_invoke");
     }
-    [self updateStatusPlist];
 }
 
-- (void)resolveUnityClasses {
-    if (!il2cpp_resolved) return;
+- (void)resolveIL2CPP {
+    if (!classesResolved) {
+        classesResolved = [NSMutableDictionary dictionary];
+    }
+    ResolveIL2CPPSymbols();
+    [self resolveUnityClasses];
+}
+
+- (BOOL)resolveUnityClasses {
+    ResolveIL2CPPSymbols();
+    if (!il2cpp_domain_get || !il2cpp_class_from_name || !il2cpp_runtime_invoke) {
+        return NO;
+    }
     
     Il2CppDomain* domain = il2cpp_domain_get();
-    if (!domain) return;
+    if (!domain) {
+        return NO; // Domain not yet created by Unity, will retry on next tick
+    }
+    
     size_t count = 0;
-    Il2CppAssembly** assemblies = il2cpp_domain_get_assemblies(domain, &count);
-    if (!assemblies || count == 0) return;
+    Il2CppAssembly** assemblies = il2cpp_domain_get_assemblies ? il2cpp_domain_get_assemblies(domain, &count) : NULL;
+    if (!assemblies || count == 0) {
+        return NO;
+    }
+    
+    if (!classesResolved) {
+        classesResolved = [NSMutableDictionary dictionary];
+    }
     
     for (size_t i = 0; i < count; i++) {
-        const Il2CppImage* image = il2cpp_assembly_get_image(assemblies[i]);
+        const Il2CppImage* image = il2cpp_assembly_get_image ? il2cpp_assembly_get_image(assemblies[i]) : NULL;
         if (!image) continue;
         
         if (!set_timeScale_method) {
@@ -144,7 +167,10 @@ static const MethodInfo* load_scene_method = NULL;
             if (timeClass) {
                 set_timeScale_method = il2cpp_class_get_method_from_name(timeClass, "set_timeScale", 1);
                 get_timeScale_method = il2cpp_class_get_method_from_name(timeClass, "get_timeScale", 0);
-                classesResolved[@"UnityEngine.Time"] = @YES;
+                if (set_timeScale_method) {
+                    classesResolved[@"UnityEngine.Time"] = @YES;
+                    NSLog(@"[EmberConnect] Resolved UnityEngine.Time set_timeScale!");
+                }
             }
         }
         
@@ -153,7 +179,10 @@ static const MethodInfo* load_scene_method = NULL;
             if (physicsClass) {
                 set_gravity_method = il2cpp_class_get_method_from_name(physicsClass, "set_gravity", 1);
                 get_gravity_method = il2cpp_class_get_method_from_name(physicsClass, "get_gravity", 0);
-                classesResolved[@"UnityEngine.Physics2D"] = @YES;
+                if (set_gravity_method) {
+                    classesResolved[@"UnityEngine.Physics2D"] = @YES;
+                    NSLog(@"[EmberConnect] Resolved UnityEngine.Physics2D set_gravity!");
+                }
             }
         }
         
@@ -161,41 +190,58 @@ static const MethodInfo* load_scene_method = NULL;
             Il2CppClass* sceneManagerClass = il2cpp_class_from_name(image, "UnityEngine.SceneManagement", "SceneManager");
             if (sceneManagerClass) {
                 load_scene_method = il2cpp_class_get_method_from_name(sceneManagerClass, "LoadScene", 1);
-                classesResolved[@"UnityEngine.SceneManagement.SceneManager"] = @YES;
+                if (load_scene_method) {
+                    classesResolved[@"UnityEngine.SceneManagement.SceneManager"] = @YES;
+                    NSLog(@"[EmberConnect] Resolved SceneManager.LoadScene!");
+                }
             }
         }
     }
     
+    il2cpp_resolved = (set_timeScale_method != NULL);
     [self updateStatusPlist];
+    return il2cpp_resolved;
 }
 
 - (void)applyTimeScale {
-    if (il2cpp_resolved && set_timeScale_method && il2cpp_runtime_invoke) {
+    if (!set_timeScale_method) {
+        [self resolveUnityClasses];
+    }
+    if (set_timeScale_method && il2cpp_runtime_invoke) {
         float speed = (float)self.speedFactor;
         void* args[1] = { &speed };
-        il2cpp_runtime_invoke(set_timeScale_method, NULL, args, NULL);
+        Il2CppObject *exc = NULL;
+        il2cpp_runtime_invoke(set_timeScale_method, NULL, args, &exc);
     }
 }
 
 - (void)applyGravity {
-    if (il2cpp_resolved && set_gravity_method && il2cpp_runtime_invoke) {
+    if (!set_gravity_method) {
+        [self resolveUnityClasses];
+    }
+    if (set_gravity_method && il2cpp_runtime_invoke) {
         Vector2 grav = { 0.0f, -9.81f * (float)self.gravityFactor };
         void* args[1] = { &grav };
-        il2cpp_runtime_invoke(set_gravity_method, NULL, args, NULL);
+        Il2CppObject *exc = NULL;
+        il2cpp_runtime_invoke(set_gravity_method, NULL, args, &exc);
     }
 }
 
 - (void)reloadActiveScene {
-    if (il2cpp_resolved && load_scene_method && il2cpp_runtime_invoke) {
+    if (!load_scene_method) {
+        [self resolveUnityClasses];
+    }
+    if (load_scene_method && il2cpp_runtime_invoke) {
         int sceneIndex = 0;
         void* args[1] = { &sceneIndex };
-        il2cpp_runtime_invoke(load_scene_method, NULL, args, NULL);
+        Il2CppObject *exc = NULL;
+        il2cpp_runtime_invoke(load_scene_method, NULL, args, &exc);
     }
 }
 
 - (void)maintainEnabledTweaks {
-    if (!il2cpp_resolved) {
-        [self resolveIL2CPP];
+    if (!set_timeScale_method) {
+        [self resolveUnityClasses];
     }
     [self applyTimeScale];
     [self applyGravity];
@@ -216,25 +262,38 @@ static const MethodInfo* load_scene_method = NULL;
         self.statsHud.hidden = NO;
         self.statsHudLabel.text = [NSString stringWithFormat:@"FPS: %.0f\nSpd: %.2gx  Grv: %.2gx\nIL2CPP: %@",
                                    self.currentFPS, self.speedFactor, self.gravityFactor,
-                                   il2cpp_resolved ? @"Hooked" : @"Pending"];
+                                   il2cpp_resolved ? @"Hooked" : @"Resolving..."];
     } else if (self.statsHud) {
         self.statsHud.hidden = YES;
     }
 }
 
 - (UIWindow *)guestWindow {
+    UIWindow *best = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if ([scene isKindOfClass:UIWindowScene.class]) {
-            for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if (!window.hidden && window.rootViewController) return window;
-            }
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.hidden || !window.rootViewController || window.windowLevel > UIWindowLevelNormal) continue;
+            if (!best || window.isKeyWindow) best = window;
         }
     }
-    return nil;
+    if (best) return best;
+    
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window.hidden || !window.rootViewController || window.windowLevel > UIWindowLevelNormal) continue;
+        if (!best || window.isKeyWindow) best = window;
+    }
+    if (best) return best;
+    
+    return UIApplication.sharedApplication.keyWindow;
 }
 
 - (UIViewController *)topViewController {
     UIViewController *controller = self.hostWindow.rootViewController;
+    if (!controller) {
+        UIWindow *window = [self guestWindow];
+        controller = window.rootViewController;
+    }
     while (controller.presentedViewController) controller = controller.presentedViewController;
     return controller;
 }
@@ -575,6 +634,9 @@ static void EmberGettingOverItInit(void) {
         EmberGettingOverItController *controller = [EmberGettingOverItController sharedController];
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { [controller start]; }];
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { [controller stop]; }];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
+        [controller start];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [controller start]; });
     });
 }
