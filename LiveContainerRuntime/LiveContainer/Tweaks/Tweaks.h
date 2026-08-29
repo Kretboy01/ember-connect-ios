@@ -22,6 +22,10 @@ void IDFVHookInit(NSUUID* uuid);
 
 
 extern uint32_t appMainImageIndex;
+// The un-hooked dyld accessors. The hooked ones lie about the image list on
+// the guest's behalf, so anything that needs the real list must use these.
+extern uint32_t (*orig_dyld_image_count)(void);
+extern const char* (*orig_dyld_get_image_name)(uint32_t image_index);
 extern void* appExecutableHandle;
 extern bool tweakLoaderLoaded;
 void* getGuestAppHeader(void);

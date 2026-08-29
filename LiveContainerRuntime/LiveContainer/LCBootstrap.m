@@ -14,6 +14,8 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <stdlib.h>
+#include <string.h>
+#include <limits.h>
 #include "../litehook/src/litehook.h"
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
@@ -233,9 +235,54 @@ void overwriteExecPath(const char *newExecPath) {
     performHookDyldApi("_NSGetExecutablePath", 2, (void**)&orig__NSGetExecutablePath, orig__NSGetExecutablePath);
 }
 
+/// Locates the guest executable in dyld's image list, by path.
+///
+/// `appMainImageIndex` used to be *predicted*: the bootstrap recorded
+/// `_dyld_image_count()` immediately before `dlopen`ing the guest and assumed
+/// the guest would land at exactly that index. That only holds when the guest
+/// is the very next image dyld adds, and it frequently is not — dyld also
+/// loads whatever the guest links against, so the predicted slot can belong to
+/// one of its dependencies, and if no image lands there at all the slot is
+/// past the end of the list.
+///
+/// Neither failure announced itself. A dependency dylib has no `LC_MAIN`, so
+/// the entry-point scan below fell through with `entryoff == 0`; the `assert`
+/// that was supposed to catch that is compiled out in release builds, and the
+/// function then returned `header + 0`. Past the end of the list is worse:
+/// `_dyld_get_image_header` returns NULL, so it returned NULL and the guest
+/// was launched by jumping to address 0.
+///
+/// Searching for the image by its own path removes the guesswork. The
+/// un-hooked accessors are used deliberately — the hooked ones rewrite the
+/// image list for the guest's benefit and would hide the very entry we want.
+static uint32_t findGuestImageIndex(const char *execPath) {
+    if (!execPath) return UINT32_MAX;
+
+    char wantedBuffer[PATH_MAX];
+    const char *wanted = realpath(execPath, wantedBuffer) ? wantedBuffer : execPath;
+
+    uint32_t count = orig_dyld_image_count();
+    for (uint32_t i = 0; i < count; ++i) {
+        const char *name = orig_dyld_get_image_name(i);
+        if (!name) continue;
+        if (strcmp(name, wanted) == 0) return i;
+
+        char resolvedBuffer[PATH_MAX];
+        const char *resolved = realpath(name, resolvedBuffer);
+        if (resolved && strcmp(resolved, wanted) == 0) return i;
+    }
+    return UINT32_MAX;
+}
+
 static void *getAppEntryPoint(void *handle) {
     uint32_t entryoff = 0;
     const struct mach_header_64 *header = (struct mach_header_64 *)getGuestAppHeader();
+    if (!header) {
+        NSLog(@"[LCBootstrap] no Mach-O header for image index %u of %u",
+              appMainImageIndex, orig_dyld_image_count());
+        return NULL;
+    }
+
     uint8_t *imageHeaderPtr = (uint8_t*)header + sizeof(struct mach_header_64);
     struct load_command *command = (struct load_command *)imageHeaderPtr;
     for(int i = 0; i < header->ncmds; ++i) {
@@ -247,7 +294,16 @@ static void *getAppEntryPoint(void *handle) {
         imageHeaderPtr += command->cmdsize;
         command = (struct load_command *)imageHeaderPtr;
     }
-    assert(entryoff > 0);
+
+    // Report it rather than returning `header + 0` and letting the caller jump
+    // into a Mach-O header. The caller already turns NULL into a legible
+    // "Could not find the main entry point".
+    if (entryoff == 0) {
+        NSLog(@"[LCBootstrap] image at index %u has no LC_MAIN (filetype %u) — "
+               "this is not the guest executable",
+              appMainImageIndex, header->filetype);
+        return NULL;
+    }
     return (void *)header + entryoff;
 }
 
@@ -567,7 +623,10 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         tweakLoaderLoaded = true;
     }
     
-    // Preload executable to bypass RT_NOLOAD
+    // Preload executable to bypass RT_NOLOAD.
+    //
+    // This index is a first guess only; it is corrected against dyld's real
+    // image list once the guest is loaded. See findGuestImageIndex.
     appMainImageIndex = _dyld_image_count();
     __block void *appHandle = 0;
     void (^dlopenBlock)(void) = ^{
@@ -584,6 +643,22 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
     appExecutableHandle = appHandle;
     const char *dlerr = dlerror();
+
+    // Correct the predicted index against where the guest actually landed.
+    // Everything downstream keys off it — the entry-point lookup, the
+    // MH_EXECUTE filetype rewrite, `dlsym(RTLD_MAIN_ONLY)` and the image-index
+    // translation — so a wrong value here is not a local mistake.
+    {
+        uint32_t actual = findGuestImageIndex(appExecPath);
+        if (actual != UINT32_MAX && actual != appMainImageIndex) {
+            NSLog(@"[LCBootstrap] guest image is at index %u, not the predicted %u; correcting",
+                  actual, appMainImageIndex);
+            appMainImageIndex = actual;
+        } else if (actual == UINT32_MAX) {
+            NSLog(@"[LCBootstrap] could not find %s in dyld's image list; keeping predicted index %u",
+                  appExecPath, appMainImageIndex);
+        }
+    }
     
     if (!appHandle || (uint64_t)appHandle > 0xf00000000000) {
         if (dlerr) {
