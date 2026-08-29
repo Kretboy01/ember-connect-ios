@@ -9,7 +9,7 @@
 #define EMBER_GOI_BUTTON_TAG 0xFB003
 #define EMBER_GOI_HUD_TAG    0xFB004
 
-// MARK: - IL2CPP Types
+// MARK: - Unity / IL2CPP Types
 typedef void Il2CppDomain;
 typedef void Il2CppAssembly;
 typedef void Il2CppImage;
@@ -17,12 +17,21 @@ typedef void Il2CppClass;
 typedef void MethodInfo;
 typedef void FieldInfo;
 typedef void Il2CppObject;
+typedef void Il2CppThread;
+
+typedef struct { float x; float y; float z; } Vector3;
 typedef struct { float x; float y; } Vector2;
 
 typedef void (*SetTimeScaleFunc)(float);
 typedef float (*GetTimeScaleFunc)(void);
-typedef void (*SetGravityInjectedFunc)(Vector2*);
-typedef void (*SetGravityDirectFunc)(Vector2);
+typedef void (*SetFixedDeltaTimeFunc)(float);
+
+typedef void (*Set3DGravityInjectedFunc)(Vector3*);
+typedef void (*Set3DGravityDirectFunc)(Vector3);
+typedef void (*Get3DGravityInjectedFunc)(Vector3*);
+
+typedef void (*Set2DGravityInjectedFunc)(Vector2*);
+typedef void (*Set2DGravityDirectFunc)(Vector2);
 
 // MARK: - Constants & Settings Keys
 static NSString *const kEmberSpeedKey = @"EmberGettingOverIt.speed";
@@ -34,19 +43,28 @@ static NSString *const kEmberStatsHudKey = @"EmberGettingOverIt.statsHud";
 // MARK: - IL2CPP Function Pointers
 static void* (*g_il2cpp_resolve_icall)(const char*) = NULL;
 static Il2CppDomain* (*il2cpp_domain_get)(void) = NULL;
+static Il2CppThread* (*il2cpp_thread_attach)(Il2CppDomain* domain) = NULL;
 static Il2CppAssembly** (*il2cpp_domain_get_assemblies)(const Il2CppDomain* domain, size_t* size) = NULL;
 static const Il2CppImage* (*il2cpp_assembly_get_image)(const Il2CppAssembly* assembly) = NULL;
+static const char* (*il2cpp_image_get_name)(const Il2CppImage* image) = NULL;
 static Il2CppClass* (*il2cpp_class_from_name)(const Il2CppImage* image, const char* namespaze, const char* name) = NULL;
 static const MethodInfo* (*il2cpp_class_get_method_from_name)(Il2CppClass* klass, const char* name, int argsCount) = NULL;
 static Il2CppObject* (*il2cpp_runtime_invoke)(const MethodInfo* method, void* obj, void** params, Il2CppObject** exc) = NULL;
 
 static SetTimeScaleFunc g_setTimeScale = NULL;
 static GetTimeScaleFunc g_getTimeScale = NULL;
-static SetGravityInjectedFunc g_setGravityInjected = NULL;
-static SetGravityDirectFunc g_setGravityDirect = NULL;
+static SetFixedDeltaTimeFunc g_setFixedDeltaTime = NULL;
+
+static Set3DGravityInjectedFunc g_set3DGravityInjected = NULL;
+static Set3DGravityDirectFunc g_set3DGravityDirect = NULL;
+
+static Set2DGravityInjectedFunc g_set2DGravityInjected = NULL;
+static Set2DGravityDirectFunc g_set2DGravityDirect = NULL;
 
 static const MethodInfo* set_timeScale_method = NULL;
-static const MethodInfo* set_gravity_method = NULL;
+static const MethodInfo* set_fixedDeltaTime_method = NULL;
+static const MethodInfo* set_3d_gravity_method = NULL;
+static const MethodInfo* set_2d_gravity_method = NULL;
 static const MethodInfo* load_scene_method = NULL;
 
 static BOOL il2cpp_resolved = NO;
@@ -116,9 +134,9 @@ static void ProbeIL2CPPSymbols(void) {
     void *handles[] = {
         RTLD_DEFAULT,
         dlopen(NULL, RTLD_LAZY),
-        dlopen("UnityFramework.framework/UnityFramework", RTLD_NOLOAD | RTLD_LAZY),
-        dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_NOLOAD | RTLD_LAZY),
-        dlopen("Frameworks/UnityFramework.framework/UnityFramework", RTLD_NOLOAD | RTLD_LAZY)
+        dlopen("UnityFramework.framework/UnityFramework", RTLD_LAZY),
+        dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_LAZY),
+        dlopen("Frameworks/UnityFramework.framework/UnityFramework", RTLD_LAZY)
     };
     
     for (int i = 0; i < sizeof(handles)/sizeof(handles[0]); i++) {
@@ -126,23 +144,36 @@ static void ProbeIL2CPPSymbols(void) {
         if (!h) continue;
         if (!g_il2cpp_resolve_icall) g_il2cpp_resolve_icall = dlsym(h, "il2cpp_resolve_icall");
         if (!il2cpp_domain_get) il2cpp_domain_get = dlsym(h, "il2cpp_domain_get");
+        if (!il2cpp_thread_attach) il2cpp_thread_attach = dlsym(h, "il2cpp_thread_attach");
         if (!il2cpp_domain_get_assemblies) il2cpp_domain_get_assemblies = dlsym(h, "il2cpp_domain_get_assemblies");
         if (!il2cpp_assembly_get_image) il2cpp_assembly_get_image = dlsym(h, "il2cpp_assembly_get_image");
+        if (!il2cpp_image_get_name) il2cpp_image_get_name = dlsym(h, "il2cpp_image_get_name");
         if (!il2cpp_class_from_name) il2cpp_class_from_name = dlsym(h, "il2cpp_class_from_name");
         if (!il2cpp_class_get_method_from_name) il2cpp_class_get_method_from_name = dlsym(h, "il2cpp_class_get_method_from_name");
         if (!il2cpp_runtime_invoke) il2cpp_runtime_invoke = dlsym(h, "il2cpp_runtime_invoke");
     }
 }
 
+- (void)ensureThreadAttached {
+    if (il2cpp_thread_attach && il2cpp_domain_get) {
+        Il2CppDomain *domain = il2cpp_domain_get();
+        if (domain) {
+            il2cpp_thread_attach(domain);
+        }
+    }
+}
+
 - (BOOL)resolveIL2CPP {
     ProbeIL2CPPSymbols();
+    [self ensureThreadAttached];
     
     if (!classesResolved) {
         classesResolved = [NSMutableDictionary dictionary];
     }
     
-    // 1. Direct icall resolution (fastest & most reliable)
+    // 1. Direct icall resolution (fastest & native)
     if (g_il2cpp_resolve_icall) {
+        // Time.timeScale
         if (!g_setTimeScale) {
             g_setTimeScale = (SetTimeScaleFunc)g_il2cpp_resolve_icall("UnityEngine.Time::set_timeScale(System.Single)");
             if (!g_setTimeScale) g_setTimeScale = (SetTimeScaleFunc)g_il2cpp_resolve_icall("UnityEngine.Time::set_timeScale");
@@ -153,11 +184,26 @@ static void ProbeIL2CPPSymbols(void) {
             if (!g_getTimeScale) g_getTimeScale = (GetTimeScaleFunc)g_il2cpp_resolve_icall("UnityEngine.Time::get_timeScale");
             if (g_getTimeScale) classesResolved[@"icall:Time::get_timeScale"] = @YES;
         }
-        if (!g_setGravityInjected && !g_setGravityDirect) {
-            g_setGravityInjected = (SetGravityInjectedFunc)g_il2cpp_resolve_icall("UnityEngine.Physics2D::set_gravity_Injected(UnityEngine.Vector2&)");
-            if (!g_setGravityInjected) g_setGravityDirect = (SetGravityDirectFunc)g_il2cpp_resolve_icall("UnityEngine.Physics2D::set_gravity(UnityEngine.Vector2)");
-            if (!g_setGravityInjected && !g_setGravityDirect) g_setGravityDirect = (SetGravityDirectFunc)g_il2cpp_resolve_icall("UnityEngine.Physics2D::set_gravity");
-            if (g_setGravityInjected || g_setGravityDirect) classesResolved[@"icall:Physics2D::set_gravity"] = @YES;
+        if (!g_setFixedDeltaTime) {
+            g_setFixedDeltaTime = (SetFixedDeltaTimeFunc)g_il2cpp_resolve_icall("UnityEngine.Time::set_fixedDeltaTime(System.Single)");
+            if (!g_setFixedDeltaTime) g_setFixedDeltaTime = (SetFixedDeltaTimeFunc)g_il2cpp_resolve_icall("UnityEngine.Time::set_fixedDeltaTime");
+            if (g_setFixedDeltaTime) classesResolved[@"icall:Time::set_fixedDeltaTime"] = @YES;
+        }
+        
+        // 3D Physics (PhysX - Getting Over It primary physics)
+        if (!g_set3DGravityInjected && !g_set3DGravityDirect) {
+            g_set3DGravityInjected = (Set3DGravityInjectedFunc)g_il2cpp_resolve_icall("UnityEngine.Physics::set_gravity_Injected(UnityEngine.Vector3&)");
+            if (!g_set3DGravityInjected) g_set3DGravityDirect = (Set3DGravityDirectFunc)g_il2cpp_resolve_icall("UnityEngine.Physics::set_gravity(UnityEngine.Vector3)");
+            if (!g_set3DGravityInjected && !g_set3DGravityDirect) g_set3DGravityDirect = (Set3DGravityDirectFunc)g_il2cpp_resolve_icall("UnityEngine.Physics::set_gravity");
+            if (g_set3DGravityInjected || g_set3DGravityDirect) classesResolved[@"icall:Physics::set_gravity"] = @YES;
+        }
+        
+        // 2D Physics (Box2D fallback)
+        if (!g_set2DGravityInjected && !g_set2DGravityDirect) {
+            g_set2DGravityInjected = (Set2DGravityInjectedFunc)g_il2cpp_resolve_icall("UnityEngine.Physics2D::set_gravity_Injected(UnityEngine.Vector2&)");
+            if (!g_set2DGravityInjected) g_set2DGravityDirect = (Set2DGravityDirectFunc)g_il2cpp_resolve_icall("UnityEngine.Physics2D::set_gravity(UnityEngine.Vector2)");
+            if (!g_set2DGravityInjected && !g_set2DGravityDirect) g_set2DGravityDirect = (Set2DGravityDirectFunc)g_il2cpp_resolve_icall("UnityEngine.Physics2D::set_gravity");
+            if (g_set2DGravityInjected || g_set2DGravityDirect) classesResolved[@"icall:Physics2D::set_gravity"] = @YES;
         }
     }
     
@@ -176,14 +222,22 @@ static void ProbeIL2CPPSymbols(void) {
                         Il2CppClass* timeClass = il2cpp_class_from_name(image, "UnityEngine", "Time");
                         if (timeClass) {
                             set_timeScale_method = il2cpp_class_get_method_from_name(timeClass, "set_timeScale", 1);
+                            set_fixedDeltaTime_method = il2cpp_class_get_method_from_name(timeClass, "set_fixedDeltaTime", 1);
                             if (set_timeScale_method) classesResolved[@"UnityEngine.Time"] = @YES;
                         }
                     }
-                    if (!set_gravity_method) {
-                        Il2CppClass* physicsClass = il2cpp_class_from_name(image, "UnityEngine", "Physics2D");
+                    if (!set_3d_gravity_method) {
+                        Il2CppClass* physicsClass = il2cpp_class_from_name(image, "UnityEngine", "Physics");
                         if (physicsClass) {
-                            set_gravity_method = il2cpp_class_get_method_from_name(physicsClass, "set_gravity", 1);
-                            if (set_gravity_method) classesResolved[@"UnityEngine.Physics2D"] = @YES;
+                            set_3d_gravity_method = il2cpp_class_get_method_from_name(physicsClass, "set_gravity", 1);
+                            if (set_3d_gravity_method) classesResolved[@"UnityEngine.Physics"] = @YES;
+                        }
+                    }
+                    if (!set_2d_gravity_method) {
+                        Il2CppClass* physics2DClass = il2cpp_class_from_name(image, "UnityEngine", "Physics2D");
+                        if (physics2DClass) {
+                            set_2d_gravity_method = il2cpp_class_get_method_from_name(physics2DClass, "set_gravity", 1);
+                            if (set_2d_gravity_method) classesResolved[@"UnityEngine.Physics2D"] = @YES;
                         }
                     }
                     if (!load_scene_method) {
@@ -198,40 +252,73 @@ static void ProbeIL2CPPSymbols(void) {
         }
     }
     
-    il2cpp_resolved = (g_setTimeScale != NULL || set_timeScale_method != NULL);
+    il2cpp_resolved = (g_setTimeScale != NULL || set_timeScale_method != NULL || g_set3DGravityInjected != NULL || set_3d_gravity_method != NULL);
     [self updateStatusPlist];
     return il2cpp_resolved;
 }
 
 - (void)applyTimeScale {
+    [self ensureThreadAttached];
+    float speed = (float)self.speedFactor;
+    float fixedDt = 0.02f * speed;
+    
     if (g_setTimeScale) {
-        g_setTimeScale((float)self.speedFactor);
+        g_setTimeScale(speed);
+        if (g_setFixedDeltaTime) g_setFixedDeltaTime(fixedDt);
     } else if (set_timeScale_method && il2cpp_runtime_invoke) {
-        float speed = (float)self.speedFactor;
         void* args[1] = { &speed };
         Il2CppObject *exc = NULL;
         il2cpp_runtime_invoke(set_timeScale_method, NULL, args, &exc);
+        
+        if (set_fixedDeltaTime_method) {
+            void* dtArgs[1] = { &fixedDt };
+            il2cpp_runtime_invoke(set_fixedDeltaTime_method, NULL, dtArgs, &exc);
+        }
     } else {
         [self resolveIL2CPP];
     }
 }
 
 - (void)applyGravity {
-    Vector2 grav = { 0.0f, -9.81f * (float)self.gravityFactor };
-    if (g_setGravityInjected) {
-        g_setGravityInjected(&grav);
-    } else if (g_setGravityDirect) {
-        g_setGravityDirect(grav);
-    } else if (set_gravity_method && il2cpp_runtime_invoke) {
-        void* args[1] = { &grav };
+    [self ensureThreadAttached];
+    CGFloat factor = self.gravityFactor;
+    if (self.ghostModeEnabled) {
+        factor = 0.0; // Zero-G float in ghost mode
+    } else if (self.superGripEnabled) {
+        factor = MIN(factor, 0.45); // Low gravity + high grip
+    }
+    
+    // 1. 3D PhysX Gravity (Getting Over It)
+    Vector3 grav3 = { 0.0f, -9.81f * (float)factor, 0.0f };
+    if (g_set3DGravityInjected) {
+        g_set3DGravityInjected(&grav3);
+    } else if (g_set3DGravityDirect) {
+        g_set3DGravityDirect(grav3);
+    } else if (set_3d_gravity_method && il2cpp_runtime_invoke) {
+        void* args[1] = { &grav3 };
         Il2CppObject *exc = NULL;
-        il2cpp_runtime_invoke(set_gravity_method, NULL, args, &exc);
-    } else {
+        il2cpp_runtime_invoke(set_3d_gravity_method, NULL, args, &exc);
+    }
+    
+    // 2. 2D Box2D Gravity (Fallback)
+    Vector2 grav2 = { 0.0f, -9.81f * (float)factor };
+    if (g_set2DGravityInjected) {
+        g_set2DGravityInjected(&grav2);
+    } else if (g_set2DGravityDirect) {
+        g_set2DGravityDirect(grav2);
+    } else if (set_2d_gravity_method && il2cpp_runtime_invoke) {
+        void* args[1] = { &grav2 };
+        Il2CppObject *exc = NULL;
+        il2cpp_runtime_invoke(set_2d_gravity_method, NULL, args, &exc);
+    }
+    
+    if (!g_set3DGravityInjected && !set_3d_gravity_method && !g_set2DGravityInjected && !set_2d_gravity_method) {
         [self resolveIL2CPP];
     }
 }
 
 - (void)reloadActiveScene {
+    [self ensureThreadAttached];
     if (load_scene_method && il2cpp_runtime_invoke) {
         int sceneIndex = 0;
         void* args[1] = { &sceneIndex };
@@ -260,9 +347,12 @@ static void ProbeIL2CPPSymbols(void) {
     
     if (self.statsHudEnabled && self.statsHudLabel && self.statsHud) {
         self.statsHud.hidden = NO;
-        self.statsHudLabel.text = [NSString stringWithFormat:@"FPS: %.0f\nSpd: %.2gx  Grv: %.2gx\nIL2CPP: %@",
+        NSString *physStatus = (g_set3DGravityInjected || set_3d_gravity_method) ? @"3D PhysX" : (il2cpp_resolved ? @"Hooked" : @"Resolving...");
+        self.statsHudLabel.text = [NSString stringWithFormat:@"FPS: %.0f\nSpd: %.2gx  Grv: %.2gx\nMod: %@\nGrip: %@ Ghost: %@",
                                    self.currentFPS, self.speedFactor, self.gravityFactor,
-                                   il2cpp_resolved ? @"Hooked" : @"Resolving..."];
+                                   physStatus,
+                                   self.superGripEnabled ? @"ON" : @"OFF",
+                                   self.ghostModeEnabled ? @"ON" : @"OFF"];
     } else if (self.statsHud) {
         self.statsHud.hidden = YES;
     }
@@ -339,7 +429,7 @@ static void ProbeIL2CPPSymbols(void) {
 - (void)showSpeedMenu {
     UIViewController *presenter = [self topViewController];
     if (!presenter) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Game Speed (Time.timeScale)" message:@"Scales Unity simulation speed." preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Game Speed (Time.timeScale)" message:@"Scales Unity simulation speed and physics delta time." preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
     NSArray *speeds = @[@0.25, @0.5, @0.75, @1.0, @1.25, @1.5, @2.0];
     for (NSNumber *spd in speeds) {
@@ -356,7 +446,7 @@ static void ProbeIL2CPPSymbols(void) {
 - (void)showGravityMenu {
     UIViewController *presenter = [self topViewController];
     if (!presenter) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Gravity Multiplier (Physics2D)" message:@"Adjusts 2D gravity acceleration." preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Gravity Multiplier (UnityEngine.Physics)" message:@"Adjusts 3D PhysX gravity acceleration." preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
     NSArray *gravities = @[@0.0, @0.25, @0.5, @0.75, @1.0, @1.5];
     for (NSNumber *num in gravities) {
@@ -375,12 +465,12 @@ static void ProbeIL2CPPSymbols(void) {
     if (!presenter) return;
     UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Practice Profiles" message:@"Presets for Getting Over It practice." preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
-    [menu addAction:[UIAlertAction actionWithTitle:@"Easy Climb (0.65x Speed, 0.7x Gravity, Super Grip)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.speedFactor = 0.65; weakSelf.gravityFactor = 0.7; weakSelf.superGripEnabled = YES; weakSelf.ghostModeEnabled = NO;
+    [menu addAction:[UIAlertAction actionWithTitle:@"Easy Climb (0.65x Speed, 0.45x Low Gravity, Super Grip)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        weakSelf.speedFactor = 0.65; weakSelf.gravityFactor = 0.45; weakSelf.superGripEnabled = YES; weakSelf.ghostModeEnabled = NO;
         [weakSelf saveSettings]; [weakSelf applyTimeScale]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
     }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Moon Jump (0.35x Low Gravity)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.speedFactor = 1.0; weakSelf.gravityFactor = 0.35; weakSelf.superGripEnabled = NO; weakSelf.ghostModeEnabled = NO;
+    [menu addAction:[UIAlertAction actionWithTitle:@"Moon Jump (0.3x Low Gravity)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        weakSelf.speedFactor = 1.0; weakSelf.gravityFactor = 0.3; weakSelf.superGripEnabled = NO; weakSelf.ghostModeEnabled = NO;
         [weakSelf saveSettings]; [weakSelf applyTimeScale]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Speed Run Mode (1.5x Speed)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
@@ -402,11 +492,11 @@ static void ProbeIL2CPPSymbols(void) {
     [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Speed: %@  ▶", spdStr] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf showSpeedMenu]; }]];
     NSString *grvStr = (fabs(self.gravityFactor - 1.0) < 0.01) ? @"Normal (1.0x)" : (self.gravityFactor < 0.01 ? @"Zero-G" : [NSString stringWithFormat:@"%.2gx", self.gravityFactor]);
     [menu addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Gravity: %@  ▶", grvStr] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [weakSelf showGravityMenu]; }]];
-    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Ghost Mode (Pass Through)" selected:self.ghostModeEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.ghostModeEnabled = !weakSelf.ghostModeEnabled; [weakSelf saveSettings]; [weakSelf updateButtonTitle];
+    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Ghost Mode (Zero-G Float)" selected:self.ghostModeEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        weakSelf.ghostModeEnabled = !weakSelf.ghostModeEnabled; [weakSelf saveSettings]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
     }]];
-    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Super Grip (Sticky Friction)" selected:self.superGripEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        weakSelf.superGripEnabled = !weakSelf.superGripEnabled; [weakSelf saveSettings]; [weakSelf updateButtonTitle];
+    [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Super Grip (Sticky Friction & Assist)" selected:self.superGripEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        weakSelf.superGripEnabled = !weakSelf.superGripEnabled; [weakSelf saveSettings]; [weakSelf applyGravity]; [weakSelf updateButtonTitle];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:[self markedTitle:@"Live Stats HUD Overlay" selected:self.statsHudEnabled] style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         weakSelf.statsHudEnabled = !weakSelf.statsHudEnabled; [weakSelf saveSettings]; [weakSelf updateButtonTitle];
@@ -458,16 +548,16 @@ static void ProbeIL2CPPSymbols(void) {
     self.hostWindow = host;
     
     if (!self.statsHud) {
-        UIView *hud = [[UIView alloc] initWithFrame:CGRectMake(12, 44, 150, 68)];
+        UIView *hud = [[UIView alloc] initWithFrame:CGRectMake(12, 44, 160, 78)];
         hud.tag = EMBER_GOI_HUD_TAG;
-        hud.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+        hud.backgroundColor = [UIColor colorWithWhite:0 alpha:0.65];
         hud.layer.cornerRadius = 8;
         hud.layer.borderWidth = 1;
         hud.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
         hud.userInteractionEnabled = NO;
         hud.hidden = YES;
         
-        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, 134, 60)];
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, 144, 70)];
         label.numberOfLines = 0;
         label.textColor = [UIColor whiteColor];
         label.font = [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightMedium];
