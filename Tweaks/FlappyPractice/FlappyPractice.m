@@ -15,6 +15,25 @@
 
 static const CGFloat EmberPracticeSlowFactor = 0.55;
 
+static void EmberWritePracticeStatus(NSString *state) {
+    NSString *cache = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
+                                                           NSUserDomainMask,
+                                                           YES).firstObject;
+    if (!cache) return;
+    NSString *folder = [cache stringByAppendingPathComponent:@"EmberConnect"];
+    [NSFileManager.defaultManager createDirectoryAtPath:folder
+                             withIntermediateDirectories:YES
+                                              attributes:nil
+                                                   error:nil];
+    NSDictionary *status = @{
+        @"state": state ?: @"unknown",
+        @"bundleIdentifier": NSBundle.mainBundle.bundleIdentifier ?: @"unknown",
+        @"updatedAt": @([NSDate.date timeIntervalSince1970])
+    };
+    [status writeToFile:[folder stringByAppendingPathComponent:@"FlappyPracticeStatus.plist"]
+             atomically:YES];
+}
+
 @interface EmberFlappyPracticeController : NSObject
 @property(nonatomic, weak) UIButton *button;
 @property(nonatomic, weak) UIWindow *hostWindow;
@@ -79,6 +98,7 @@ static const CGFloat EmberPracticeSlowFactor = 0.55;
         }
         scene.speed = original.doubleValue * EmberPracticeSlowFactor;
     }
+    EmberWritePracticeStatus(scenes.count > 0 ? @"slow-motion-applied" : @"no-spritekit-scene");
     return scenes.count > 0;
 }
 
@@ -156,6 +176,7 @@ static const CGFloat EmberPracticeSlowFactor = 0.55;
     self.button = button;
     self.hostWindow = host;
     [self updateButtonTitle];
+    EmberWritePracticeStatus(@"button-installed");
 }
 
 - (void)start {
@@ -177,6 +198,7 @@ static const CGFloat EmberPracticeSlowFactor = 0.55;
 __attribute__((constructor))
 static void EmberFlappyPracticeInit(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        EmberWritePracticeStatus(@"constructor-ran");
         EmberFlappyPracticeController *controller = [EmberFlappyPracticeController sharedController];
 
         [NSNotificationCenter.defaultCenter

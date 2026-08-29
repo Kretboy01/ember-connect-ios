@@ -11,7 +11,8 @@ Bird and some ports use other engines; those show `No SK` and are left alone.
 
 1. The Tweaks tab copies the bundled `FlappyPractice.dylib` into an
    app-specific `Tweaks/Flappy Practice` folder.
-2. The app's settings store that folder name as `LCTweakFolder`.
+2. The sample installer finds `org.brandonplank.flappybird` and stores that
+   folder name as the app's `LCTweakFolder` automatically.
 3. Before launch, Ember Connect patches and signs the dylib with the same local
    certificate used for the guest app.
 4. `TweakLoader.dylib` is injected into the guest executable and recursively
@@ -21,6 +22,10 @@ Bird and some ports use other engines; those show `No SK` and are left alone.
 
 The tweak uses public UIKit and SpriteKit APIs. It does not patch scores,
 purchases, network calls, or game-specific classes.
+
+For diagnosis it records its last lifecycle state in the guest app's
+`Library/Caches/EmberConnect/FlappyPracticeStatus.plist`. This distinguishes a
+load/signing problem from a button-attachment or SpriteKit-discovery problem.
 
 ## Build
 

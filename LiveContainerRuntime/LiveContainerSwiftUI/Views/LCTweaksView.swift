@@ -42,6 +42,7 @@ struct LCTweakFolderView : View {
     @State private var isTweakSigning = false
 
     private static let exampleFolderName = "Flappy Practice"
+    private static let exampleBundleIdentifier = "org.brandonplank.flappybird"
     
     init(baseUrl: URL, isRoot: Bool = false, tweakFolders: Binding<[String]>) {
         _baseUrl = State(initialValue: baseUrl)
@@ -81,7 +82,7 @@ struct LCTweakFolderView : View {
                         Text("A tweak is an arm64 .dylib or framework that Ember Connect signs, injects, and loads inside a guest app when it starts.")
                             .font(.subheadline)
 
-                        Text("Keep app-specific tweaks in a folder, then choose that folder in the guest app's Settings. Loose dylibs and frameworks at this top level are global and load into every guest app.")
+                        Text("Enabled only means the file may load. An app-specific folder must also be assigned to the guest app. Loose dylibs and frameworks at this top level are global and load into every guest app.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -89,12 +90,12 @@ struct LCTweakFolderView : View {
                     Button {
                         installBundledExample()
                     } label: {
-                        Label(exampleIsInstalled ? "Reinstall Flappy Practice (SpriteKit)"
-                                                 : "Install Flappy Practice (SpriteKit)",
+                        Label(exampleIsInstalled ? "Reinstall & Assign Flappy Practice"
+                                                 : "Install & Assign Flappy Practice",
                               systemImage: "speedometer")
                     }
                 } footer: {
-                    Text("The example adds a 0.55x speed toggle to SpriteKit games. After installing it, select “Flappy Practice” in the game's Settings and relaunch the game.")
+                    Text("The example adds a 0.55x speed toggle and automatically assigns itself to the installed org.brandonplank.flappybird app. Relaunch Flappy Bird after installing it.")
                 }
             }
 
@@ -295,6 +296,11 @@ struct LCTweakFolderView : View {
             }
             if !tweakFolders.contains(Self.exampleFolderName) {
                 tweakFolders.append(Self.exampleFolderName)
+            }
+            if let flappy = DataManager.shared.model.apps.first(where: {
+                $0.bundleIdentifier == Self.exampleBundleIdentifier
+            }) {
+                flappy.uiTweakFolder = Self.exampleFolderName
             }
         } catch {
             errorShow = true
