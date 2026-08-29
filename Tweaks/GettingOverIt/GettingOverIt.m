@@ -4,6 +4,7 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
 #import <QuartzCore/QuartzCore.h>
 
 #define EMBER_GOI_BUTTON_TAG 0xFB003
@@ -33,6 +34,8 @@ typedef void (*Get3DGravityInjectedFunc)(Vector3*);
 typedef void (*Set2DGravityInjectedFunc)(Vector2*);
 typedef void (*Set2DGravityDirectFunc)(Vector2);
 
+typedef void (*UnitySendMessageFunc)(const char*, const char*, const char*);
+
 // MARK: - Constants & Settings Keys
 static NSString *const kEmberSpeedKey = @"EmberGettingOverIt.speed";
 static NSString *const kEmberGravityKey = @"EmberGettingOverIt.gravity";
@@ -51,6 +54,8 @@ static Il2CppClass* (*il2cpp_class_from_name)(const Il2CppImage* image, const ch
 static const MethodInfo* (*il2cpp_class_get_method_from_name)(Il2CppClass* klass, const char* name, int argsCount) = NULL;
 static Il2CppObject* (*il2cpp_runtime_invoke)(const MethodInfo* method, void* obj, void** params, Il2CppObject** exc) = NULL;
 
+static UnitySendMessageFunc g_UnitySendMessage = NULL;
+
 static SetTimeScaleFunc g_setTimeScale = NULL;
 static GetTimeScaleFunc g_getTimeScale = NULL;
 static SetFixedDeltaTimeFunc g_setFixedDeltaTime = NULL;
@@ -68,6 +73,7 @@ static const MethodInfo* set_2d_gravity_method = NULL;
 static const MethodInfo* load_scene_method = NULL;
 
 static BOOL il2cpp_resolved = NO;
+static NSString *resolvedSource = @"None";
 static NSMutableDictionary *classesResolved;
 
 // MARK: - Main Controller
@@ -128,29 +134,50 @@ static NSMutableDictionary *classesResolved;
     [defaults setBool:self.statsHudEnabled forKey:kEmberStatsHudKey];
 }
 
+static void TryProbeHandle(void *h, const char *sourceLabel) {
+    if (!h) return;
+    
+    if (!g_il2cpp_resolve_icall) {
+        g_il2cpp_resolve_icall = dlsym(h, "il2cpp_resolve_icall");
+        if (g_il2cpp_resolve_icall) resolvedSource = [NSString stringWithUTF8String:sourceLabel];
+    }
+    if (!il2cpp_domain_get) {
+        il2cpp_domain_get = dlsym(h, "il2cpp_domain_get");
+        if (il2cpp_domain_get) resolvedSource = [NSString stringWithUTF8String:sourceLabel];
+    }
+    if (!il2cpp_thread_attach) il2cpp_thread_attach = dlsym(h, "il2cpp_thread_attach");
+    if (!il2cpp_domain_get_assemblies) il2cpp_domain_get_assemblies = dlsym(h, "il2cpp_domain_get_assemblies");
+    if (!il2cpp_assembly_get_image) il2cpp_assembly_get_image = dlsym(h, "il2cpp_assembly_get_image");
+    if (!il2cpp_image_get_name) il2cpp_image_get_name = dlsym(h, "il2cpp_image_get_name");
+    if (!il2cpp_class_from_name) il2cpp_class_from_name = dlsym(h, "il2cpp_class_from_name");
+    if (!il2cpp_class_get_method_from_name) il2cpp_class_get_method_from_name = dlsym(h, "il2cpp_class_get_method_from_name");
+    if (!il2cpp_runtime_invoke) il2cpp_runtime_invoke = dlsym(h, "il2cpp_runtime_invoke");
+    if (!g_UnitySendMessage) g_UnitySendMessage = dlsym(h, "UnitySendMessage");
+}
+
 static void ProbeIL2CPPSymbols(void) {
     if (g_il2cpp_resolve_icall && il2cpp_domain_get && il2cpp_runtime_invoke) return;
     
-    void *handles[] = {
-        RTLD_DEFAULT,
-        dlopen(NULL, RTLD_LAZY),
-        dlopen("UnityFramework.framework/UnityFramework", RTLD_LAZY),
-        dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_LAZY),
-        dlopen("Frameworks/UnityFramework.framework/UnityFramework", RTLD_LAZY)
-    };
+    // 1. LiveContainer guest executable handle via RTLD_MAIN_ONLY
+    TryProbeHandle((void *)RTLD_MAIN_ONLY, "RTLD_MAIN_ONLY");
     
-    for (int i = 0; i < sizeof(handles)/sizeof(handles[0]); i++) {
-        void *h = handles[i];
-        if (!h) continue;
-        if (!g_il2cpp_resolve_icall) g_il2cpp_resolve_icall = dlsym(h, "il2cpp_resolve_icall");
-        if (!il2cpp_domain_get) il2cpp_domain_get = dlsym(h, "il2cpp_domain_get");
-        if (!il2cpp_thread_attach) il2cpp_thread_attach = dlsym(h, "il2cpp_thread_attach");
-        if (!il2cpp_domain_get_assemblies) il2cpp_domain_get_assemblies = dlsym(h, "il2cpp_domain_get_assemblies");
-        if (!il2cpp_assembly_get_image) il2cpp_assembly_get_image = dlsym(h, "il2cpp_assembly_get_image");
-        if (!il2cpp_image_get_name) il2cpp_image_get_name = dlsym(h, "il2cpp_image_get_name");
-        if (!il2cpp_class_from_name) il2cpp_class_from_name = dlsym(h, "il2cpp_class_from_name");
-        if (!il2cpp_class_get_method_from_name) il2cpp_class_get_method_from_name = dlsym(h, "il2cpp_class_get_method_from_name");
-        if (!il2cpp_runtime_invoke) il2cpp_runtime_invoke = dlsym(h, "il2cpp_runtime_invoke");
+    // 2. Global scope
+    TryProbeHandle(RTLD_DEFAULT, "RTLD_DEFAULT");
+    TryProbeHandle(dlopen(NULL, RTLD_LAZY), "dlopen(NULL)");
+    
+    // 3. Scan all loaded dyld images
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        
+        void *h = dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
+        if (!h) h = dlopen(name, RTLD_LAZY);
+        if (h) {
+            const char *base = strrchr(name, '/');
+            TryProbeHandle(h, base ? base + 1 : name);
+        }
+        if (g_il2cpp_resolve_icall && il2cpp_domain_get && il2cpp_runtime_invoke) break;
     }
 }
 
@@ -348,8 +375,9 @@ static void ProbeIL2CPPSymbols(void) {
     if (self.statsHudEnabled && self.statsHudLabel && self.statsHud) {
         self.statsHud.hidden = NO;
         NSString *physStatus = (g_set3DGravityInjected || set_3d_gravity_method) ? @"3D PhysX" : (il2cpp_resolved ? @"Hooked" : @"Resolving...");
-        self.statsHudLabel.text = [NSString stringWithFormat:@"FPS: %.0f\nSpd: %.2gx  Grv: %.2gx\nMod: %@\nGrip: %@ Ghost: %@",
+        self.statsHudLabel.text = [NSString stringWithFormat:@"FPS: %.0f\nSpd: %.2gx  Grv: %.2gx\nSrc: %@\nMod: %@\nGrip: %@ Ghost: %@",
                                    self.currentFPS, self.speedFactor, self.gravityFactor,
+                                   resolvedSource,
                                    physStatus,
                                    self.superGripEnabled ? @"ON" : @"OFF",
                                    self.ghostModeEnabled ? @"ON" : @"OFF"];
@@ -548,7 +576,7 @@ static void ProbeIL2CPPSymbols(void) {
     self.hostWindow = host;
     
     if (!self.statsHud) {
-        UIView *hud = [[UIView alloc] initWithFrame:CGRectMake(12, 44, 160, 78)];
+        UIView *hud = [[UIView alloc] initWithFrame:CGRectMake(12, 44, 160, 88)];
         hud.tag = EMBER_GOI_HUD_TAG;
         hud.backgroundColor = [UIColor colorWithWhite:0 alpha:0.65];
         hud.layer.cornerRadius = 8;
@@ -557,7 +585,7 @@ static void ProbeIL2CPPSymbols(void) {
         hud.userInteractionEnabled = NO;
         hud.hidden = YES;
         
-        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, 144, 70)];
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, 144, 80)];
         label.numberOfLines = 0;
         label.textColor = [UIColor whiteColor];
         label.font = [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightMedium];
@@ -596,6 +624,7 @@ static void ProbeIL2CPPSymbols(void) {
     NSDictionary *status = @{
         @"state": @"active",
         @"il2cppResolved": @(il2cpp_resolved),
+        @"resolvedSource": resolvedSource ?: @"None",
         @"classesResolved": classesResolved ?: @{},
         @"speed": @(self.speedFactor),
         @"gravity": @(self.gravityFactor),
