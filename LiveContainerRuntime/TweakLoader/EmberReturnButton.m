@@ -2,19 +2,14 @@
 //  EmberReturnButton.m
 //  Ember Connect
 //
-//  A floating "back to Ember Connect" control, injected into every guest app.
+//  The in-game Ember Connect overlay: a floating flame button that opens a
+//  menu of things you can do without leaving the app you are in.
 //
 //  A guest app replaces the container's UI inside the same process, so there
-//  is no navigation stack to pop and nothing on screen that belongs to Ember
-//  Connect. Getting back meant force-quitting from the app switcher and
-//  launching again by hand. The switch itself was always possible — opening
-//  `<scheme>://livecontainer-launch?bundle-name=ui` sets the next launch
-//  target to the UI and restarts — but nothing inside a running game could
-//  ask for it. This is that missing trigger.
-//
-//  The return is not free: `launchToGuestApp` SIGKILLs the process after
-//  handing the URL to iOS, so the guest never gets `applicationWillTerminate`
-//  and cannot flush unsaved state. That is why a tap asks first.
+//  is no navigation stack to pop and nothing on screen belongs to Ember
+//  Connect. This button is the only surface we own while a game is running,
+//  which makes it the natural home for anything that needs to reach into a
+//  live guest.
 //
 //  ## Why this is a subview and not its own window
 //
@@ -28,34 +23,94 @@
 //  orientation the game had not asked for, and the game ended up drawn into a
 //  portrait-shaped box in the corner of a landscape screen.
 //
-//  Hanging the button off the app's existing window removes the whole class
+//  Hanging everything off the app's existing window removes that whole class
 //  of problem — there is no second root view controller for iOS to ask, and
-//  the button rotates with the app for free.
+//  the overlay rotates with the app for free.
 //
 
 @import UIKit;
+@import QuartzCore;
+@import Metal;
 @import ObjectiveC;
+#include <stdatomic.h>
 #import "../LiveContainer/LCSharedUtils.h"
 #import "../LiveContainer/utils.h"
 
-/// Set to hide the button entirely, for someone who would rather force-quit.
+/// Set to hide the overlay entirely, for someone who would rather force-quit.
 static NSString * const kEmberHideReturnButtonKey = @"EmberHideReturnButton";
 /// Remembered position, so the button stays where it was dragged.
 static NSString * const kEmberReturnButtonYKey = @"EmberReturnButtonY";
 static NSString * const kEmberReturnButtonLeftKey = @"EmberReturnButtonOnLeft";
+static NSString * const kEmberShowFPSKey = @"EmberShowFPS";
+static NSString * const kEmberKeepAwakeKey = @"EmberKeepAwake";
 
 static const CGFloat kButtonSize = 46.0;
 static const CGFloat kEdgeInset = 6.0;
-/// Faded once the user stops interacting, so it does not sit on top of a game
-/// at full strength forever.
 static const CGFloat kIdleAlpha = 0.35;
 static const CGFloat kActiveAlpha = 1.0;
 static const NSTimeInterval kIdleDelay = 3.0;
 
+#pragma mark - Frame counter
+
+/// Counts frames the guest actually presents.
+///
+/// A `CADisplayLink` would only report the display's refresh rate, which stays
+/// at 60 whether or not the game is keeping up — useless as a performance
+/// readout. Hooking the two calls that put a rendered frame on screen counts
+/// what the game really achieves: `nextDrawable` for Metal (which is what
+/// Unity and most modern engines use) and `presentRenderbuffer:` for the
+/// older GLES path.
+static _Atomic(uint64_t) EmberPresentedFrames = 0;
+static BOOL EmberFrameHooksInstalled = NO;
+
+@interface CAMetalLayer (EmberFPS)
+@end
+@implementation CAMetalLayer (EmberFPS)
+- (id<CAMetalDrawable>)ember_nextDrawable {
+    atomic_fetch_add(&EmberPresentedFrames, 1);
+    return [self ember_nextDrawable];
+}
+@end
+
+static void EmberInstallFrameHooks(void) {
+    if (EmberFrameHooksInstalled) return;
+    EmberFrameHooksInstalled = YES;
+
+    Class metal = NSClassFromString(@"CAMetalLayer");
+    if (metal) {
+        Method original = class_getInstanceMethod(metal, @selector(nextDrawable));
+        Method replacement = class_getInstanceMethod(metal, @selector(ember_nextDrawable));
+        if (original && replacement) method_exchangeImplementations(original, replacement);
+    }
+
+    // GLES games present through -[EAGLContext presentRenderbuffer:]. OpenGL
+    // ES is deprecated and the class may be absent entirely, so it is looked
+    // up at runtime rather than linked against.
+    Class eagl = NSClassFromString(@"EAGLContext");
+    SEL present = NSSelectorFromString(@"presentRenderbuffer:");
+    if (eagl && [eagl instancesRespondToSelector:present]) {
+        Method original = class_getInstanceMethod(eagl, present);
+        if (original) {
+            __block IMP originalIMP = NULL;
+            IMP counting = imp_implementationWithBlock(^BOOL(id target, NSUInteger buffer) {
+                atomic_fetch_add(&EmberPresentedFrames, 1);
+                return ((BOOL (*)(id, SEL, NSUInteger))originalIMP)(target, present, buffer);
+            });
+            originalIMP = method_setImplementation(original, counting);
+        }
+    }
+}
+
+#pragma mark - Controller
+
 @interface EmberReturnButtonController : NSObject
 @property (nonatomic, weak) UIButton *button;
+@property (nonatomic, weak) UILabel *fpsLabel;
 @property (nonatomic, weak) UIWindow *host;
 @property (nonatomic, strong) NSTimer *idleTimer;
+@property (nonatomic, strong) NSTimer *fpsTimer;
+@property (nonatomic, assign) uint64_t lastFrameCount;
+@property (nonatomic, assign) NSTimeInterval lastFrameSampleAt;
 @end
 
 @implementation EmberReturnButtonController
@@ -67,15 +122,13 @@ static const NSTimeInterval kIdleDelay = 3.0;
     return shared;
 }
 
-/// The app's own front-most window. Deliberately picks the app's, never one
-/// of ours, and skips windows with no root view controller — a game engine
-/// often keeps a spare around.
+/// The app's own front-most window. Deliberately picks the app's, and skips
+/// windows with no root view controller — a game engine often keeps a spare.
 - (UIWindow *)hostWindow {
     UIWindow *best = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
-        UIWindowScene *windowScene = (UIWindowScene *)scene;
-        for (UIWindow *window in windowScene.windows) {
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
             if (window.hidden || !window.rootViewController) continue;
             if (!best || window.windowLevel >= best.windowLevel) best = window;
         }
@@ -87,16 +140,16 @@ static const NSTimeInterval kIdleDelay = 3.0;
     UIWindow *host = [self hostWindow];
     if (!host) return;
 
-    UIButton *button = self.button;
-    if (button && button.superview == host) {
-        // Already in place; just make sure the game has not covered it.
-        [host bringSubviewToFront:button];
+    if (self.button && self.button.superview == host) {
+        [host bringSubviewToFront:self.button];
+        if (self.fpsLabel) [host bringSubviewToFront:self.fpsLabel];
         [self clampIntoBounds];
         return;
     }
-    [button removeFromSuperview];
+    [self.button removeFromSuperview];
+    [self.fpsLabel removeFromSuperview];
 
-    button = [UIButton buttonWithType:UIButtonTypeCustom];
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
     button.frame = CGRectMake(0, 0, kButtonSize, kButtonSize);
     button.backgroundColor = [UIColor colorWithRed:0.98 green:0.42 blue:0.13 alpha:1.0];
     button.layer.cornerRadius = kButtonSize / 2.0;
@@ -105,9 +158,7 @@ static const NSTimeInterval kIdleDelay = 3.0;
     button.layer.shadowRadius = 6.0;
     button.layer.shadowOffset = CGSizeMake(0, 2);
     button.tintColor = UIColor.whiteColor;
-    button.accessibilityLabel = @"Return to Ember Connect";
-    // Pinned to the top-left corner: the button is positioned by frame, and a
-    // resizing mask would fight that every time the app rotates.
+    button.accessibilityLabel = @"Ember Connect";
     button.autoresizingMask = UIViewAutoresizingNone;
 
     UIImage *glyph = nil;
@@ -128,13 +179,27 @@ static const NSTimeInterval kIdleDelay = 3.0;
     [button addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self
                                                                         action:@selector(panned:)]];
 
+    UILabel *fps = [[UILabel alloc] initWithFrame:CGRectZero];
+    fps.font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightBold];
+    fps.textColor = UIColor.whiteColor;
+    fps.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+    fps.textAlignment = NSTextAlignmentCenter;
+    fps.layer.cornerRadius = 5;
+    fps.clipsToBounds = YES;
+    fps.hidden = YES;
+    fps.userInteractionEnabled = NO;
+
     [host addSubview:button];
+    [host addSubview:fps];
     [host bringSubviewToFront:button];
     self.button = button;
+    self.fpsLabel = fps;
     self.host = host;
 
     [self restorePosition];
     [self markActive];
+    [self applyKeepAwake];
+    if ([NSUserDefaults.lcUserDefaults boolForKey:kEmberShowFPSKey]) [self startFPS];
 }
 
 #pragma mark - Position
@@ -142,6 +207,14 @@ static const NSTimeInterval kIdleDelay = 3.0;
 - (CGRect)hostBounds {
     UIWindow *host = self.host ?: [self hostWindow];
     return host ? host.bounds : UIScreen.mainScreen.bounds;
+}
+
+- (void)layoutFPSLabel {
+    CGRect button = self.button.frame;
+    CGFloat width = 52, height = 18;
+    self.fpsLabel.frame = CGRectMake(CGRectGetMidX(button) - width / 2,
+                                     CGRectGetMinY(button) - height - 4,
+                                     width, height);
 }
 
 - (void)restorePosition {
@@ -154,9 +227,10 @@ static const NSTimeInterval kIdleDelay = 3.0;
     y = MAX(kEdgeInset, MIN(y, CGRectGetHeight(bounds) - kButtonSize - kEdgeInset));
     CGFloat x = onLeft ? kEdgeInset : CGRectGetWidth(bounds) - kButtonSize - kEdgeInset;
     self.button.frame = CGRectMake(x, y, kButtonSize, kButtonSize);
+    [self layoutFPSLabel];
 }
 
-/// Keeps the button on screen after the app rotates, since the window's
+/// Keeps the overlay on screen after the app rotates, since the window's
 /// bounds swap underneath it.
 - (void)clampIntoBounds {
     if (!self.button) return;
@@ -168,6 +242,7 @@ static const NSTimeInterval kIdleDelay = 3.0;
     frame.origin.y = MAX(kEdgeInset, MIN(frame.origin.y, maxY));
     frame.origin.x = onLeft ? kEdgeInset : CGRectGetWidth(bounds) - kButtonSize - kEdgeInset;
     self.button.frame = frame;
+    [self layoutFPSLabel];
 }
 
 - (void)panned:(UIPanGestureRecognizer *)pan {
@@ -181,12 +256,11 @@ static const NSTimeInterval kIdleDelay = 3.0;
     frame.origin.y += translation.y;
     [pan setTranslation:CGPointZero inView:host];
     self.button.frame = frame;
+    [self layoutFPSLabel];
     [self markActive];
 
     if (pan.state == UIGestureRecognizerStateEnded ||
         pan.state == UIGestureRecognizerStateCancelled) {
-        // Snap to whichever edge is nearer, so it never floats mid-screen over
-        // something the user is trying to tap.
         BOOL onLeft = CGRectGetMidX(frame) < CGRectGetMidX(bounds);
         CGFloat y = MAX(kEdgeInset,
                         MIN(frame.origin.y, CGRectGetHeight(bounds) - kButtonSize - kEdgeInset));
@@ -194,6 +268,7 @@ static const NSTimeInterval kIdleDelay = 3.0;
 
         [UIView animateWithDuration:0.2 animations:^{
             self.button.frame = CGRectMake(x, y, kButtonSize, kButtonSize);
+            [self layoutFPSLabel];
         }];
 
         NSUserDefaults *defaults = NSUserDefaults.lcUserDefaults;
@@ -217,46 +292,247 @@ static const NSTimeInterval kIdleDelay = 3.0;
     }];
 }
 
-#pragma mark - Action
+#pragma mark - Features
+
+- (void)applyKeepAwake {
+    BOOL keepAwake = [NSUserDefaults.lcUserDefaults boolForKey:kEmberKeepAwakeKey];
+    UIApplication.sharedApplication.idleTimerDisabled = keepAwake;
+}
+
+- (void)startFPS {
+    EmberInstallFrameHooks();
+    self.fpsLabel.hidden = NO;
+    self.lastFrameCount = atomic_load(&EmberPresentedFrames);
+    self.lastFrameSampleAt = CACurrentMediaTime();
+    [self.fpsTimer invalidate];
+    __weak typeof(self) weakSelf = self;
+    self.fpsTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                    repeats:YES
+                                                      block:^(NSTimer *timer) {
+        [weakSelf sampleFPS];
+    }];
+}
+
+- (void)stopFPS {
+    [self.fpsTimer invalidate];
+    self.fpsTimer = nil;
+    self.fpsLabel.hidden = YES;
+}
+
+- (void)sampleFPS {
+    uint64_t now = atomic_load(&EmberPresentedFrames);
+    NSTimeInterval at = CACurrentMediaTime();
+    NSTimeInterval elapsed = at - self.lastFrameSampleAt;
+    if (elapsed <= 0) return;
+
+    double fps = (double)(now - self.lastFrameCount) / elapsed;
+    self.lastFrameCount = now;
+    self.lastFrameSampleAt = at;
+
+    // A game that presents through neither hooked path leaves the counter at
+    // zero forever; say so rather than insisting it is running at 0 fps.
+    self.fpsLabel.text = (now == 0) ? @"— fps"
+                                    : [NSString stringWithFormat:@"%.0f fps", fps];
+}
+
+#pragma mark - Guest app catalogue
+
+/// Guest apps installed in this container, as (folder name, display name).
+///
+/// Apps live in one of two roots depending on whether they were kept private
+/// or converted to shared, so both are scanned. The folder name is what the
+/// launcher wants — it is the same "relative bundle path" the app list writes
+/// into `selected`.
+- (NSArray<NSArray<NSString *> *> *)installedGuestApps {
+    NSMutableArray *apps = [NSMutableArray new];
+    NSMutableSet *seen = [NSMutableSet new];
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    NSMutableArray<NSString *> *roots = [NSMutableArray new];
+    NSString *group = [NSUserDefaults lcAppGroupPath];
+    if (group) {
+        [roots addObject:[group stringByAppendingPathComponent:@"LiveContainer/Applications"]];
+    }
+    const char *home = getenv("LC_HOME_PATH");
+    if (home) {
+        [roots addObject:[[NSString stringWithUTF8String:home]
+                          stringByAppendingPathComponent:@"Documents/Applications"]];
+    }
+
+    NSString *current = NSBundle.mainBundle.bundlePath.lastPathComponent;
+
+    for (NSString *root in roots) {
+        for (NSString *folder in [fm contentsOfDirectoryAtPath:root error:nil]) {
+            if ([folder isEqualToString:current] || [seen containsObject:folder]) continue;
+            NSString *path = [root stringByAppendingPathComponent:folder];
+            NSString *infoPath = [path stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+            if (!info) continue;
+
+            NSString *name = info[@"CFBundleDisplayName"] ?: info[@"CFBundleName"] ?: folder;
+            [seen addObject:folder];
+            [apps addObject:@[folder, name]];
+        }
+    }
+
+    [apps sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+        return [a[1] localizedCaseInsensitiveCompare:b[1]];
+    }];
+    return apps;
+}
+
+- (void)launchBundleFolder:(NSString *)folder {
+    NSString *scheme = NSUserDefaults.lcAppUrlScheme;
+    if (!scheme) return;
+    NSString *encoded = [folder stringByAddingPercentEncodingWithAllowedCharacters:
+                         NSCharacterSet.URLQueryAllowedCharacterSet] ?: folder;
+    NSURL *url = [NSURL URLWithString:
+                  [NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=%@",
+                   scheme, encoded]];
+    [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithURL:url];
+}
+
+#pragma mark - Menu
+
+- (UIViewController *)presenter {
+    UIViewController *presenter = self.button.window.rootViewController;
+    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+    return presenter;
+}
+
+- (void)present:(UIAlertController *)sheet {
+    // An action sheet needs an anchor on iPad or it throws.
+    sheet.popoverPresentationController.sourceView = self.button;
+    sheet.popoverPresentationController.sourceRect = self.button.bounds;
+    [[self presenter] presentViewController:sheet animated:YES completion:nil];
+}
 
 - (void)tapped {
     [self markActive];
+    if (![self presenter]) return;
 
+    NSUserDefaults *defaults = NSUserDefaults.lcUserDefaults;
+    BOOL keepAwake = [defaults boolForKey:kEmberKeepAwakeKey];
+    BOOL showFPS = [defaults boolForKey:kEmberShowFPSKey];
+
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Ember Connect"
+                                            message:nil
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    __weak typeof(self) weakSelf = self;
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Switch App…"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf showAppSwitcher];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:(keepAwake ? @"Allow Screen to Sleep"
+                                                              : @"Keep Screen Awake")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [defaults setBool:!keepAwake forKey:kEmberKeepAwakeKey];
+        [weakSelf applyKeepAwake];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:(showFPS ? @"Hide FPS" : @"Show FPS")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [defaults setBool:!showFPS forKey:kEmberShowFPSKey];
+        if (showFPS) { [weakSelf stopFPS]; } else { [weakSelf startFPS]; }
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Hide This Button"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf confirmHide];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Return to Ember Connect"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf confirmReturn];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [self present:sheet];
+}
+
+- (void)showAppSwitcher {
+    NSArray<NSArray<NSString *> *> *apps = [self installedGuestApps];
+
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Switch App"
+                                            message:(apps.count ? @"The current app will close."
+                                                                : @"No other apps are installed.")
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    __weak typeof(self) weakSelf = self;
+    for (NSArray<NSString *> *app in apps) {
+        NSString *folder = app[0];
+        [sheet addAction:[UIAlertAction actionWithTitle:app[1]
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+            [weakSelf launchBundleFolder:folder];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [self present:sheet];
+}
+
+- (void)confirmReturn {
     NSString *scheme = NSUserDefaults.lcAppUrlScheme;
     if (!scheme) return;
     NSURL *url = [NSURL URLWithString:
                   [NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=ui", scheme]];
 
-    UIViewController *presenter = self.button.window.rootViewController;
-    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
-    if (!presenter) {
-        [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithURL:url];
-        return;
-    }
-
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Return to Ember Connect"
                          message:@"This app will close. Anything it has not saved will be lost."
                   preferredStyle:UIAlertControllerStyleAlert];
-
     [alert addAction:[UIAlertAction actionWithTitle:@"Return"
                                               style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *action) {
+                                            handler:^(UIAlertAction *a) {
         [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithURL:url];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Stay"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
+    [[self presenter] presentViewController:alert animated:YES completion:nil];
+}
 
-    [presenter presentViewController:alert animated:YES completion:nil];
+- (void)confirmHide {
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Hide the Ember Connect button?"
+                         message:@"It stays hidden in every app until you turn it back on in "
+                                  "Ember Connect's settings."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Hide"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a) {
+        [NSUserDefaults.lcUserDefaults setBool:YES forKey:kEmberHideReturnButtonKey];
+        [self.button removeFromSuperview];
+        [self.fpsLabel removeFromSuperview];
+        [self stopFPS];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Keep"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [[self presenter] presentViewController:alert animated:YES completion:nil];
 }
 
 @end
 
 #pragma mark - Installation
 
-static void EmberInstallReturnButton(void) {
+static void EmberInstallOverlay(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if ([NSUserDefaults.lcUserDefaults boolForKey:kEmberHideReturnButtonKey]) return;
         [[EmberReturnButtonController shared] install];
     });
 }
@@ -271,21 +547,16 @@ static void EmberReturnButtonInit(void) {
     if (NSUserDefaults.isLiveProcess) return;
     if ([NSUserDefaults.lcUserDefaults boolForKey:kEmberHideReturnButtonKey]) return;
 
-    // The guest has no windows yet at constructor time. Wait for it to come
-    // up, then re-assert on every activation: a guest that creates its own
-    // window later would otherwise cover the button.
     for (NSNotificationName name in @[UIApplicationDidBecomeActiveNotification,
                                       UISceneDidActivateNotification]) {
         [NSNotificationCenter.defaultCenter addObserverForName:name
                                                         object:nil
                                                          queue:NSOperationQueue.mainQueue
                                                     usingBlock:^(NSNotification *note) {
-            EmberInstallReturnButton();
+            EmberInstallOverlay();
         }];
     }
 
-    // Rotation swaps the host window's bounds underneath the button, which
-    // would otherwise leave it pinned to a coordinate that is now off screen.
     [NSNotificationCenter.defaultCenter
         addObserverForName:UIApplicationDidChangeStatusBarOrientationNotification
                     object:nil
