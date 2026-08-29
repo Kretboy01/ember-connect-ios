@@ -34,6 +34,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
 
 #define EMBER_GOI_BUTTON_TAG 0xFB003
 #define EMBER_GOI_HUD_TAG    0xFB004
@@ -204,19 +205,54 @@ static void EmberProbeIL2CPPSymbols(void) {
     // included for the analyser's sake.
     if (self_handle) dlclose(self_handle);
 
+    // First pass: probe every already-loaded dyld image.
+    //
+    // The bundle-path scan the previous version used returned nothing at
+    // all in a LiveContainer guest — see the diag log. Iterating the real
+    // image list finds Unity wherever it landed, and does not need us to
+    // know the guest's on-disk layout.
+    uint32_t imageCount = _dyld_image_count();
+    static uint32_t s_lastLogged = 0;
+    BOOL logImages = (imageCount != s_lastLogged);
+    s_lastLogged = imageCount;
+    if (logImages) EmberLog(@"dyld images: %u", imageCount);
+    for (uint32_t i = 0; i < imageCount; i++) {
+        const char *cname = _dyld_get_image_name(i);
+        if (!cname) continue;
+        NSString *name = [NSString stringWithUTF8String:cname];
+        // Only re-open images whose names hint at the runtime we care about;
+        // dlsym-scanning every image on every retry would be pointlessly
+        // expensive.
+        NSString *lower = name.lowercaseString;
+        if (![lower containsString:@"unity"]      &&
+            ![lower containsString:@"il2cpp"]      &&
+            ![lower containsString:@"mono"]        &&
+            ![lower containsString:@"gameassembly"] &&
+            ![lower containsString:@"getting over"] &&
+            ![lower containsString:@"foddy"]) {
+            continue;
+        }
+        void *handle = dlopen(cname, RTLD_LAZY | RTLD_NOLOAD);
+        if (logImages) EmberLog(@"probe %@ -> handle=%p", name.lastPathComponent, handle);
+        EmberProbeHandle(handle, [NSString stringWithFormat:@"dyld: %@", name.lastPathComponent]);
+    }
+
+    // Second pass: framework directory scan, as a fallback in case the
+    // engine dylib has an unusual name we did not filter for.
     for (NSString *path in EmberFrameworkCandidates()) {
-        // RTLD_NOLOAD first: query without pulling the framework in, so we do
-        // not affect the game's own loader sequence.
         void *handle = dlopen(path.UTF8String, RTLD_LAZY | RTLD_NOLOAD);
         BOOL wasLoaded = handle != NULL;
         if (!handle) handle = dlopen(path.UTF8String, RTLD_LAZY);
-        EmberLog(@"framework %@: loaded=%d handle=%p", path.lastPathComponent, wasLoaded, handle);
+        if (logImages) EmberLog(@"framework %@: loaded=%d handle=%p",
+                                path.lastPathComponent, wasLoaded, handle);
         EmberProbeHandle(handle, [NSString stringWithFormat:@"framework: %@", path.lastPathComponent]);
     }
-    EmberLog(@"symbols: il2cpp_resolve_icall=%p domain_get=%p thread_attach=%p"
-              " mono_root=%p mono_domain=%p unitySend=%p",
-             g_il2cpp_resolve_icall, g_il2cpp_domain_get, g_il2cpp_thread_attach,
-             g_mono_get_root_domain, g_mono_domain_get, g_unity_send_message);
+    if (logImages) {
+        EmberLog(@"symbols: il2cpp_resolve_icall=%p domain_get=%p thread_attach=%p"
+                  " mono_root=%p mono_domain=%p unitySend=%p",
+                 g_il2cpp_resolve_icall, g_il2cpp_domain_get, g_il2cpp_thread_attach,
+                 g_mono_get_root_domain, g_mono_domain_get, g_unity_send_message);
+    }
 }
 
 static void EmberResolveMethods(void) {
@@ -808,9 +844,11 @@ __attribute__((constructor))
 static void EmberGettingOverItInit(void) {
     // Written before the runloop even exists, so its presence proves the
     // dylib got injected — the first thing to check when "nothing works".
-    EmberLog(@"constructor ran; bundle=%@ exec=%s",
+    EmberLog(@"constructor ran; bundle=%@ exec=%s bundlePath=%@ frameworksPath=%@",
              NSBundle.mainBundle.bundleIdentifier,
-             getprogname());
+             getprogname(),
+             NSBundle.mainBundle.bundlePath,
+             NSBundle.mainBundle.privateFrameworksPath);
     dispatch_async(dispatch_get_main_queue(), ^{
         EmberGettingOverItController *controller = [EmberGettingOverItController sharedController];
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
