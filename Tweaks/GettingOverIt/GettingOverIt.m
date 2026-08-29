@@ -216,6 +216,23 @@ static void EmberProbeIL2CPPSymbols(void) {
     BOOL logImages = (imageCount != s_lastLogged);
     s_lastLogged = imageCount;
     if (logImages) EmberLog(@"dyld images: %u", imageCount);
+    // On the very first attempt, dump every non-system image name so we can
+    // see what engine actually shipped with the game -- this is the sanity
+    // check for "is it Unity at all?". System paths are filtered out because
+    // they add nothing to the diagnosis and would flood the log.
+    static BOOL s_dumpedAll = NO;
+    if (!s_dumpedAll) {
+        s_dumpedAll = YES;
+        for (uint32_t i = 0; i < imageCount; i++) {
+            const char *cname = _dyld_get_image_name(i);
+            if (!cname) continue;
+            if (strncmp(cname, "/usr/lib/", 9) == 0 ||
+                strncmp(cname, "/System/", 8) == 0 ||
+                strstr(cname, "/PrivateFrameworks/") ||
+                strstr(cname, "UIKitCore")) continue;
+            EmberLog(@"non-system image: %s", cname);
+        }
+    }
     for (uint32_t i = 0; i < imageCount; i++) {
         const char *cname = _dyld_get_image_name(i);
         if (!cname) continue;
