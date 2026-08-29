@@ -36,6 +36,17 @@
 #import "../LiveContainer/LCSharedUtils.h"
 #import "../LiveContainer/utils.h"
 
+/// LiveContainer's own app-switch entry point, from UIKit+GuestHooks.m.
+///
+/// Worth going through rather than calling `launchToGuestAppWithURL:`
+/// directly: it clears `LCOpenSideStore` first, and `LCBootstrap` checks that
+/// flag on relaunch and opens SideStore instead of the container UI when it is
+/// set. Reimplementing the sequence and missing that step is exactly how the
+/// first version of this menu managed to kill the guest without ever arriving
+/// anywhere. It also honours the user's existing "switch without asking"
+/// preference and shows the same confirmation every other switch shows.
+extern void LCShowSwitchAppConfirmation(NSURL *url, NSString *bundleId, bool isSharedApp);
+
 /// Set to hide the overlay entirely, for someone who would rather force-quit.
 static NSString * const kEmberHideReturnButtonKey = @"EmberHideReturnButton";
 /// Remembered position, so the button stays where it was dragged.
@@ -381,15 +392,26 @@ static void EmberInstallFrameHooks(void) {
     return apps;
 }
 
-- (void)launchBundleFolder:(NSString *)folder {
+/// Builds the switch URL LiveContainer understands. `bundle-name=ui` is the
+/// sentinel for the container's own interface.
+- (NSURL *)switchURLForBundleName:(NSString *)bundleName {
     NSString *scheme = NSUserDefaults.lcAppUrlScheme;
-    if (!scheme) return;
-    NSString *encoded = [folder stringByAddingPercentEncodingWithAllowedCharacters:
-                         NSCharacterSet.URLQueryAllowedCharacterSet] ?: folder;
-    NSURL *url = [NSURL URLWithString:
-                  [NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=%@",
-                   scheme, encoded]];
-    [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithURL:url];
+    if (!scheme) return nil;
+    NSString *encoded = [bundleName stringByAddingPercentEncodingWithAllowedCharacters:
+                         NSCharacterSet.URLQueryAllowedCharacterSet] ?: bundleName;
+    return [NSURL URLWithString:
+            [NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=%@",
+             scheme, encoded]];
+}
+
+- (void)switchToBundleName:(NSString *)bundleName displayName:(NSString *)displayName {
+    NSURL *url = [self switchURLForBundleName:bundleName];
+    if (!url) return;
+    // Deferred a turn: this runs from a UIAlertAction handler while the menu
+    // is still dismissing, and the confirmation puts up its own window.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        LCShowSwitchAppConfirmation(url, displayName, false);
+    });
 }
 
 #pragma mark - Menu
@@ -466,17 +488,18 @@ static void EmberInstallFrameHooks(void) {
 
     UIAlertController *sheet =
         [UIAlertController alertControllerWithTitle:@"Switch App"
-                                            message:(apps.count ? @"The current app will close."
+                                            message:(apps.count ? nil
                                                                 : @"No other apps are installed.")
                                      preferredStyle:UIAlertControllerStyleActionSheet];
 
     __weak typeof(self) weakSelf = self;
     for (NSArray<NSString *> *app in apps) {
         NSString *folder = app[0];
-        [sheet addAction:[UIAlertAction actionWithTitle:app[1]
+        NSString *displayName = app[1];
+        [sheet addAction:[UIAlertAction actionWithTitle:displayName
                                                   style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction *a) {
-            [weakSelf launchBundleFolder:folder];
+            [weakSelf switchToBundleName:folder displayName:displayName];
         }]];
     }
     [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
@@ -486,24 +509,7 @@ static void EmberInstallFrameHooks(void) {
 }
 
 - (void)confirmReturn {
-    NSString *scheme = NSUserDefaults.lcAppUrlScheme;
-    if (!scheme) return;
-    NSURL *url = [NSURL URLWithString:
-                  [NSString stringWithFormat:@"%@://livecontainer-launch?bundle-name=ui", scheme]];
-
-    UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"Return to Ember Connect"
-                         message:@"This app will close. Anything it has not saved will be lost."
-                  preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Return"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-        [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithURL:url];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Stay"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
-    [[self presenter] presentViewController:alert animated:YES completion:nil];
+    [self switchToBundleName:@"ui" displayName:@"Ember Connect"];
 }
 
 - (void)confirmHide {
