@@ -52,6 +52,11 @@
 
 @interface UIMutableApplicationSceneSettings : UIApplicationSceneSettings
 @property (assign,nonatomic) UIDeviceOrientation deviceOrientation;
+// Inherited from FBSSceneSettings. Needed because forcing an orientation on a
+// scene does not reshape it — see the orientation lock hook in
+// UIKit+GuestHooks.m. Every use is guarded by -respondsToSelector:, since this
+// is private and its availability is not promised.
+@property (assign,nonatomic) CGRect frame;
 - (void)setInterfaceOrientation:(UIInterfaceOrientation)o;
 @end
 

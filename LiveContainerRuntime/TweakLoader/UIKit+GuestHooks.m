@@ -713,6 +713,22 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
 }
 @end
 
+/// The device orientation that corresponds to an interface orientation.
+///
+/// The two are mirrored, not equal: holding the phone rotated left
+/// (`UIDeviceOrientationLandscapeLeft`) presents a `LandscapeRight`
+/// interface. Games that read `UIDevice.current.orientation` directly - and
+/// plenty do, to place a virtual stick - get the wrong side if this is left
+/// inconsistent with the interface orientation.
+static UIDeviceOrientation LCDeviceOrientationFor(UIInterfaceOrientation interface) {
+    switch (interface) {
+        case UIInterfaceOrientationLandscapeRight:     return UIDeviceOrientationLandscapeLeft;
+        case UIInterfaceOrientationLandscapeLeft:      return UIDeviceOrientationLandscapeRight;
+        case UIInterfaceOrientationPortraitUpsideDown: return UIDeviceOrientationPortraitUpsideDown;
+        default:                                       return UIDeviceOrientationPortrait;
+    }
+}
+
 @implementation FBSSceneParameters(LiveContainerHook)
 - (instancetype)hook_initWithXPCDictionary:(NSDictionary*)dict {
 
@@ -721,6 +737,37 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
     UIMutableApplicationSceneClientSettings* clientSettings = [ans.clientSettings mutableCopy];
     [settings setInterfaceOrientation:LCOrientationLock];
     [clientSettings setInterfaceOrientation:LCOrientationLock];
+
+    // Reshape the scene to match the orientation being forced on it.
+    //
+    // Setting `interfaceOrientation` alone tells the guest it is landscape
+    // while handing it a portrait-shaped frame, because the scene is built
+    // from whatever orientation the container happened to be in and nothing
+    // rotates it afterwards. The guest then lays a landscape game out inside
+    // a tall, narrow box: stretched or squashed content, a viewport the wrong
+    // size, and touch coordinates that no longer line up with what is drawn.
+    // iOS does this reshaping itself during a real rotation; forcing the
+    // orientation at scene-creation time skips that, so it has to be done
+    // here.
+    if ([settings respondsToSelector:@selector(frame)] &&
+        [settings respondsToSelector:@selector(setFrame:)]) {
+        CGRect frame = settings.frame;
+        BOOL wantsLandscape = UIInterfaceOrientationIsLandscape(LCOrientationLock);
+        BOOL isLandscape = frame.size.width > frame.size.height;
+        if (wantsLandscape != isLandscape) {
+            settings.frame = CGRectMake(frame.origin.x, frame.origin.y,
+                                        frame.size.height, frame.size.width);
+        }
+    }
+
+    UIDeviceOrientation device = LCDeviceOrientationFor(LCOrientationLock);
+    if ([settings respondsToSelector:@selector(setDeviceOrientation:)]) {
+        settings.deviceOrientation = device;
+    }
+    if ([clientSettings respondsToSelector:@selector(setDeviceOrientation:)]) {
+        clientSettings.deviceOrientation = device;
+    }
+
     ans.settings = settings;
     ans.clientSettings = clientSettings;
     return ans;
@@ -732,12 +779,13 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
 @implementation UIViewController(LiveContainerHook)
 
 - (UIInterfaceOrientationMask)hook___supportedInterfaceOrientations {
-    if(LCOrientationLock == UIInterfaceOrientationLandscapeRight) {
+    // The mask covers both landscape orientations deliberately, so a game can
+    // still be flipped end-for-end while staying locked out of portrait.
+    if(UIInterfaceOrientationIsLandscape(LCOrientationLock)) {
         return UIInterfaceOrientationMaskLandscape;
     } else {
         return UIInterfaceOrientationMaskPortrait;
     }
-
 }
 
 - (BOOL)hook_shouldAutorotateToInterfaceOrientation:(NSInteger)orientation {
