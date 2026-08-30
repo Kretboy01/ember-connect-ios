@@ -74,6 +74,23 @@ jobs:
           file BuiltTweaks/FlappyPractice.dylib
           xcrun otool -L BuiltTweaks/FlappyPractice.dylib
 
+          # EightBPOfflineLines — native 8 Ball Pool aim-range extension, offline guarded
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -fblocks \
+            -dynamiclib \
+            Tweaks/EightBPOfflineLines/EightBPOfflineLines.m \
+            -framework Foundation \
+            -framework UIKit \
+            -framework QuartzCore \
+            -install_name @rpath/EightBPOfflineLines.dylib \
+            -o BuiltTweaks/EightBPOfflineLines.dylib
+
+          file BuiltTweaks/EightBPOfflineLines.dylib
+          xcrun otool -L BuiltTweaks/EightBPOfflineLines.dylib
+
           # GettingOverIt — Unity/IL2CPP mod for Getting Over It with Bennett Foddy
           xcrun --sdk iphoneos clang \
             -arch arm64 \
@@ -114,6 +131,7 @@ jobs:
           cp -R "$BROADCAST" "$APP/PlugIns/"
           mkdir -p "$APP/EmberTweaks"
           cp BuiltTweaks/FlappyPractice.dylib "$APP/EmberTweaks/"
+          cp BuiltTweaks/EightBPOfflineLines.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/GettingOverIt.dylib "$APP/EmberTweaks/"
 
       - name: Verify container, branding, and App ID usage
@@ -134,6 +152,7 @@ jobs:
           test -f "$APP/Frameworks/LiveContainerSwiftUI.framework/LiveContainerSwiftUI"
           test -f "$APP/Frameworks/ZSign.dylib"
           test -f "$APP/EmberTweaks/FlappyPractice.dylib"
+          test -f "$APP/EmberTweaks/EightBPOfflineLines.dylib"
           test -f "$APP/EmberTweaks/GettingOverIt.dylib"
 
           echo "Verified Ember Connect host with one ReplayKit extension."
@@ -153,4 +172,5 @@ jobs:
           path: |
             EmberConnectMobile.ipa
             BuiltTweaks/FlappyPractice.dylib
+            BuiltTweaks/EightBPOfflineLines.dylib
             BuiltTweaks/GettingOverIt.dylib

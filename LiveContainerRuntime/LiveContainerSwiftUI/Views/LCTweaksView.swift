@@ -54,6 +54,16 @@ struct LCTweakFolderView : View {
 
     private static let bundledPresets: [BundledTweakPreset] = [
         BundledTweakPreset(
+            id: "eightbp-offline-lines",
+            name: "8BP Offline Lines",
+            dylibName: "EightBPOfflineLines.dylib",
+            folderName: "8BP Offline Lines",
+            targetBundleIdentifiers: ["com.miniclip.8ballpoolmult"],
+            targetNameKeywords: ["8 ball pool", "8ballpool"],
+            icon: "scope",
+            description: "Native extended aiming lines for offline/practice games. Strict network-state guard keeps it inactive online."
+        ),
+        BundledTweakPreset(
             id: "flappy",
             name: "Flappy Practice",
             dylibName: "FlappyPractice.dylib",
