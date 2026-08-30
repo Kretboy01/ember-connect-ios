@@ -11,12 +11,8 @@
 // the path it already loads. It does nothing, which is the point: the mod menu
 // is gone and the load command is satisfied.
 //
-// It is also the hook. Anything you want injected for offline testing goes in
-// the constructor below and arrives before the game's own main runs.
+// The game imports zero symbols from this library, so the replacement needs
+// no initializer, hooks, logging, or external dependencies. Keep one inert
+// exported function only so the compiler emits a normal loadable dylib.
 
-#include <stdio.h>
-
-__attribute__((constructor))
-static void ember_stub_init(void) {
-    fprintf(stderr, "[Ember] 80pool stub loaded; mod menu is not present\n");
-}
+void ember_80pool_compatibility_stub(void) {}
