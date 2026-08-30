@@ -209,6 +209,9 @@ static NSArray<NSString *> *EmberFrameworkCandidates(void) {
 // symbols by name. dlsym only returns *exported* symbols; IL2CPP in a
 // stripped Unity build is `private_extern` and dlsym passes it over, but
 // LC_SYMTAB still lists it. Adding this recovers those addresses.
+static uint32_t g_symtabCount = 0;
+static uint32_t g_symtabWithName = 0;
+
 static void *EmberFindHiddenSymbol(const char *name) {
     if (!name) return NULL;
     // Main executable is index 0 in dyld's image list.
@@ -247,9 +250,12 @@ static void *EmberFindHiddenSymbol(const char *name) {
     char underscored[256];
     snprintf(underscored, sizeof underscored, "_%s", name);
 
+    g_symtabCount = symtab->nsyms;
+    g_symtabWithName = 0;
     for (uint32_t i = 0; i < symtab->nsyms; i++) {
         uint32_t strx = symbols[i].n_un.n_strx;
         if (strx == 0) continue;
+        g_symtabWithName++;
         const char *sym_name = strings + strx;
         if (strcmp(sym_name, name) == 0 || strcmp(sym_name, underscored) == 0) {
             uint64_t value = symbols[i].n_value;
@@ -397,10 +403,12 @@ static void EmberProbeIL2CPPSymbols(void) {
     }
     if (logImages) {
         EmberLog(@"symbols: il2cpp_resolve_icall=%p domain_get=%p thread_attach=%p"
-                  " mono_root=%p mono_domain=%p unitySend=%p unityPause=%p targetFPS=%p",
+                  " mono_root=%p mono_domain=%p unitySend=%p unityPause=%p targetFPS=%p"
+                  " | symtab: nsyms=%u named=%u",
                  g_il2cpp_resolve_icall, g_il2cpp_domain_get, g_il2cpp_thread_attach,
                  g_mono_get_root_domain, g_mono_domain_get, g_unity_send_message,
-                 g_unity_pause, g_unity_set_target_fps);
+                 g_unity_pause, g_unity_set_target_fps,
+                 g_symtabCount, g_symtabWithName);
     }
 }
 
@@ -622,6 +630,29 @@ static void EmberEnsureThreadAttached(void) {
 - (void)pushAllSettingsNow {
     [self applyTimeScale];
     [self applyGravity];
+}
+
+/// Simulates the OS resign-active call to the Unity app delegate. Unity
+/// iOS pauses its engine on resign, so this is a real pause even without
+/// the IL2CPP `Time::set_timeScale` icall.
+- (void)unityPause {
+    UIApplication *app = UIApplication.sharedApplication;
+    id<UIApplicationDelegate> delegate = app.delegate;
+    if (g_unity_pause) {
+        g_unity_pause(1);
+    } else if ([delegate respondsToSelector:@selector(applicationWillResignActive:)]) {
+        [delegate applicationWillResignActive:app];
+    }
+}
+
+- (void)unityResume {
+    UIApplication *app = UIApplication.sharedApplication;
+    id<UIApplicationDelegate> delegate = app.delegate;
+    if (g_unity_pause) {
+        g_unity_pause(0);
+    } else if ([delegate respondsToSelector:@selector(applicationDidBecomeActive:)]) {
+        [delegate applicationDidBecomeActive:app];
+    }
 }
 
 /// Reloads scene 0. Best-effort — Unity may reject a bare integer overload
@@ -892,6 +923,12 @@ static void EmberEnsureThreadAttached(void) {
     [menu addAction:[UIAlertAction actionWithTitle:@"Practice Profiles  ▶" style:UIAlertActionStyleDefault
                                            handler:^(UIAlertAction *a) { [weakSelf showProfilesMenu]; }]];
 
+    [menu addAction:[UIAlertAction actionWithTitle:@"Pause Game (Unity Resign-Active)"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { [weakSelf unityPause]; }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Resume Game"
+                                             style:UIAlertActionStyleDefault
+                                           handler:^(UIAlertAction *a) { [weakSelf unityResume]; }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Restart / Reload Scene" style:UIAlertActionStyleDefault
                                            handler:^(UIAlertAction *a) { [weakSelf reloadActiveScene]; }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Force Re-Resolve Unity" style:UIAlertActionStyleDefault
