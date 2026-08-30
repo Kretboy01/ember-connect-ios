@@ -89,14 +89,16 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                     try? fm.createDirectory(at: folderUrl, withIntermediateDirectories: true)
                     let destUrl = folderUrl.appendingPathComponent("\(tweakFile).dylib")
 
-                    // Replace when the bundled dylib is newer than what is on
-                    // disk. The previous check skipped whenever any file was
-                    // present, which meant every rebuild's bug-fixes were
-                    // ignored until the user deleted the tweak folder by hand.
-                    let bundledMTime  = (try? source.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                    let existingMTime = (try? destUrl.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                    // Replace when contents differ. mtime comparison was
+                    // unreliable — zip extraction shuffles timestamps enough
+                    // that a genuinely newer dylib inside the bundle can end
+                    // up looking older than the file already on disk. Comparing
+                    // the raw bytes is cheap for a 150 KB dylib and definitive.
+                    let bundledData  = (try? Data(contentsOf: source))
+                    let existingData = (try? Data(contentsOf: destUrl))
                     let shouldReplace = !fm.fileExists(atPath: destUrl.path)
-                        || (bundledMTime != nil && existingMTime != nil && bundledMTime! > existingMTime!)
+                        || bundledData == nil
+                        || bundledData != existingData
                     if shouldReplace {
                         try? fm.removeItem(at: destUrl)
                         try? fm.copyItem(at: source, to: destUrl)

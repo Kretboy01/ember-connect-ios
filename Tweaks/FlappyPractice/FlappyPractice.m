@@ -44,6 +44,7 @@ static CGFloat gEmberSpeedFactor    = 1.0;
 static CGFloat gEmberGravityFactor  = 1.0;
 static CGFloat gEmberFlapFactor     = 1.0;
 static _Thread_local BOOL gEmberBypassScaling = NO;
+static NSInteger gEmberScoreMultiplier = 1;
 
 static void (*OriginalApplyImpulse)(SKPhysicsBody *, SEL, CGVector) = NULL;
 static void (*OriginalApplyImpulseAtPoint)(SKPhysicsBody *, SEL, CGVector, CGPoint) = NULL;
@@ -102,6 +103,48 @@ static void EmberInstallPhysicsHook(void) {
         if (m2) {
             OriginalApplyImpulseAtPoint = (void *)method_getImplementation(m2);
             method_setImplementation(m2, (IMP)HookedApplyImpulseAtPoint);
+        }
+    });
+}
+
+// MARK: - Score multiplier hook
+//
+// The previous approach walked the scene tree every tick and rewrote label
+// text, then flagged the label so we would not touch it again. That fought
+// the game's own updates: game writes "5", we multiply to "50" and flag it,
+// game writes "6" on the next frame, we skip, so the score stays "6" forever.
+//
+// Hooking -[SKLabelNode setText:] intercepts the write itself. All-digit text
+// with a positive integer value gets multiplied on the way through; anything
+// with non-digits ("0:15", "GAME OVER") passes untouched.
+
+static void (*OriginalSetText)(SKLabelNode *, SEL, NSString *) = NULL;
+
+static void HookedSetText(SKLabelNode *self, SEL selector, NSString *text) {
+    if (gEmberScoreMultiplier > 1 && text.length > 0 && text.length < 12) {
+        BOOL onlyDigits = YES;
+        for (NSUInteger i = 0; i < text.length; i++) {
+            unichar c = [text characterAtIndex:i];
+            if (c < '0' || c > '9') { onlyDigits = NO; break; }
+        }
+        if (onlyDigits) {
+            NSInteger val = [text integerValue];
+            if (val > 0) {
+                text = [NSString stringWithFormat:@"%lld",
+                        (long long)val * (long long)gEmberScoreMultiplier];
+            }
+        }
+    }
+    if (OriginalSetText) OriginalSetText(self, selector, text);
+}
+
+static void EmberInstallLabelHook(void) {
+    static dispatch_once_t hookToken;
+    dispatch_once(&hookToken, ^{
+        Method m = class_getInstanceMethod(SKLabelNode.class, @selector(setText:));
+        if (m) {
+            OriginalSetText = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)HookedSetText);
         }
     });
 }
@@ -197,6 +240,7 @@ static void EmberWritePracticeStatus(NSString *state) {
         gEmberSpeedFactor = controller.speedFactor;
         gEmberGravityFactor = controller.gravityFactor;
         gEmberFlapFactor = controller.flapFactor;
+        gEmberScoreMultiplier = controller.scoreMultiplier;
         
         controller.displayLink = [CADisplayLink displayLinkWithTarget:controller selector:@selector(tick:)];
         [controller.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
@@ -421,14 +465,7 @@ static void EmberWritePracticeStatus(NSString *state) {
         } else if (!self.hitboxVisualizerEnabled && node.physicsBody) {
             [[node childNodeWithName:@"EmberHitbox"] removeFromParent];
         }
-        if (self.scoreMultiplier > 1 && [node isKindOfClass:SKLabelNode.class]) {
-            SKLabelNode *label = (SKLabelNode *)node;
-            NSInteger val = [label.text integerValue];
-            if (val > 0 && ![label.name containsString:@"EmberScore"]) {
-                label.name = @"EmberScoreMod";
-                label.text = [NSString stringWithFormat:@"%ld", (long)(val * self.scoreMultiplier)];
-            }
-        }
+        // Score multiplier is handled by the setText: hook now.
     }];
     
     if (self.autoPilotEnabled && birdNode && birdNode.physicsBody) {
@@ -626,6 +663,7 @@ static void EmberWritePracticeStatus(NSString *state) {
     self.ghostModeEnabled = NO;
     self.autoPilotEnabled = NO;
     self.scoreMultiplier = 1;
+    gEmberScoreMultiplier = 1;
     self.nightModeEnabled = NO;
     self.birdTrailEnabled = NO;
     self.pipeTintEnabled = NO;
@@ -709,6 +747,7 @@ static void EmberWritePracticeStatus(NSString *state) {
         else if (weakSelf.scoreMultiplier == 2) weakSelf.scoreMultiplier = 5;
         else if (weakSelf.scoreMultiplier == 5) weakSelf.scoreMultiplier = 10;
         else weakSelf.scoreMultiplier = 1;
+        gEmberScoreMultiplier = weakSelf.scoreMultiplier;
         [weakSelf saveSettings]; [weakSelf updateButtonTitle];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Back" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) { [weakSelf tapped]; }]];
@@ -883,6 +922,7 @@ static void EmberWritePracticeStatus(NSString *state) {
 __attribute__((constructor))
 static void EmberFlappyPracticeInit(void) {
     EmberInstallPhysicsHook();
+    EmberInstallLabelHook();
     dispatch_async(dispatch_get_main_queue(), ^{
         EmberWritePracticeStatus(@"constructor-ran");
         EmberFlappyPracticeController *controller = [EmberFlappyPracticeController sharedController];
