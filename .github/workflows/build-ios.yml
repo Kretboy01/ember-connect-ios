@@ -85,6 +85,7 @@ jobs:
             -framework Foundation \
             -framework UIKit \
             -framework QuartzCore \
+            -framework CoreGraphics \
             -install_name @rpath/EightBPOfflineLines.dylib \
             -o BuiltTweaks/EightBPOfflineLines.dylib
 
