@@ -642,7 +642,14 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                     continue
                 }
 
-                await startInstallApp(ipaURL)
+                // AutoInstall drops IPAs that Ember Desktop may have modified
+                // in-place (mod cleanup, tweak fixups). LiveContainer's default
+                // resign-if-needed check only inspects the main executable's
+                // signature — if that stayed valid but any dylib got edited,
+                // iOS crashes on Invalid Page when it maps the stale hash.
+                // Force a full ZSign pass so every Mach-O in the bundle gets
+                // recomputed page hashes.
+                await startInstallApp(ipaURL, forceSign: true)
                 if fileManager.fileExists(atPath: ipaURL.path) {
                     try? fileManager.removeItem(at: ipaURL)
                 }
@@ -769,10 +776,10 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
 
 
     
-    func startInstallApp(_ fileUrl:URL) async {
+    func startInstallApp(_ fileUrl:URL, forceSign: Bool = false) async {
         do {
             self.installprogressVisible = true
-            try await installIpaFile(fileUrl)
+            try await installIpaFile(fileUrl, forceSign: forceSign)
             try? FileManager.default.removeItem(at: fileUrl)
         } catch {
             errorInfo = error.localizedDescription
@@ -786,7 +793,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
         extract(path, destination, progress)
     }
     
-    func installIpaFile(_ url:URL) async throws {
+    func installIpaFile(_ url:URL, forceSign: Bool = false) async throws {
         let fm = FileManager()
         
         let installProgress = Progress.discreteProgress(totalUnitCount: 100)
@@ -906,7 +913,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 c.resume()
             }, progressHandler: { signProgress in
                 installProgress.addChild(signProgress!, withPendingUnitCount: 20)
-            }, forceSign: false)
+            }, forceSign: forceSign)
         })
         
         // we leave it unsigned even if signing failed
