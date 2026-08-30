@@ -232,6 +232,34 @@ static void EmberProbeIL2CPPSymbols(void) {
                 strstr(cname, "UIKitCore")) continue;
             EmberLog(@"non-system image: %s", cname);
         }
+
+        // Enumerate Objective-C classes defined by the game and its bundled
+        // libraries. Filters out anything defined by system images (identified
+        // by the class's `class_getImageName`, which points at the dylib the
+        // class lives in). What is left is the game's own hooking surface —
+        // real classes and methods we can swizzle, in a game that has no
+        // Unity runtime for us to reach into.
+        unsigned int classCount = 0;
+        Class *classes = objc_copyClassList(&classCount);
+        int shown = 0;
+        for (unsigned int i = 0; i < classCount && shown < 200; i++) {
+            Class cls = classes[i];
+            const char *img = class_getImageName(cls);
+            if (!img) continue;
+            if (strncmp(img, "/usr/lib/", 9) == 0 ||
+                strncmp(img, "/System/", 8) == 0 ||
+                strstr(img, "/PrivateFrameworks/") ||
+                strstr(img, "LiveContainer") ||
+                strstr(img, "CydiaSubstrate")) continue;
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(cls, &methodCount);
+            if (methods) free(methods);
+            EmberLog(@"class: %s (methods=%u img=%s)",
+                     class_getName(cls), methodCount, strrchr(img, '/') ?: img);
+            shown++;
+        }
+        if (classes) free(classes);
+        EmberLog(@"class dump complete (shown=%d of %u)", shown, classCount);
     }
     for (uint32_t i = 0; i < imageCount; i++) {
         const char *cname = _dyld_get_image_name(i);
