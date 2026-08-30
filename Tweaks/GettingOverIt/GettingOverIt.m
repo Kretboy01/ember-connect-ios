@@ -35,6 +35,8 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 
 #define EMBER_GOI_BUTTON_TAG 0xFB003
 #define EMBER_GOI_HUD_TAG    0xFB004
@@ -79,6 +81,14 @@ static void *(*g_mono_domain_get)(void)                          = NULL;
 static void *(*g_mono_thread_attach)(void *)                     = NULL;
 
 static UnitySendMessageFunc      g_unity_send_message         = NULL;
+
+// Unity C API — often exported from Unity iOS builds even when the
+// IL2CPP internals are stripped/hidden. These give us pause/resume
+// and, indirectly, the ability to drive game objects.
+typedef void (*UnityPauseFunc)(int);
+typedef void (*UnitySetTargetFPSFunc)(int);
+static UnityPauseFunc        g_unity_pause          = NULL;
+static UnitySetTargetFPSFunc g_unity_set_target_fps = NULL;
 static SetTimeScaleFunc          g_set_time_scale             = NULL;
 static GetTimeScaleFunc          g_get_time_scale             = NULL;
 static SetFixedDeltaTimeFunc     g_set_fixed_delta_time       = NULL;
@@ -165,6 +175,8 @@ static void EmberProbeHandle(void *handle, NSString *label) {
     TRY(g_il2cpp_runtime_invoke,              "il2cpp_runtime_invoke");
     TRY(g_il2cpp_string_new,                  "il2cpp_string_new");
     TRY(g_unity_send_message,                 "UnitySendMessage");
+    TRY(g_unity_pause,                        "UnityPause");
+    TRY(g_unity_set_target_fps,               "UnitySetTargetFPS");
 
     TRY(g_mono_get_root_domain,               "mono_get_root_domain");
     TRY(g_mono_domain_get,                    "mono_domain_get");
@@ -192,7 +204,98 @@ static NSArray<NSString *> *EmberFrameworkCandidates(void) {
     return out;
 }
 
+
+// Walks the main executable's Mach-O symbol table looking for hidden
+// symbols by name. dlsym only returns *exported* symbols; IL2CPP in a
+// stripped Unity build is `private_extern` and dlsym passes it over, but
+// LC_SYMTAB still lists it. Adding this recovers those addresses.
+static void *EmberFindHiddenSymbol(const char *name) {
+    if (!name) return NULL;
+    // Main executable is index 0 in dyld's image list.
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (!header) return NULL;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+
+    const uint8_t *cmd_ptr = (const uint8_t *)(header + 1);
+    const struct symtab_command *symtab = NULL;
+    const struct segment_command_64 *linkedit = NULL;
+    const struct segment_command_64 *text = NULL;
+
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cmd_ptr;
+        if (lc->cmd == LC_SYMTAB) {
+            symtab = (const struct symtab_command *)lc;
+        } else if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg =
+                (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit = seg;
+            else if (strcmp(seg->segname, "__TEXT") == 0) text = seg;
+        }
+        cmd_ptr += lc->cmdsize;
+    }
+    if (!symtab || !linkedit || !text) return NULL;
+
+    // The symbol table and string table live inside __LINKEDIT. Their file
+    // offsets are absolute; converting to a runtime address needs the
+    // difference between __LINKEDIT's vmaddr and fileoff, plus the slide.
+    uintptr_t base = (uintptr_t)linkedit->vmaddr - (uintptr_t)linkedit->fileoff + slide;
+    const struct nlist_64 *symbols = (const struct nlist_64 *)(base + symtab->symoff);
+    const char *strings = (const char *)(base + symtab->stroff);
+
+    // Some Unity toolchains prepend an underscore on iOS.
+    char underscored[256];
+    snprintf(underscored, sizeof underscored, "_%s", name);
+
+    for (uint32_t i = 0; i < symtab->nsyms; i++) {
+        uint32_t strx = symbols[i].n_un.n_strx;
+        if (strx == 0) continue;
+        const char *sym_name = strings + strx;
+        if (strcmp(sym_name, name) == 0 || strcmp(sym_name, underscored) == 0) {
+            uint64_t value = symbols[i].n_value;
+            if (value == 0) continue;
+            return (void *)((uintptr_t)value + slide);
+        }
+    }
+    return NULL;
+}
+
+// Fills in the same globals `EmberProbeHandle` fills, but from the symbol
+// table walk. Lets IL2CPP work even in Unity builds with stripped exports.
+static void EmberFillFromSymbolTable(void) {
+#define TRY_SYM(var, name) do { \
+    if (!var) { \
+        void *sym = EmberFindHiddenSymbol(name); \
+        if (sym) { \
+            var = sym; \
+            if ([g_resolvedSource isEqualToString:@"none"]) g_resolvedSource = @"symtab"; \
+        } \
+    } \
+} while (0)
+
+    TRY_SYM(g_il2cpp_resolve_icall,              "il2cpp_resolve_icall");
+    TRY_SYM(g_il2cpp_domain_get,                 "il2cpp_domain_get");
+    TRY_SYM(g_il2cpp_thread_attach,              "il2cpp_thread_attach");
+    TRY_SYM(g_il2cpp_domain_get_assemblies,      "il2cpp_domain_get_assemblies");
+    TRY_SYM(g_il2cpp_assembly_get_image,         "il2cpp_assembly_get_image");
+    TRY_SYM(g_il2cpp_class_from_name,            "il2cpp_class_from_name");
+    TRY_SYM(g_il2cpp_class_get_method_from_name, "il2cpp_class_get_method_from_name");
+    TRY_SYM(g_il2cpp_runtime_invoke,             "il2cpp_runtime_invoke");
+    TRY_SYM(g_il2cpp_string_new,                 "il2cpp_string_new");
+
+    TRY_SYM(g_unity_send_message,                "UnitySendMessage");
+    TRY_SYM(g_unity_pause,                       "UnityPause");
+    TRY_SYM(g_unity_set_target_fps,              "UnitySetTargetFPS");
+
+#undef TRY_SYM
+}
+
 static void EmberProbeIL2CPPSymbols(void) {
+    // The symtab walk finds hidden Unity/IL2CPP exports first — cheapest and
+    // works even when the game strips its dynamic export table. Everything
+    // below stays as a fallback and covers Unity/Mono builds that do export.
+    EmberFillFromSymbolTable();
+
     // Any of these may contain the symbols. Try each even after some are
     // found, so a mixed-load process gets its pointers filled in.
     EmberProbeHandle(RTLD_DEFAULT,           @"RTLD_DEFAULT");
@@ -294,9 +397,10 @@ static void EmberProbeIL2CPPSymbols(void) {
     }
     if (logImages) {
         EmberLog(@"symbols: il2cpp_resolve_icall=%p domain_get=%p thread_attach=%p"
-                  " mono_root=%p mono_domain=%p unitySend=%p",
+                  " mono_root=%p mono_domain=%p unitySend=%p unityPause=%p targetFPS=%p",
                  g_il2cpp_resolve_icall, g_il2cpp_domain_get, g_il2cpp_thread_attach,
-                 g_mono_get_root_domain, g_mono_domain_get, g_unity_send_message);
+                 g_mono_get_root_domain, g_mono_domain_get, g_unity_send_message,
+                 g_unity_pause, g_unity_set_target_fps);
     }
 }
 
