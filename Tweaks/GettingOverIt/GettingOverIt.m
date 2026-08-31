@@ -111,9 +111,23 @@ static void EmberGoiLog(NSString *fmt, ...) {
 @end
 
 @implementation EmberGoiPassthroughView
+@end
+
+/// The pass-through has to happen HERE. UIView.hitTest falls back to
+/// returning the view itself when no subview is hit, and UIWindow inherits
+/// that fallback — so a plain window swallows every touch and the game never
+/// sees input. Returning nil from the window's hitTest hands the touch to
+/// the next window down (the game's).
+@interface EmberGoiOverlayWindow : UIWindow
+@end
+
+@implementation EmberGoiOverlayWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *result = [super hitTest:point withEvent:event];
-    return result == self ? nil : result;
+    if (result == nil || result == self) {
+        return nil;
+    }
+    return result;
 }
 @end
 
@@ -318,7 +332,7 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 - (void)ensureOverlay {
     CGRect frame = [UIScreen.mainScreen bounds];
     if (!self.overlayWindow) {
-        self.overlayWindow = [[UIWindow alloc] initWithFrame:frame];
+        self.overlayWindow = [[EmberGoiOverlayWindow alloc] initWithFrame:frame];
         self.overlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
         self.overlayWindow.backgroundColor = UIColor.clearColor;
         UIViewController *root = [[UIViewController alloc] init];
@@ -340,10 +354,13 @@ static void EmberGoiApplyGravity(CGFloat factor) {
             }
         }
     }
-    // Track rotation / resolution changes every tick.
+    // Track rotation / resolution changes every tick — the root view must
+    // follow the window or the panel/button end up sized for the wrong
+    // orientation.
     self.overlayWindow.frame = frame;
     self.overlayWindow.hidden = NO;
     self.overlayRoot = self.overlayWindow.rootViewController;
+    self.overlayRoot.view.frame = CGRectMake(0, 0, CGRectGetWidth(frame), CGRectGetHeight(frame));
 }
 
 - (void)clampButton {
