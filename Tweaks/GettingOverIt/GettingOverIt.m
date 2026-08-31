@@ -118,16 +118,43 @@ static void EmberGoiLog(NSString *fmt, ...) {
 /// that fallback — so a plain window swallows every touch and the game never
 /// sees input. Returning nil from the window's hitTest hands the touch to
 /// the next window down (the game's).
+///
+/// The window must also refuse to become key: Unity derives its orientation
+/// from the key window's root view controller, and a key overlay defaulted
+/// to portrait rotates the whole game sideways.
 @interface EmberGoiOverlayWindow : UIWindow
 @end
 
 @implementation EmberGoiOverlayWindow
+- (BOOL)canBecomeKeyWindow {
+    return NO;
+}
+
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *result = [super hitTest:point withEvent:event];
     if (result == nil || result == self) {
         return nil;
     }
     return result;
+}
+@end
+
+/// Declares the game's own orientation so the overlay can never shrink the
+/// app's supported-orientation mask even if UIKit consults it.
+@interface EmberGoiOverlayRootViewController : UIViewController
+@end
+
+@implementation EmberGoiOverlayRootViewController
+- (BOOL)shouldAutorotate {
+    return YES;
+}
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    return UIInterfaceOrientationMaskLandscape;
+}
+
+- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
+    return UIInterfaceOrientationLandscapeRight;
 }
 @end
 
@@ -335,7 +362,7 @@ static void EmberGoiApplyGravity(CGFloat factor) {
         self.overlayWindow = [[EmberGoiOverlayWindow alloc] initWithFrame:frame];
         self.overlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
         self.overlayWindow.backgroundColor = UIColor.clearColor;
-        UIViewController *root = [[UIViewController alloc] init];
+        UIViewController *root = [[EmberGoiOverlayRootViewController alloc] init];
         root.view = [[EmberGoiPassthroughView alloc] initWithFrame:frame];
         root.view.backgroundColor = UIColor.clearColor;
         self.overlayWindow.rootViewController = root;
