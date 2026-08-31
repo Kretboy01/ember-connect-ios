@@ -64,6 +64,7 @@ static const Il2CppMethod *g_send_console_command_method = NULL;
 static BOOL g_send_console_command_is_static = NO;
 static Il2CppClass *g_dev_console_class = NULL;
 static const void *g_find_object_of_type_icall = NULL;
+static const void *g_find_object_inactive_icall = NULL;
 static const void *g_set_time_scale_icall = NULL;
 
 static BOOL g_resolved = NO;
@@ -235,8 +236,13 @@ static void EmberSnResolveRuntime(void) {
     if (g_il2cpp_resolve_icall) {
         g_find_object_of_type_icall =
             g_il2cpp_resolve_icall("UnityEngine.Object::FindObjectOfType(System.Type)");
+        g_find_object_inactive_icall =
+            g_il2cpp_resolve_icall("UnityEngine.Object::FindObjectOfType(System.Type,System.Boolean)");
         g_set_time_scale_icall =
             g_il2cpp_resolve_icall("UnityEngine.Time::set_timeScale(Single)");
+        EmberSnLog(@"icalls: find=%p findInactive=%p timeScale=%p",
+                   g_find_object_of_type_icall, g_find_object_inactive_icall,
+                   g_set_time_scale_icall);
     }
 
     g_resolved = YES;
@@ -259,15 +265,28 @@ static BOOL EmberSnSendCommand(NSString *command) {
 
     void *instance = NULL;
     if (!g_send_console_command_is_static) {
-        // Instance method: locate the live console component first.
-        if (!g_find_object_of_type_icall || !g_il2cpp_class_get_type || !g_il2cpp_type_get_object ||
-            !g_dev_console_class) {
+        // Instance method: locate the live console component, including
+        // inactive objects (the console UI is often disabled until opened).
+        if ((!g_find_object_inactive_icall && !g_find_object_of_type_icall) ||
+            !g_il2cpp_class_get_type || !g_il2cpp_type_get_object || !g_dev_console_class) {
+            EmberSnLog(@"instance path unavailable (icalls/type missing)");
             return NO;
         }
         void *type = g_il2cpp_type_get_object(g_il2cpp_class_get_type(g_dev_console_class));
-        if (!type) return NO;
-        typedef void *(*FindObjectFunc)(void *);
-        instance = ((FindObjectFunc)g_find_object_of_type_icall)(type);
+        if (!type) {
+            EmberSnLog(@"System.Type object creation failed");
+            return NO;
+        }
+        typedef void *(*Find1)(void *);
+        typedef void *(*Find2)(void *, signed char);
+        if (g_find_object_inactive_icall) {
+            instance = ((Find2)g_find_object_inactive_icall)(type, 1);
+            EmberSnLog(@"FindObjectOfType(includeInactive) -> %p", instance);
+        }
+        if (!instance && g_find_object_of_type_icall) {
+            instance = ((Find1)g_find_object_of_type_icall)(type);
+            EmberSnLog(@"FindObjectOfType -> %p", instance);
+        }
         if (!instance) {
             EmberSnLog(@"no DevConsole instance in the scene yet");
             return NO;
@@ -423,9 +442,10 @@ static BOOL EmberSnSendCommand(NSString *command) {
     [menu addAction:[UIAlertAction actionWithTitle:@"Game Speed…"
                                              style:UIAlertActionStyleDefault
                                            handler:^(UIAlertAction *a) { [weakSelf showTimeScaleMenu]; }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Back"
+    // Plain dismiss — re-presenting here created an endless menu loop.
+    [menu addAction:[UIAlertAction actionWithTitle:@"Close"
                                              style:UIAlertActionStyleCancel
-                                           handler:^(UIAlertAction *a) { [weakSelf tapped]; }]];
+                                           handler:nil]];
     menu.popoverPresentationController.sourceView = self.button;
     menu.popoverPresentationController.sourceRect = self.button.bounds;
     [presenter presentViewController:menu animated:YES completion:nil];
@@ -440,6 +460,12 @@ static BOOL EmberSnSendCommand(NSString *command) {
     __weak typeof(self) weakSelf = self;
     void (^sendClose)(NSString *) = ^(NSString *command) {
         [weakSelf dispatchCommand:command];
+    };
+    // Re-present after the current alert finishes dismissing; presenting
+    // during dismissal fails silently in UIKit.
+    void (^backToMain)() = ^() {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [weakSelf showMainMenu]; });
     };
 
     [menu addAction:[UIAlertAction actionWithTitle:@"Toggle No Damage"
@@ -468,7 +494,7 @@ static BOOL EmberSnSendCommand(NSString *command) {
                                            handler:^(UIAlertAction *a) { sendClose(@"unlockall"); }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Back"
                                              style:UIAlertActionStyleCancel
-                                           handler:^(UIAlertAction *a) { [weakSelf showMainMenu]; }]];
+                                           handler:^(UIAlertAction *a) { backToMain(); }]];
     menu.popoverPresentationController.sourceView = self.button;
     menu.popoverPresentationController.sourceRect = self.button.bounds;
     [presenter presentViewController:menu animated:YES completion:nil];
@@ -504,7 +530,10 @@ static BOOL EmberSnSendCommand(NSString *command) {
                                            handler:^(UIAlertAction *a) { apply(3.0f); }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Back"
                                              style:UIAlertActionStyleCancel
-                                           handler:^(UIAlertAction *a) { [weakSelf showMainMenu]; }]];
+                                           handler:^(UIAlertAction *a) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [weakSelf showMainMenu]; });
+    }]];
     menu.popoverPresentationController.sourceView = self.button;
     menu.popoverPresentationController.sourceRect = self.button.bounds;
     [presenter presentViewController:menu animated:YES completion:nil];
