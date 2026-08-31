@@ -149,20 +149,6 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     EmberGoiLog(@"gravity factor -> %.2f (y=%.2f)", clamped, gravity.y);
 }
 
-static void toast_goi(NSString *message) {
-    UIViewController *presenter = [[EmberGoiController sharedController] topViewController];
-    if (!presenter) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *top = [[EmberGoiController sharedController] topViewController];
-        if (!top) return;
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Ember Connect"
-                                                                       message:message
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [top presentViewController:alert animated:YES completion:nil];
-    });
-}
-
 #pragma mark - Controller
 
 @implementation EmberGoiController
@@ -206,7 +192,7 @@ static void toast_goi(NSString *message) {
     double speed = [defaults doubleForKey:@"EmberGOI.speedFactor"];
     double gravity = [defaults doubleForKey:@"EmberGOI.gravityFactor"];
     if (speed > 0.04 && speed <= 4.0) self.speedFactor = speed;
-    if (gravity >= -3.0 && gravity <= 3.0 && defaults.objectForKey:@"EmberGOI.gravityFactor") {
+    if (gravity >= -3.0 && gravity <= 3.0 && [defaults objectForKey:@"EmberGOI.gravityFactor"]) {
         self.gravityFactor = gravity;
     }
 }
