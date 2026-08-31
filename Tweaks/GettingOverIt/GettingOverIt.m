@@ -76,12 +76,15 @@ static void EmberGoiLog(NSString *fmt, ...) {
     }
 }
 
+@class EmberGoiMenuPanel;
+
 @interface EmberGoiController : NSObject
 @property (nonatomic, assign) CGFloat speedFactor;       // Time.timeScale
 @property (nonatomic, assign) CGFloat gravityFactor;     // Physics2D.gravity scale
 @property (nonatomic, strong) UIButton *button;
 @property (nonatomic, strong) UIWindow *overlayWindow;   // our own always-on-top window
 @property (nonatomic, strong) UIViewController *overlayRoot;
+@property (nonatomic, strong) EmberGoiMenuPanel *panel;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 @property (nonatomic, assign) BOOL appliedOnce;
 + (instancetype)sharedController;
@@ -103,6 +106,115 @@ static void EmberGoiLog(NSString *fmt, ...) {
     UIView *result = [super hitTest:point withEvent:event];
     return result == self ? nil : result;
 }
+@end
+
+#pragma mark - Custom menu panel
+
+@interface EmberGoiMenuPanel : UIView
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *subtitleLabel;
+@property (nonatomic, strong) UIStackView *rows;
+@property (nonatomic, assign) NSUInteger rowCount;
+@property (nonatomic, copy) void (^onClose)(void);
+@end
+
+@implementation EmberGoiMenuPanel
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.96];
+        self.layer.cornerRadius = 14;
+        self.layer.borderWidth = 1;
+        self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
+        self.layer.shadowColor = UIColor.blackColor.CGColor;
+        self.layer.shadowOpacity = 0.5;
+        self.layer.shadowRadius = 10;
+
+        self.titleLabel = [UILabel new];
+        self.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
+        self.titleLabel.textColor = UIColor.whiteColor;
+        self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:self.titleLabel];
+
+        self.subtitleLabel = [UILabel new];
+        self.subtitleLabel.font = [UIFont systemFontOfSize:11];
+        self.subtitleLabel.textColor = [UIColor colorWithWhite:1 alpha:0.55];
+        self.subtitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:self.subtitleLabel];
+
+        UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+        close.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
+        [close setTitle:@"✕" forState:UIControlStateNormal];
+        close.tintColor = [UIColor colorWithWhite:1 alpha:0.8];
+        close.translatesAutoresizingMaskIntoConstraints = NO;
+        [close addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:close];
+
+        self.rows = [[UIStackView alloc] init];
+        self.rows.axis = UILayoutConstraintAxisVertical;
+        self.rows.spacing = 6;
+        self.rows.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:self.rows];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [self.titleLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+            [self.titleLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+            [self.subtitleLabel.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:2],
+            [self.subtitleLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+            [close.topAnchor constraintEqualToAnchor:self.topAnchor constant:10],
+            [close.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-10],
+            [close.widthAnchor constraintEqualToConstant:24],
+            [self.rows.topAnchor constraintEqualToAnchor:self.subtitleLabel.bottomAnchor constant:10],
+            [self.rows.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
+            [self.rows.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
+            [self.rows.bottomAnchor constraintLessThanOrEqualToAnchor:self.bottomAnchor constant:-12],
+        ]];
+    }
+    return self;
+}
+
+- (void)closeTapped {
+    if (self.onClose) self.onClose();
+}
+
+- (void)setHeader:(NSString *)title subtitle:(NSString *)subtitle {
+    self.titleLabel.text = title;
+    self.subtitleLabel.text = subtitle;
+}
+
+- (void)addOption:(NSString *)title handler:(void (^)(void))handler {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold];
+    [button setTitle:title forState:UIControlStateNormal];
+    button.tintColor = [UIColor colorWithRed:0.55 green:0.9 blue:1 alpha:1];
+    button.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+    button.layer.cornerRadius = 8;
+    button.contentEdgeInsets = UIEdgeInsetsMake(8, 10, 8, 10);
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    [button.heightAnchor constraintEqualToConstant:36].active = YES;
+    if (handler) {
+        [button addTarget:self action:@selector(optionTapped:) forControlEvents:UIControlEventTouchUpInside];
+        objc_setAssociatedObject(button, "handler", handler, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+    [self.rows addArrangedSubview:button];
+    self.rowCount += 1;
+}
+
+- (void)optionTapped:(UIButton *)sender {
+    void (^handler)(void) = objc_getAssociatedObject(sender, "handler");
+    if (handler) handler();
+}
+
+- (void)finalizeLayout {
+    CGFloat height = 64 + 14 + self.rowCount * 42 + 12;
+    CGFloat width = 300;
+    CGRect frame = self.frame;
+    frame.size = CGSizeMake(width, height);
+    self.frame = frame;
+}
+
 @end
 
 static void toast_goi(NSString *message) {
@@ -328,176 +440,113 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 
 
 
-- (void)showMainMenu {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
-
-    NSString *header = self.appliedOnce
-        ? [NSString stringWithFormat:@"Speed %.2fx · Gravity %.2fx",
-            self.speedFactor, self.gravityFactor]
-        : @"Waiting for the game runtime. Settings apply automatically once it is ready.";
-
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Getting Over It Tools"
-                                                                  message:header
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
-    __weak typeof(self) weakSelf = self;
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"Game Speed…"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showSpeedMenu]; });
-    }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Gravity…"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showGravityMenu]; });
-    }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Practice Profiles…"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showProfilesMenu]; });
-    }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Close"
-                                             style:UIAlertActionStyleCancel
-                                           handler:nil]];
-    menu.popoverPresentationController.sourceView = self.button;
-    menu.popoverPresentationController.sourceRect = self.button.bounds;
-    [presenter presentViewController:menu animated:YES completion:nil];
+- (void)closePanel {
+    [self.panel removeFromSuperview];
+    self.panel = nil;
 }
 
-- (void)showSpeedMenu {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Game Speed (Time.timeScale)"
-                                                                  message:nil
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+- (void)showPanel:(void (^)(EmberGoiMenuPanel *panel))build {
+    [self ensureOverlay];
+    [self closePanel];
+    EmberGoiMenuPanel *panel = [[EmberGoiMenuPanel alloc] initWithFrame:CGRectZero];
+    panel.onClose = ^{ [self closePanel]; };
+    build(panel);
+    [panel finalizeLayout];
+    panel.center = CGPointMake(CGRectGetMidX(self.overlayRoot.view.bounds),
+                               CGRectGetMidY(self.overlayRoot.view.bounds));
+    panel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                             UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    [self.overlayRoot.view addSubview:panel];
+    self.panel = panel;
+}
+
+- (void)showMainPanel {
     __weak typeof(self) weakSelf = self;
-    void (^apply)(CGFloat) = ^(CGFloat factor) {
-        weakSelf.speedFactor = factor;
-        [weakSelf saveSettings];
-        EmberGoiApplyTimeScale(factor);
-        [weakSelf updateButtonTitle];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showSpeedMenu]; });
-    };
-    [menu addAction:[UIAlertAction actionWithTitle:@"0.25x — ultra slow"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(0.25); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"0.5x — slow"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(0.5); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"0.65x — easy climb"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(0.65); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"1x — normal"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(1.0); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"1.5x — speed run"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(1.5); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Back"
-                                             style:UIAlertActionStyleCancel
-                                           handler:^(UIAlertAction *a) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showMainMenu]; });
-    }]];
-    menu.popoverPresentationController.sourceView = self.button;
-    menu.popoverPresentationController.sourceRect = self.button.bounds;
-    [presenter presentViewController:menu animated:YES completion:nil];
+    [self showPanel:^(EmberGoiMenuPanel *panel) {
+        [panel setHeader:@"Getting Over It Tools"
+                subtitle:[NSString stringWithFormat:@"Speed %.2fx · Gravity %.2fx",
+                          weakSelf.speedFactor, weakSelf.gravityFactor]];
+        [panel addOption:@"Game Speed ▸" handler:^{ [weakSelf showSpeedPanel]; }];
+        [panel addOption:@"Gravity ▸" handler:^{ [weakSelf showGravityPanel]; }];
+        [panel addOption:@"Profiles ▸" handler:^{ [weakSelf showProfilesPanel]; }];
+        [panel addOption:@"Reset to 1x speed / 1x gravity" handler:^{
+            weakSelf.speedFactor = 1.0;
+            weakSelf.gravityFactor = 1.0;
+            [weakSelf saveSettings];
+            [weakSelf applyAll];
+            [weakSelf updateButtonTitle];
+            [weakSelf closePanel];
+        }];
+    }];
+}
+
+- (void)showSpeedPanel {
+    __weak typeof(self) weakSelf = self;
+    [self showPanel:^(EmberGoiMenuPanel *panel) {
+        [panel setHeader:@"Game Speed" subtitle:@"Time.timeScale"];
+        void (^apply)(CGFloat) = ^(CGFloat factor) {
+            weakSelf.speedFactor = factor;
+            [weakSelf saveSettings];
+            EmberGoiApplyTimeScale(factor);
+            [weakSelf updateButtonTitle];
+            [weakSelf closePanel];
+        };
+        [panel addOption:@"0.25x — ultra slow" handler:^{ apply(0.25); }];
+        [panel addOption:@"0.5x — slow" handler:^{ apply(0.5); }];
+        [panel addOption:@"0.65x — easy climb" handler:^{ apply(0.65); }];
+        [panel addOption:@"1x — normal" handler:^{ apply(1.0); }];
+        [panel addOption:@"1.5x — speed run" handler:^{ apply(1.5); }];
+    }];
 }
 
 
-- (void)showGravityMenu {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Gravity (Physics2D.gravity scale)"
-                                                                  message:nil
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+- (void)showGravityPanel {
     __weak typeof(self) weakSelf = self;
-    void (^apply)(CGFloat) = ^(CGFloat factor) {
-        weakSelf.gravityFactor = factor;
-        [weakSelf saveSettings];
-        EmberGoiApplyGravity(factor);
-        [weakSelf updateButtonTitle];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showGravityMenu]; });
-    };
-    [menu addAction:[UIAlertAction actionWithTitle:@"0x — zero-G float"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(0.0); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"0.3x — moon"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(0.3); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"0.45x — easy climb"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(0.45); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"1x — normal"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(1.0); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"1.5x — heavy"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(1.5); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Back"
-                                             style:UIAlertActionStyleCancel
-                                           handler:^(UIAlertAction *a) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showMainMenu]; });
-    }]];
-    menu.popoverPresentationController.sourceView = self.button;
-    menu.popoverPresentationController.sourceRect = self.button.bounds;
-    [presenter presentViewController:menu animated:YES completion:nil];
+    [self showPanel:^(EmberGoiMenuPanel *panel) {
+        [panel setHeader:@"Gravity" subtitle:@"Physics2D.gravity scale"];
+        void (^apply)(CGFloat) = ^(CGFloat factor) {
+            weakSelf.gravityFactor = factor;
+            [weakSelf saveSettings];
+            EmberGoiApplyGravity(factor);
+            [weakSelf updateButtonTitle];
+            [weakSelf closePanel];
+        };
+        [panel addOption:@"0x — zero-G float" handler:^{ apply(0.0); }];
+        [panel addOption:@"0.3x — moon" handler:^{ apply(0.3); }];
+        [panel addOption:@"0.45x — easy climb" handler:^{ apply(0.45); }];
+        [panel addOption:@"1x — normal" handler:^{ apply(1.0); }];
+        [panel addOption:@"1.5x — heavy" handler:^{ apply(1.5); }];
+    }];
 }
 
 
-- (void)showProfilesMenu {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Practice Profiles"
-                                                                  message:nil
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+- (void)showProfilesPanel {
     __weak typeof(self) weakSelf = self;
-    void (^apply)(CGFloat, CGFloat) = ^(CGFloat s, CGFloat g) {
-        weakSelf.speedFactor = s;
-        weakSelf.gravityFactor = g;
-        [weakSelf saveSettings];
-        EmberGoiApplyTimeScale(s);
-        EmberGoiApplyGravity(g);
-        [weakSelf updateButtonTitle];
-        toast_goi([NSString stringWithFormat:@"Speed %.2fx, gravity %.2fx applied.", s, g]);
-    };
-    [menu addAction:[UIAlertAction actionWithTitle:@"Easy Climb — 0.65x speed, 0.45x gravity"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(0.65, 0.45); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Moon Jump — 1x speed, 0.3x gravity"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(1.0, 0.3); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Zero-G Float — 1x speed, no gravity"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(1.0, 0.0); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Speed Run — 1.5x speed, 1x gravity"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(1.5, 1.0); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Defaults — 1x / 1x"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(1.0, 1.0); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Back"
-                                             style:UIAlertActionStyleCancel
-                                           handler:^(UIAlertAction *a) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showMainMenu]; });
-    }]];
-    menu.popoverPresentationController.sourceView = self.button;
-    menu.popoverPresentationController.sourceRect = self.button.bounds;
-    [presenter presentViewController:menu animated:YES completion:nil];
+    [self showPanel:^(EmberGoiMenuPanel *panel) {
+        [panel setHeader:@"Practice Profiles" subtitle:@"Applies instantly"];
+        void (^apply)(CGFloat, CGFloat) = ^(CGFloat s, CGFloat g) {
+            weakSelf.speedFactor = s;
+            weakSelf.gravityFactor = g;
+            [weakSelf saveSettings];
+            EmberGoiApplyTimeScale(s);
+            EmberGoiApplyGravity(g);
+            [weakSelf updateButtonTitle];
+            [weakSelf closePanel];
+        };
+        [panel addOption:@"Easy Climb — 0.65x speed, 0.45x gravity" handler:^{ apply(0.65, 0.45); }];
+        [panel addOption:@"Moon Jump — 1x speed, 0.3x gravity" handler:^{ apply(1.0, 0.3); }];
+        [panel addOption:@"Zero-G Float — 1x speed, no gravity" handler:^{ apply(1.0, 0.0); }];
+        [panel addOption:@"Speed Run — 1.5x speed, 1x gravity" handler:^{ apply(1.5, 1.0); }];
+        [panel addOption:@"Defaults — 1x / 1x" handler:^{ apply(1.0, 1.0); }];
+    }];
 }
 
 - (void)tapped {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
-    [self showMainMenu];
+    if (self.panel) {
+        [self closePanel];
+        return;
+    }
+    [self showMainPanel];
 }
 
 @end
