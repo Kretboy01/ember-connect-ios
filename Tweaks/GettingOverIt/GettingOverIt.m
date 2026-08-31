@@ -325,11 +325,24 @@ static void EmberGoiApplyGravity(CGFloat factor) {
         root.view = [[EmberGoiPassthroughView alloc] initWithFrame:frame];
         root.view.backgroundColor = UIColor.clearColor;
         self.overlayWindow.rootViewController = root;
-        self.overlayWindow.hidden = NO;
         EmberGoiLog(@"overlay window created");
+    }
+    // The host uses the scene lifecycle: a window without a UIWindowScene
+    // never renders on modern iOS. Attach to the foreground scene as soon as
+    // one exists.
+    if (!self.overlayWindow.windowScene) {
+        for (__kindof UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:UIWindowScene.class] &&
+                scene.activationState == UISceneActivationStateForegroundActive) {
+                self.overlayWindow.windowScene = (UIWindowScene *)scene;
+                EmberGoiLog(@"overlay window attached to foreground scene");
+                break;
+            }
+        }
     }
     // Track rotation / resolution changes every tick.
     self.overlayWindow.frame = frame;
+    self.overlayWindow.hidden = NO;
     self.overlayRoot = self.overlayWindow.rootViewController;
 }
 
