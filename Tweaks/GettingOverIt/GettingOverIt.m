@@ -91,8 +91,6 @@ static void EmberGoiLog(NSString *fmt, ...) {
 @property (nonatomic, assign) CGFloat speedFactor;       // Time.timeScale
 @property (nonatomic, assign) CGFloat gravityFactor;     // Physics2D.gravity scale
 @property (nonatomic, strong) UIButton *button;
-@property (nonatomic, strong) UIWindow *overlayWindow;   // our own always-on-top window
-@property (nonatomic, strong) UIViewController *overlayRoot;
 @property (nonatomic, strong) EmberGoiMenuPanel *panel;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 @property (nonatomic, assign) BOOL appliedOnce;
@@ -102,61 +100,14 @@ static void EmberGoiLog(NSString *fmt, ...) {
 - (UIViewController *)topViewController;
 @end
 
-/// The game's own windows come and go (Unity recreates them on rotation and
-/// scene loads), which used to tear the button and any presented menu down
-/// with them. The tweak therefore owns a top-level overlay window whose root
-/// view swallows no touches — everything falls through to the game except
-/// the button itself.
-@interface EmberGoiPassthroughView : UIView
-@end
+/// The game's own windows come and go, and custom overlay windows get
+/// buried, mis-rotated, or swallow touches. LiveContainer's own floating
+/// dock solves this the simple way (MultitaskDockView.swift): it adds its
+/// view as a plain subview of the GAME'S key window
+/// (`windowScene.windows.first`) and calls bringSubviewToFront on every
+/// tick. Same window as the game = same orientation, always on top, touches
+/// just work.
 
-@implementation EmberGoiPassthroughView
-@end
-
-/// The pass-through has to happen HERE. UIView.hitTest falls back to
-/// returning the view itself when no subview is hit, and UIWindow inherits
-/// that fallback — so a plain window swallows every touch and the game never
-/// sees input. Returning nil from the window's hitTest hands the touch to
-/// the next window down (the game's).
-///
-/// The window must also refuse to become key: Unity derives its orientation
-/// from the key window's root view controller, and a key overlay defaulted
-/// to portrait rotates the whole game sideways.
-@interface EmberGoiOverlayWindow : UIWindow
-@end
-
-@implementation EmberGoiOverlayWindow
-- (BOOL)canBecomeKeyWindow {
-    return NO;
-}
-
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *result = [super hitTest:point withEvent:event];
-    if (result == nil || result == self) {
-        return nil;
-    }
-    return result;
-}
-@end
-
-/// Declares the game's own orientation so the overlay can never shrink the
-/// app's supported-orientation mask even if UIKit consults it.
-@interface EmberGoiOverlayRootViewController : UIViewController
-@end
-
-@implementation EmberGoiOverlayRootViewController
-- (BOOL)shouldAutorotate {
-    return YES;
-}
-
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskLandscape;
-}
-
-- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
-    return UIInterfaceOrientationLandscapeRight;
-}
-@end
 
 #pragma mark - Custom menu panel
 
@@ -352,46 +303,35 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     return self;
 }
 
-- (UIViewController *)topViewController {
-    return self.overlayRoot;
-}
+#pragma mark - Host window (LiveContainer dock pattern)
 
-- (void)ensureOverlay {
-    CGRect frame = [UIScreen.mainScreen bounds];
-    if (!self.overlayWindow) {
-        self.overlayWindow = [[EmberGoiOverlayWindow alloc] initWithFrame:frame];
-        self.overlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
-        self.overlayWindow.backgroundColor = UIColor.clearColor;
-        UIViewController *root = [[EmberGoiOverlayRootViewController alloc] init];
-        root.view = [[EmberGoiPassthroughView alloc] initWithFrame:frame];
-        root.view.backgroundColor = UIColor.clearColor;
-        self.overlayWindow.rootViewController = root;
-        EmberGoiLog(@"overlay window created");
-    }
-    // The host uses the scene lifecycle: a window without a UIWindowScene
-    // never renders on modern iOS. Attach to the foreground scene as soon as
-    // one exists.
-    if (!self.overlayWindow.windowScene) {
-        for (__kindof UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if ([scene isKindOfClass:UIWindowScene.class] &&
-                scene.activationState == UISceneActivationStateForegroundActive) {
-                self.overlayWindow.windowScene = (UIWindowScene *)scene;
-                EmberGoiLog(@"overlay window attached to foreground scene");
-                break;
+/// The game's key window — first window of the first non-background scene.
+/// The floating button and menu panel are plain subviews of it, exactly like
+/// LiveContainer's own dock (keyWindow.addSubview + bringSubviewToFront).
+static UIWindow *EmberGoiHostWindow(void) {
+    for (__kindof UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if ([scene isKindOfClass:UIWindowScene.class] &&
+            scene.activationState != UISceneActivationStateBackground) {
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+            for (UIWindow *window in windowScene.windows) {
+                return window;
             }
         }
     }
-    // Track rotation / resolution changes every tick — the root view must
-    // follow the window or the panel/button end up sized for the wrong
-    // orientation.
-    self.overlayWindow.frame = frame;
-    self.overlayWindow.hidden = NO;
-    self.overlayRoot = self.overlayWindow.rootViewController;
-    self.overlayRoot.view.frame = CGRectMake(0, 0, CGRectGetWidth(frame), CGRectGetHeight(frame));
+    return UIApplication.sharedApplication.keyWindow;
+}
+
+- (UIViewController *)topViewController {
+    UIWindow *host = EmberGoiHostWindow();
+    UIViewController *root = host.rootViewController;
+    while (root.presentedViewController) {
+        root = root.presentedViewController;
+    }
+    return root;
 }
 
 - (void)clampButton {
-    UIView *host = self.overlayRoot.view;
+    UIWindow *host = EmberGoiHostWindow();
     if (!self.button || !host) return;
     CGRect bounds = host.bounds;
     CGFloat halfW = CGRectGetWidth(self.button.frame) / 2 + 4;
@@ -435,10 +375,10 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 }
 
 - (void)dragged:(UIPanGestureRecognizer *)recognizer {
-    CGPoint translation = [recognizer translationInView:self.overlayRoot.view];
     UIView *view = recognizer.view;
+    CGPoint translation = [recognizer translationInView:view.superview];
     view.center = CGPointMake(view.center.x + translation.x, view.center.y + translation.y);
-    [recognizer setTranslation:CGPointZero inView:self.overlayRoot.view];
+    [recognizer setTranslation:CGPointZero inView:view.superview];
     if (recognizer.state == UIGestureRecognizerStateEnded) {
         [self clampButton];
         [self saveSettings];
@@ -446,9 +386,10 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 }
 
 - (void)install {
-    [self ensureOverlay];
-    UIView *host = self.overlayRoot.view;
+    UIWindow *host = EmberGoiHostWindow();
+    if (!host) return;
     if (self.button.superview == host) {
+        [host bringSubviewToFront:self.button];
         [self clampButton];
         return;
     }
@@ -508,17 +449,19 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 }
 
 - (void)showPanel:(void (^)(EmberGoiMenuPanel *panel))build {
-    [self ensureOverlay];
+    UIWindow *host = EmberGoiHostWindow();
+    if (!host) return;
     [self closePanel];
     EmberGoiMenuPanel *panel = [[EmberGoiMenuPanel alloc] initWithFrame:CGRectZero];
     panel.onClose = ^{ [self closePanel]; };
     build(panel);
     [panel finalizeLayout];
-    panel.center = CGPointMake(CGRectGetMidX(self.overlayRoot.view.bounds),
-                               CGRectGetMidY(self.overlayRoot.view.bounds));
+    panel.center = CGPointMake(CGRectGetMidX(host.bounds),
+                               CGRectGetMidY(host.bounds));
     panel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
                              UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-    [self.overlayRoot.view addSubview:panel];
+    [host addSubview:panel];
+    [host bringSubviewToFront:panel];
     self.panel = panel;
 }
 
