@@ -80,13 +80,29 @@ static void EmberGoiLog(NSString *fmt, ...) {
 @property (nonatomic, assign) CGFloat speedFactor;       // Time.timeScale
 @property (nonatomic, assign) CGFloat gravityFactor;     // Physics2D.gravity scale
 @property (nonatomic, strong) UIButton *button;
-@property (nonatomic, strong) UIWindow *hostWindow;
+@property (nonatomic, strong) UIWindow *overlayWindow;   // our own always-on-top window
+@property (nonatomic, strong) UIViewController *overlayRoot;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 @property (nonatomic, assign) BOOL appliedOnce;
 + (instancetype)sharedController;
 - (void)start;
 - (void)stop;
 - (UIViewController *)topViewController;
+@end
+
+/// The game's own windows come and go (Unity recreates them on rotation and
+/// scene loads), which used to tear the button and any presented menu down
+/// with them. The tweak therefore owns a top-level overlay window whose root
+/// view swallows no touches — everything falls through to the game except
+/// the button itself.
+@interface EmberGoiPassthroughView : UIView
+@end
+
+@implementation EmberGoiPassthroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *result = [super hitTest:point withEvent:event];
+    return result == self ? nil : result;
+}
 @end
 
 static void toast_goi(NSString *message) {
@@ -170,13 +186,39 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 }
 
 - (UIViewController *)topViewController {
-    UIWindow *host = self.hostWindow ?: UIApplication.sharedApplication.keyWindow;
-    if (!host) return nil;
-    UIViewController *root = host.rootViewController;
-    while (root.presentedViewController) {
-        root = root.presentedViewController;
+    return self.overlayRoot;
+}
+
+- (void)ensureOverlay {
+    CGRect frame = [UIScreen.mainScreen bounds];
+    if (!self.overlayWindow) {
+        self.overlayWindow = [[UIWindow alloc] initWithFrame:frame];
+        self.overlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
+        self.overlayWindow.backgroundColor = UIColor.clearColor;
+        UIViewController *root = [[UIViewController alloc] init];
+        root.view = [[EmberGoiPassthroughView alloc] initWithFrame:frame];
+        root.view.backgroundColor = UIColor.clearColor;
+        self.overlayWindow.rootViewController = root;
+        self.overlayWindow.hidden = NO;
+        EmberGoiLog(@"overlay window created");
     }
-    return root;
+    // Track rotation / resolution changes every tick.
+    self.overlayWindow.frame = frame;
+    self.overlayRoot = self.overlayWindow.rootViewController;
+}
+
+- (void)clampButton {
+    UIView *host = self.overlayRoot.view;
+    if (!self.button || !host) return;
+    CGRect bounds = host.bounds;
+    CGFloat halfW = CGRectGetWidth(self.button.frame) / 2 + 4;
+    CGFloat halfH = CGRectGetHeight(self.button.frame) / 2 + 4;
+    CGPoint center = self.button.center;
+    center.x = MAX(halfW, MIN(CGRectGetWidth(bounds) - halfW, center.x));
+    center.y = MAX(halfH, MIN(CGRectGetHeight(bounds) - halfH, center.y));
+    if (!CGPointEqualToPoint(center, self.button.center)) {
+        self.button.center = center;
+    }
 }
 
 - (void)saveSettings {
@@ -210,24 +252,22 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 }
 
 - (void)dragged:(UIPanGestureRecognizer *)recognizer {
-    UIWindow *host = self.hostWindow ?: UIApplication.sharedApplication.keyWindow;
-    if (!host) return;
-    CGPoint translation = [recognizer translationInView:host];
+    CGPoint translation = [recognizer translationInView:self.overlayRoot.view];
     UIView *view = recognizer.view;
     view.center = CGPointMake(view.center.x + translation.x, view.center.y + translation.y);
-    [recognizer setTranslation:CGPointZero inView:host];
+    [recognizer setTranslation:CGPointZero inView:self.overlayRoot.view];
     if (recognizer.state == UIGestureRecognizerStateEnded) {
+        [self clampButton];
         [self saveSettings];
     }
 }
 
 - (void)install {
-    UIWindow *host = UIApplication.sharedApplication.keyWindow;
-    if (!host) return;
-    if (self.button.superview == host) return;
-    if (self.hostWindow && self.hostWindow != host) {
-        [self.button removeFromSuperview];
-        self.button = nil;
+    [self ensureOverlay];
+    UIView *host = self.overlayRoot.view;
+    if (self.button.superview == host) {
+        [self clampButton];
+        return;
     }
 
     UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -237,9 +277,10 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     CGFloat savedX = [NSUserDefaults.standardUserDefaults doubleForKey:@"EmberGOI.buttonX"];
     CGFloat savedY = [NSUserDefaults.standardUserDefaults doubleForKey:@"EmberGOI.buttonY"];
     CGFloat defaultX = CGRectGetWidth(host.bounds) - 62;
-    CGFloat defaultY = MAX(52, host.safeAreaInsets.top + 24);
+    CGFloat defaultY = CGRectGetHeight(host.bounds) / 2;
     button.center = CGPointMake(savedX > 0 ? savedX : defaultX, savedY > 0 ? savedY : defaultY);
-    button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+    button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                              UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
     button.layer.cornerRadius = 11;
     button.layer.borderWidth = 1;
     button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
@@ -255,7 +296,7 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     [host addSubview:button];
     [host bringSubviewToFront:button];
     self.button = button;
-    self.hostWindow = host;
+    [self clampButton];
     [self updateButtonTitle];
 }
 
@@ -284,6 +325,7 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     [self.keepAliveTimer invalidate];
     self.keepAliveTimer = nil;
 }
+
 
 
 - (void)showMainMenu {
