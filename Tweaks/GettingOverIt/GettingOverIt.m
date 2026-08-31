@@ -305,20 +305,50 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 
 #pragma mark - Host window (LiveContainer dock pattern)
 
-/// The game's key window — first window of the first non-background scene.
-/// The floating button and menu panel are plain subviews of it, exactly like
-/// LiveContainer's own dock (keyWindow.addSubview + bringSubviewToFront).
+/// The floating button and menu panel are plain subviews of the game's key
+/// window, exactly like LiveContainer's own dock
+/// (keyWindow.addSubview + bringSubviewToFront). Prefer the scene's actual
+/// key window; log the full window inventory so a wrong pick is visible in
+/// the diag.
 static UIWindow *EmberGoiHostWindow(void) {
     for (__kindof UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if ([scene isKindOfClass:UIWindowScene.class] &&
-            scene.activationState != UISceneActivationStateBackground) {
-            UIWindowScene *windowScene = (UIWindowScene *)scene;
-            for (UIWindow *window in windowScene.windows) {
-                return window;
-            }
+        if (![scene isKindOfClass:UIWindowScene.class] ||
+            scene.activationState == UISceneActivationStateBackground) {
+            continue;
+        }
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+
+        if ([windowScene respondsToSelector:@selector(keyWindow)] &&
+            windowScene.keyWindow) {
+            return windowScene.keyWindow;
+        }
+
+        UIWindow *fallback = windowScene.windows.firstObject;
+        if (fallback) {
+            EmberGoiLog(@"falling back to windows.first (keyWindow unavailable)");
+            return fallback;
         }
     }
     return UIApplication.sharedApplication.keyWindow;
+}
+
+static void EmberGoiLogWindowInventory(void) {
+    NSMutableString *report = [NSMutableString new];
+    [report appendString:@"window inventory:\n"];
+    for (__kindof UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        [report appendFormat:@"  scene %@ state=%ld\n",
+            windowScene.title ?: @"(untitled)", (long)windowScene.activationState];
+        for (UIWindow *window in windowScene.windows) {
+            NSString *rootClass = window.rootViewController ?
+                NSStringFromClass(window.rootViewController.class) : @"(none)";
+            [report appendFormat:@"    %@ level=%.0f key=%d bounds=%@ root=%@\n",
+                NSStringFromClass(window.class), (double)window.windowLevel,
+                window.isKeyWindow, NSStringFromCGRect(window.bounds), rootClass];
+        }
+    }
+    EmberGoiLog(@"%@", report);
 }
 
 - (UIViewController *)topViewController {
@@ -374,6 +404,10 @@ static UIWindow *EmberGoiHostWindow(void) {
                  forState:UIControlStateNormal];
 }
 
+- (void)logInventoryOnce {
+    EmberGoiLogWindowInventory();
+}
+
 - (void)dragged:(UIPanGestureRecognizer *)recognizer {
     UIView *view = recognizer.view;
     CGPoint translation = [recognizer translationInView:view.superview];
@@ -388,6 +422,11 @@ static UIWindow *EmberGoiHostWindow(void) {
 - (void)install {
     UIWindow *host = EmberGoiHostWindow();
     if (!host) return;
+    static BOOL loggedInventory = NO;
+    if (!loggedInventory) {
+        loggedInventory = YES;
+        [self performSelector:@selector(logInventoryOnce) withObject:nil afterDelay:1.0];
+    }
     if (self.button.superview == host) {
         [host bringSubviewToFront:self.button];
         [self clampButton];
