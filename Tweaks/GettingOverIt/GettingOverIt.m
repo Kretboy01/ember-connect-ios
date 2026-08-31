@@ -39,6 +39,15 @@
 
 static void *g_image_base = NULL;
 static BOOL g_binary_verified = NO;
+static CFAbsoluteTime g_loadTime = 0;
+
+/// The engine must be fully initialized before our direct calls are safe —
+/// an early auto-applied call crashed the process (verified on-device).
+/// Settings are only applied from the menu, long after launch, so require
+/// the game to have been running for a few seconds.
+static BOOL EmberGoiReadyToApply(void) {
+    return g_image_base != NULL && (CACurrentMediaTime() - g_loadTime) > 5.0;
+}
 
 typedef void (*TimeSetTimeScaleFunc)(float value, void *methodInfo);
 typedef void (*Physics2DSetGravityInjectedFunc)(void *gravity, void *methodInfo);
@@ -363,7 +372,7 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 }
 
 - (void)updateButtonTitle {
-    NSString *state = self.appliedOnce ? @"Tools" : @"Waiting…";
+    NSString *state = EmberGoiEnsureRuntime() ? @"Tools" : @"Waiting…";
     [self.button setTitle:[NSString stringWithFormat:@"GOI %@", state]
                  forState:UIControlStateNormal];
 }
@@ -419,22 +428,13 @@ static void EmberGoiApplyGravity(CGFloat factor) {
 
 - (void)start {
     [self install];
-    if (!self.appliedOnce && EmberGoiEnsureRuntime()) {
-        [self loadSettings];
-        [self applyAll];
-        [self updateButtonTitle];
-    }
+    [self updateButtonTitle];
     [self.keepAliveTimer invalidate];
     __weak typeof(self) weakSelf = self;
     self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
                                                           repeats:YES
                                                             block:^(NSTimer *timer) {
         [weakSelf install];
-        if (!weakSelf.appliedOnce && EmberGoiEnsureRuntime()) {
-            [weakSelf loadSettings];
-            [weakSelf applyAll];
-            [weakSelf updateButtonTitle];
-        }
     }];
 }
 
@@ -490,6 +490,10 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     [self showPanel:^(EmberGoiMenuPanel *panel) {
         [panel setHeader:@"Game Speed" subtitle:@"Time.timeScale"];
         void (^apply)(CGFloat) = ^(CGFloat factor) {
+            if (!EmberGoiReadyToApply()) {
+                toast_goi(@"Give the game a few more seconds to load, then try again.");
+                return;
+            }
             weakSelf.speedFactor = factor;
             [weakSelf saveSettings];
             EmberGoiApplyTimeScale(factor);
@@ -510,6 +514,10 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     [self showPanel:^(EmberGoiMenuPanel *panel) {
         [panel setHeader:@"Gravity" subtitle:@"Physics2D.gravity scale"];
         void (^apply)(CGFloat) = ^(CGFloat factor) {
+            if (!EmberGoiReadyToApply()) {
+                toast_goi(@"Give the game a few more seconds to load, then try again.");
+                return;
+            }
             weakSelf.gravityFactor = factor;
             [weakSelf saveSettings];
             EmberGoiApplyGravity(factor);
@@ -530,6 +538,10 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     [self showPanel:^(EmberGoiMenuPanel *panel) {
         [panel setHeader:@"Practice Profiles" subtitle:@"Applies instantly"];
         void (^apply)(CGFloat, CGFloat) = ^(CGFloat s, CGFloat g) {
+            if (!EmberGoiReadyToApply()) {
+                toast_goi(@"Give the game a few more seconds to load, then try again.");
+                return;
+            }
             weakSelf.speedFactor = s;
             weakSelf.gravityFactor = g;
             [weakSelf saveSettings];
@@ -572,6 +584,7 @@ static void EmberGettingOverItInit(void) {
             EmberGoiLog(@"wrong bundle: %@ (%@)", bundleIdentifier, executable);
             return;
         }
+        g_loadTime = CACurrentMediaTime();
         EmberGoiLog(@"tweak loaded in %@", bundleIdentifier);
 
         EmberGoiController *controller = [EmberGoiController sharedController];
