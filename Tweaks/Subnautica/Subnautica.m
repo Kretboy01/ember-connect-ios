@@ -294,7 +294,7 @@ static BOOL EmberSnSendCommand(NSString *command) {
 }
 
 - (UIViewController *)topViewController {
-    UIView *host = self.hostWindow ?: UIApplication.sharedApplication.keyWindow;
+    UIWindow *host = self.hostWindow ?: UIApplication.sharedApplication.keyWindow;
     if (!host) return nil;
     UIViewController *root = host.rootViewController;
     while (root.presentedViewController) {
@@ -328,7 +328,7 @@ static BOOL EmberSnSendCommand(NSString *command) {
 }
 
 - (void)install {
-    UIView *host = UIApplication.sharedApplication.keyWindow;
+    UIWindow *host = UIApplication.sharedApplication.keyWindow;
     if (!host) return;
     if (self.button.superview == host) return;
     if (self.hostWindow && self.hostWindow != host) {
