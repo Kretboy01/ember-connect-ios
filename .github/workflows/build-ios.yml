@@ -110,6 +110,25 @@ jobs:
           file BuiltTweaks/GettingOverIt.dylib
           xcrun otool -L BuiltTweaks/GettingOverIt.dylib
 
+          # Subnautica — IL2CPP mod for Subnautica. Drives the game's own
+          # developer console (DevConsole.SendConsoleCommand) plus icalls.
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -fblocks \
+            -dynamiclib \
+            Tweaks/Subnautica/Subnautica.m \
+            -framework Foundation \
+            -framework UIKit \
+            -framework QuartzCore \
+            -framework CoreGraphics \
+            -install_name @rpath/Subnautica.dylib \
+            -o BuiltTweaks/Subnautica.dylib
+
+          file BuiltTweaks/Subnautica.dylib
+          xcrun otool -L BuiltTweaks/Subnautica.dylib
+
       - name: Assemble Ember container host
         run: |
           APP="DerivedDataContainer/Build/Products/Release-iphoneos/LiveContainer.app"
