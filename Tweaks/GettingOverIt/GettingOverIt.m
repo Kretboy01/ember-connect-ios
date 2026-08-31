@@ -233,27 +233,32 @@ static void toast_goi(NSString *message) {
 
 #pragma mark - Runtime + direct calls
 
-/// Verifies that image 0 is the Getting Over It executable and records its
-/// load address. RVAs from the dump are relative to the __TEXT vmaddr
-/// (0x100000000), which is exactly what _dyld_get_image_header returns
-/// (rebased by the slide), so target = header + RVA.
+/// Verifies the Getting Over It binary is loaded and records its load
+/// address. In a LiveContainer guest the game binary is loaded as a dynamic
+/// image (image 0 is the host's LiveContainer executable!), so we must scan
+/// every image for it. RVAs from the dump are relative to the game's __TEXT
+/// vmaddr (0x100000000), and _dyld_get_image_header(i) is exactly
+/// slide + vmaddr, so target = header + RVA.
 static BOOL EmberGoiEnsureRuntime(void) {
     if (g_image_base) return YES;
 
-    if (_dyld_image_count() == 0) return NO;
-    const char *name = _dyld_get_image_name(0);
-    if (!name) return NO;
-    NSString *imageName = [NSString stringWithUTF8String:name];
-    if (![imageName.lowercaseString containsString:@"gettingoverit"]) {
-        EmberGoiLog(@"image 0 is not GettingOverIt: %@", imageName);
-        return NO;
+    static BOOL loggedFailure = NO;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        NSString *imageName = [NSString stringWithUTF8String:name];
+        if ([imageName.lastPathComponent.lowercaseString isEqualToString:@"gettingoverit"]) {
+            g_image_base = (void *)_dyld_get_image_header(i);
+            EmberGoiLog(@"guest binary found (image %u) at %p, slide=%lld",
+                        i, g_image_base, (long long)_dyld_get_image_vmaddr_slide(i));
+            return YES;
+        }
     }
-    g_binary_verified = YES;
-    g_image_base = (void *)_dyld_get_image_header(0);
-    EmberGoiLog(@"main binary at %p (%@), slide=%lld",
-                g_image_base, imageName.lastPathComponent,
-                (long long)_dyld_get_image_vmaddr_slide(0));
-    return YES;
+    if (!loggedFailure) {
+        EmberGoiLog(@"guest binary not loaded yet");
+        loggedFailure = YES;
+    }
+    return NO;
 }
 
 static void EmberGoiApplyTimeScale(CGFloat factor) {
