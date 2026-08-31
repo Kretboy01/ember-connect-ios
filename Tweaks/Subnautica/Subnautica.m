@@ -63,8 +63,9 @@ static UnityPauseFunc g_unity_pause = NULL;
 static const Il2CppMethod *g_send_console_command_method = NULL;
 static BOOL g_send_console_command_is_static = NO;
 static Il2CppClass *g_dev_console_class = NULL;
-static const void *g_find_object_of_type_icall = NULL;
-static const void *g_find_object_inactive_icall = NULL;
+static Il2CppClass *g_unity_object_class = NULL;
+static const Il2CppMethod *g_find_objects_of_type_method = NULL;
+static void *g_console_instance = NULL;
 static const void *g_set_time_scale_icall = NULL;
 
 static BOOL g_resolved = NO;
@@ -197,19 +198,37 @@ static void EmberSnResolveRuntime(void) {
     if (!assemblies || count == 0) return;
 
     const Il2CppImage *gameImage = NULL;
+    const Il2CppImage *unityImage = NULL;
     for (size_t i = 0; i < count; i++) {
         const Il2CppImage *image = g_il2cpp_assembly_get_image(assemblies[i]);
         if (!image || !g_il2cpp_image_get_name) continue;
         const char *name = g_il2cpp_image_get_name(image);
-        if (name && strcmp(name, "Assembly-CSharp.dll") == 0) {
+        if (!name) continue;
+        if (strcmp(name, "Assembly-CSharp.dll") == 0) {
             gameImage = image;
             EmberSnLog(@"found Assembly-CSharp image (%zu assemblies scanned)", count);
-            break;
+        } else if (strcmp(name, "UnityEngine.CoreModule.dll") == 0 ||
+                   strcmp(name, "UnityEngine.dll") == 0) {
+            unityImage = image;
         }
+        if (gameImage && unityImage) break;
     }
     if (!gameImage) {
         EmberSnLog(@"Assembly-CSharp image not found yet (%zu assemblies)", count);
         return;
+    }
+
+    // UnityEngine.Object.FindObjectsOfType(Type) — managed static — is how we
+    // locate the live console: the FindObjectOfType icalls do not exist under
+    // those names in this Unity version.
+    if (unityImage && !g_unity_object_class) {
+        g_unity_object_class = g_il2cpp_class_from_name(unityImage, "UnityEngine", "Object");
+        if (g_unity_object_class) {
+            g_find_objects_of_type_method =
+                g_il2cpp_class_get_method_from_name(g_unity_object_class, "FindObjectsOfType", 1);
+            EmberSnLog(@"FindObjectsOfType resolved (%@ image)",
+                       g_find_objects_of_type_method ? @"yes" : @"no");
+        }
     }
 
     Il2CppClass *consoleClass = g_il2cpp_class_from_name(gameImage, "", "DevConsole");
@@ -234,15 +253,9 @@ static void EmberSnResolveRuntime(void) {
     EmberSnLog(@"SendConsoleCommand resolved (static=%d)", g_send_console_command_is_static ? 1 : 0);
 
     if (g_il2cpp_resolve_icall) {
-        g_find_object_of_type_icall =
-            g_il2cpp_resolve_icall("UnityEngine.Object::FindObjectOfType(System.Type)");
-        g_find_object_inactive_icall =
-            g_il2cpp_resolve_icall("UnityEngine.Object::FindObjectOfType(System.Type,System.Boolean)");
         g_set_time_scale_icall =
             g_il2cpp_resolve_icall("UnityEngine.Time::set_timeScale(Single)");
-        EmberSnLog(@"icalls: find=%p findInactive=%p timeScale=%p",
-                   g_find_object_of_type_icall, g_find_object_inactive_icall,
-                   g_set_time_scale_icall);
+        EmberSnLog(@"icall timeScale: %p", g_set_time_scale_icall);
     }
 
     g_resolved = YES;
@@ -263,13 +276,13 @@ static BOOL EmberSnSendCommand(NSString *command) {
         }
     }
 
-    void *instance = NULL;
-    if (!g_send_console_command_is_static) {
-        // Instance method: locate the live console component, including
-        // inactive objects (the console UI is often disabled until opened).
-        if ((!g_find_object_inactive_icall && !g_find_object_of_type_icall) ||
-            !g_il2cpp_class_get_type || !g_il2cpp_type_get_object || !g_dev_console_class) {
-            EmberSnLog(@"instance path unavailable (icalls/type missing)");
+    void *instance = g_console_instance;
+    if (!g_send_console_command_is_static && !instance) {
+        // Instance method: locate the live console via the managed
+        // UnityEngine.Object.FindObjectsOfType(Type) static.
+        if (!g_find_objects_of_type_method || !g_il2cpp_class_get_type ||
+            !g_il2cpp_type_get_object || !g_il2cpp_runtime_invoke || !g_dev_console_class) {
+            EmberSnLog(@"instance path unavailable (reflection pieces missing)");
             return NO;
         }
         void *type = g_il2cpp_type_get_object(g_il2cpp_class_get_type(g_dev_console_class));
@@ -277,19 +290,25 @@ static BOOL EmberSnSendCommand(NSString *command) {
             EmberSnLog(@"System.Type object creation failed");
             return NO;
         }
-        typedef void *(*Find1)(void *);
-        typedef void *(*Find2)(void *, signed char);
-        if (g_find_object_inactive_icall) {
-            instance = ((Find2)g_find_object_inactive_icall)(type, 1);
-            EmberSnLog(@"FindObjectOfType(includeInactive) -> %p", instance);
+        void *args[1] = { type };
+        Il2CppException *exception = NULL;
+        void *array = (void *)g_il2cpp_runtime_invoke(
+            g_find_objects_of_type_method, NULL, args, &exception);
+        if (exception || !array) {
+            EmberSnLog(@"FindObjectsOfType threw or returned null");
+            return NO;
         }
-        if (!instance && g_find_object_of_type_icall) {
-            instance = ((Find1)g_find_object_of_type_icall)(type);
-            EmberSnLog(@"FindObjectOfType -> %p", instance);
-        }
-        if (!instance) {
+        // Il2CppArray layout (64-bit): klass, monitor, bounds, max_length,
+        // then the element vector at 0x20.
+        uintptr_t length = *(uintptr_t *)((char *)array + 0x18);
+        EmberSnLog(@"FindObjectsOfType found %llu console(s)", (unsigned long long)length);
+        if (length == 0) {
             EmberSnLog(@"no DevConsole instance in the scene yet");
             return NO;
+        }
+        instance = *(void **)((char *)array + 0x20);
+        if (instance) {
+            g_console_instance = instance; // cache — it persists for the session
         }
     }
 
