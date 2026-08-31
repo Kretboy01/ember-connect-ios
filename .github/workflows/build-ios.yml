@@ -153,6 +153,7 @@ jobs:
           cp BuiltTweaks/FlappyPractice.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/EightBPOfflineLines.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/GettingOverIt.dylib "$APP/EmberTweaks/"
+          cp BuiltTweaks/Subnautica.dylib "$APP/EmberTweaks/"
 
       - name: Verify container, branding, and App ID usage
         run: |
@@ -174,6 +175,7 @@ jobs:
           test -f "$APP/EmberTweaks/FlappyPractice.dylib"
           test -f "$APP/EmberTweaks/EightBPOfflineLines.dylib"
           test -f "$APP/EmberTweaks/GettingOverIt.dylib"
+          test -f "$APP/EmberTweaks/Subnautica.dylib"
 
           echo "Verified Ember Connect host with one ReplayKit extension."
 
@@ -194,3 +196,4 @@ jobs:
             BuiltTweaks/FlappyPractice.dylib
             BuiltTweaks/EightBPOfflineLines.dylib
             BuiltTweaks/GettingOverIt.dylib
+            BuiltTweaks/Subnautica.dylib
