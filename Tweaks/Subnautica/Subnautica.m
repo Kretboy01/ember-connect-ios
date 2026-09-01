@@ -127,6 +127,9 @@ static void EmberSnLog(NSString *fmt, ...) {
 @property (nonatomic, assign) BOOL espLeviathansOnly;
 @property (nonatomic, assign) BOOL espShowNames;
 @property (nonatomic, assign) float espMaxDistance;
+@property (nonatomic, strong) CADisplayLink *espDisplayLink;
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *espEntities;
+@property (nonatomic, assign) CFAbsoluteTime espLastRescan;
 + (instancetype)sharedController;
 - (void)start;
 - (void)stop;
@@ -615,6 +618,39 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
     }
 }
 
+- (void)rescanCreatures {
+    // Expensive: full managed enumeration, throttled to ~2x per second.
+    if (!g_resolved || !g_creature_class || !g_find_objects_of_type_method ||
+        !g_il2cpp_class_get_type || !g_il2cpp_type_get_object) return;
+
+    void *creatureType = g_il2cpp_type_get_object(g_il2cpp_class_get_type(g_creature_class));
+    void *findArgs[1] = { creatureType };
+    Il2CppObject *array = EmberSnInvoke(g_find_objects_of_type_method, NULL, findArgs);
+    if (!array) return;
+    uintptr_t count = *(uintptr_t *)((char *)array + 0x18);
+
+    NSMutableArray<NSDictionary *> *entities = [NSMutableArray arrayWithCapacity:MIN(count, (uintptr_t)120)];
+    for (uintptr_t i = 0; i < count && entities.count < 120; i++) {
+        Il2CppObject *creature = *(Il2CppObject **)((char *)array + 0x20 + i * sizeof(void *));
+        if (!creature) continue;
+        NSString *className = @"Creature";
+        if (g_il2cpp_object_get_class && g_il2cpp_class_get_name) {
+            Il2CppClass *klass = g_il2cpp_object_get_class(creature);
+            const char *rawName = klass ? g_il2cpp_class_get_name(klass) : NULL;
+            if (rawName) className = [NSString stringWithUTF8String:rawName] ?: @"Creature";
+        }
+        BOOL leviathan = EmberSnIsLeviathanName(className);
+        if (self.espLeviathansOnly && !leviathan) continue;
+        [entities addObject:@{
+            @"obj": creature,
+            @"name": className,
+            @"leviathan": @(leviathan)
+        }];
+    }
+    self.espEntities = entities;
+    self.espLastRescan = CACurrentMediaTime();
+}
+
 - (void)updateESP {
     EmberSnESPView *overlay = (EmberSnESPView *)self.espView;
     if (!self.espEnabled || !overlay || !g_resolved || !g_creature_class ||
@@ -628,31 +664,27 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
         return;
     }
 
+    // Per-frame: camera + projection only. Entity enumeration is cached
+    // (rescanCreatures, ~0.5s cadence) so this stays at full frame rate.
+    if (CACurrentMediaTime() - self.espLastRescan > 0.5) {
+        [self rescanCreatures];
+    }
+
     Il2CppObject *camera = EmberSnInvoke(g_camera_get_main_method, NULL, NULL);
     int screenWidth = EmberSnUnboxInt(EmberSnInvoke(g_screen_get_width_method, NULL, NULL));
     int screenHeight = EmberSnUnboxInt(EmberSnInvoke(g_screen_get_height_method, NULL, NULL));
     if (!camera || screenWidth <= 0 || screenHeight <= 0) return;
 
-    void *creatureType = g_il2cpp_type_get_object(g_il2cpp_class_get_type(g_creature_class));
-    void *findArgs[1] = { creatureType };
-    Il2CppObject *array = EmberSnInvoke(g_find_objects_of_type_method, NULL, findArgs);
-    if (!array) return;
-    uintptr_t count = *(uintptr_t *)((char *)array + 0x18);
-    NSMutableArray<NSDictionary *> *markers = [NSMutableArray arrayWithCapacity:MIN(count, (uintptr_t)80)];
+    NSMutableArray<NSDictionary *> *markers = [NSMutableArray arrayWithCapacity:self.espEntities.count];
     CGRect bounds = overlay.bounds;
+    BOOL unityLandscape = screenWidth > screenHeight;
+    BOOL viewLandscape = CGRectGetWidth(bounds) > CGRectGetHeight(bounds);
 
-    for (uintptr_t i = 0; i < count && markers.count < 80; i++) {
-        Il2CppObject *creature = *(Il2CppObject **)((char *)array + 0x20 + i * sizeof(void *));
+    for (NSDictionary *entity in self.espEntities) {
+        Il2CppObject *creature = entity[@"obj"];
         if (!creature) continue;
-
-        NSString *className = @"Creature";
-        if (g_il2cpp_object_get_class && g_il2cpp_class_get_name) {
-            Il2CppClass *klass = g_il2cpp_object_get_class(creature);
-            const char *rawName = klass ? g_il2cpp_class_get_name(klass) : NULL;
-            if (rawName) className = [NSString stringWithUTF8String:rawName] ?: @"Creature";
-        }
-        BOOL leviathan = EmberSnIsLeviathanName(className);
-        if (self.espLeviathansOnly && !leviathan) continue;
+        NSString *className = entity[@"name"];
+        BOOL leviathan = [entity[@"leviathan"] boolValue];
 
         Il2CppObject *transform = EmberSnInvoke(g_component_get_transform_method, creature, NULL);
         EmberSnVector3 world = {0};
@@ -665,9 +697,22 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
                 EmberSnInvoke(g_camera_world_to_screen_method, camera, projectArgs), &screen)) continue;
         if (screen.z <= 0.1f || screen.z > self.espMaxDistance) continue;
 
-        CGFloat x = (screen.x / (CGFloat)screenWidth) * CGRectGetWidth(bounds);
-        CGFloat y = CGRectGetHeight(bounds) -
-                    (screen.y / (CGFloat)screenHeight) * CGRectGetHeight(bounds);
+        // Unity screen coords: pixels, origin bottom-left, in the game's
+        // rendering orientation. Map onto the overlay (points, origin
+        // top-left), transposing if the spaces disagree on orientation.
+        CGFloat nx = screen.x / (CGFloat)screenWidth;
+        CGFloat ny = screen.y / (CGFloat)screenHeight;
+        CGFloat x, y;
+        if (unityLandscape == viewLandscape) {
+            x = nx * CGRectGetWidth(bounds);
+            y = (1.0 - ny) * CGRectGetHeight(bounds);
+        } else {
+            CGFloat swapped = ny;
+            ny = nx;
+            nx = 1.0 - swapped;
+            x = nx * CGRectGetWidth(bounds);
+            y = (1.0 - ny) * CGRectGetHeight(bounds);
+        }
         if (x < -40 || x > CGRectGetWidth(bounds) + 40 ||
             y < -40 || y > CGRectGetHeight(bounds) + 40) continue;
 
@@ -688,6 +733,23 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
 
     overlay.markers = markers;
     [overlay setNeedsDisplay];
+}
+
+- (void)espFrame:(CADisplayLink *)displayLink {
+    [self updateESP];
+}
+
+- (void)startESPDisplayLink {
+    if (self.espDisplayLink || !self.espEnabled) return;
+    self.espDisplayLink = [CADisplayLink displayLinkWithTarget:self
+                                                      selector:@selector(espFrame:)];
+    self.espDisplayLink.preferredFramesPerSecond = 60;
+    [self.espDisplayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+}
+
+- (void)stopESPDisplayLink {
+    [self.espDisplayLink invalidate];
+    self.espDisplayLink = nil;
 }
 
 - (void)install {
@@ -748,6 +810,7 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
 
 - (void)start {
     [self install];
+    [self startESPDisplayLink];
     [self.keepAliveTimer invalidate];
     __weak typeof(self) weakSelf = self;
     self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
@@ -761,6 +824,7 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
 }
 
 - (void)stop {
+    [self stopESPDisplayLink];
     [self.keepAliveTimer invalidate];
     self.keepAliveTimer = nil;
 }
@@ -823,6 +887,11 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
             weakSelf.espEnabled = enabled;
             [weakSelf saveSettings];
             [weakSelf install];
+            if (enabled) {
+                [weakSelf startESPDisplayLink];
+            } else {
+                [weakSelf stopESPDisplayLink];
+            }
             [weakSelf updateESP];
         }];
         [panel addToggle:@"LEVIATHANS ONLY" detail:@"Hide ordinary fish and predators" enabled:self.espLeviathansOnly handler:^(BOOL enabled) {
