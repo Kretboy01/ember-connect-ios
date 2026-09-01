@@ -78,6 +78,7 @@ static const Il2CppMethod *g_component_get_transform_method = NULL;
 static const Il2CppMethod *g_transform_get_position_method = NULL;
 static const Il2CppMethod *g_camera_get_main_method = NULL;
 static const Il2CppMethod *g_camera_world_to_screen_method = NULL;
+static const Il2CppMethod *g_camera_world_to_viewport_method = NULL;
 static const Il2CppMethod *g_screen_get_width_method = NULL;
 static const Il2CppMethod *g_screen_get_height_method = NULL;
 
@@ -273,6 +274,8 @@ static void EmberSnResolveRuntime(void) {
             g_camera_get_main_method = g_il2cpp_class_get_method_from_name(cameraClass, "get_main", 0);
             g_camera_world_to_screen_method =
                 g_il2cpp_class_get_method_from_name(cameraClass, "WorldToScreenPoint", 1);
+            g_camera_world_to_viewport_method =
+                g_il2cpp_class_get_method_from_name(cameraClass, "WorldToViewportPoint", 1);
         }
         if (screenClass) {
             g_screen_get_width_method = g_il2cpp_class_get_method_from_name(screenClass, "get_width", 0);
@@ -657,8 +660,7 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
         !g_find_objects_of_type_method || !g_il2cpp_class_get_type ||
         !g_il2cpp_type_get_object || !g_component_get_transform_method ||
         !g_transform_get_position_method || !g_camera_get_main_method ||
-        !g_camera_world_to_screen_method || !g_screen_get_width_method ||
-        !g_screen_get_height_method) {
+        !g_camera_world_to_viewport_method) {
         overlay.markers = @[];
         [overlay setNeedsDisplay];
         return;
@@ -671,14 +673,10 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
     }
 
     Il2CppObject *camera = EmberSnInvoke(g_camera_get_main_method, NULL, NULL);
-    int screenWidth = EmberSnUnboxInt(EmberSnInvoke(g_screen_get_width_method, NULL, NULL));
-    int screenHeight = EmberSnUnboxInt(EmberSnInvoke(g_screen_get_height_method, NULL, NULL));
-    if (!camera || screenWidth <= 0 || screenHeight <= 0) return;
+    if (!camera) return;
 
     NSMutableArray<NSDictionary *> *markers = [NSMutableArray arrayWithCapacity:self.espEntities.count];
     CGRect bounds = overlay.bounds;
-    BOOL unityLandscape = screenWidth > screenHeight;
-    BOOL viewLandscape = CGRectGetWidth(bounds) > CGRectGetHeight(bounds);
 
     for (NSDictionary *entity in self.espEntities) {
         Il2CppObject *creature = [(NSValue *)entity[@"obj"] pointerValue];
@@ -691,38 +689,28 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
         if (!transform || !EmberSnUnboxVector3(
                 EmberSnInvoke(g_transform_get_position_method, transform, NULL), &world)) continue;
 
+        // WorldToViewportPoint returns NORMALIZED coords (0-1, origin
+        // bottom-left) — resolution-independent, orientation-independent.
+        // z is distance from camera (positive = in front).
         void *projectArgs[1] = { &world };
-        EmberSnVector3 screen = {0};
+        EmberSnVector3 viewport = {0};
         if (!EmberSnUnboxVector3(
-                EmberSnInvoke(g_camera_world_to_screen_method, camera, projectArgs), &screen)) continue;
-        if (screen.z <= 0.1f || screen.z > self.espMaxDistance) continue;
+                EmberSnInvoke(g_camera_world_to_viewport_method, camera, projectArgs), &viewport)) continue;
+        if (viewport.z <= 0.1f || viewport.z > self.espMaxDistance) continue;
 
-        // Unity screen coords: pixels, origin bottom-left, in the game's
-        // rendering orientation. Map onto the overlay (points, origin
-        // top-left), transposing if the spaces disagree on orientation.
-        CGFloat nx = screen.x / (CGFloat)screenWidth;
-        CGFloat ny = screen.y / (CGFloat)screenHeight;
-        CGFloat x, y;
-        if (unityLandscape == viewLandscape) {
-            x = nx * CGRectGetWidth(bounds);
-            y = (1.0 - ny) * CGRectGetHeight(bounds);
-        } else {
-            CGFloat swapped = ny;
-            ny = nx;
-            nx = 1.0 - swapped;
-            x = nx * CGRectGetWidth(bounds);
-            y = (1.0 - ny) * CGRectGetHeight(bounds);
-        }
+        // Map normalized viewport coords directly onto the overlay bounds.
+        CGFloat x = viewport.x * CGRectGetWidth(bounds);
+        CGFloat y = (1.0 - viewport.y) * CGRectGetHeight(bounds);
         if (x < -40 || x > CGRectGetWidth(bounds) + 40 ||
             y < -40 || y > CGRectGetHeight(bounds) + 40) continue;
 
-        CGFloat scale = 15.0 / MAX(screen.z, 5.0f);
+        CGFloat scale = 15.0 / MAX(viewport.z, 5.0f);
         CGFloat width = leviathan ? 220.0 * scale : 80.0 * scale;
         width = MAX(leviathan ? 28.0 : 14.0, MIN(leviathan ? 190.0 : 72.0, width));
         CGFloat height = width * (leviathan ? 0.62 : 0.82);
         CGRect box = CGRectMake(x - width * 0.5, y - height * 0.5, width, height);
         NSString *label = self.espShowNames
-            ? [NSString stringWithFormat:@"%@  %.0fm", className, screen.z]
+            ? [NSString stringWithFormat:@"%@  %.0fm", className, viewport.z]
             : @"";
         [markers addObject:@{
             @"rect": [NSValue valueWithCGRect:box],
@@ -733,29 +721,6 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
 
     overlay.markers = markers;
     [overlay setNeedsDisplay];
-
-    // Once per second: log a sample projection so the coordinate mapping can
-    // be verified/corrected with real numbers instead of guesses.
-    static CFAbsoluteTime lastSample = 0;
-    CFAbsoluteTime now = CACurrentMediaTime();
-    if (now - lastSample > 1.0 && markers.count > 0) {
-        lastSample = now;
-        Il2CppObject *camTransform = EmberSnInvoke(g_component_get_transform_method, camera, NULL);
-        EmberSnVector3 camPos = {0};
-        if (camTransform) {
-            EmberSnUnboxVector3(EmberSnInvoke(g_transform_get_position_method, camTransform, NULL), &camPos);
-        }
-        NSDictionary *first = markers[0];
-        CGRect box = [first[@"rect"] CGRectValue];
-        BOOL unityLandscape = screenWidth > screenHeight;
-        BOOL viewLandscape = CGRectGetWidth(bounds) > CGRectGetHeight(bounds);
-        EmberSnLog(@"esp sample: unity %dx%d (%@) view %.0fx%.0f (%@) cam(%.1f,%.1f,%.1f) box(%.0f,%.0f %.0fx%.0f) ents=%lu",
-            screenWidth, screenHeight, unityLandscape ? @"landscape" : @"portrait",
-            CGRectGetWidth(bounds), CGRectGetHeight(bounds), viewLandscape ? @"landscape" : @"portrait",
-            camPos.x, camPos.y, camPos.z,
-            box.origin.x, box.origin.y, box.size.width, box.size.height,
-            (unsigned long)self.espEntities.count);
-    }
 }
 
 - (void)espFrame:(CADisplayLink *)displayLink {
