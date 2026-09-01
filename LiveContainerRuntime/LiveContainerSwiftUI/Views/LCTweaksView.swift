@@ -85,7 +85,7 @@ struct LCTweakFolderView : View {
             targetBundleIdentifiers: ["net.Foddy.GettingOverIt", "com.BennettFoddy.GettingOverIt", "com.noodlecake.gettingoverit", "com.noodlecake.gettingoveritios"],
             targetNameKeywords: ["getting over it", "gettingoverit", "bennettfoddy"],
             icon: "figure.climbing",
-            description: "Practice tools for Getting Over It: Time.timeScale speed control, Physics2D gravity control, ghost mode, and HUD."
+            description: "Crash-safe practice tools for Getting Over It: speed, physics, pause, frame-step, profiles, and HUD."
         ),
         BundledTweakPreset(
             id: "subnautica",
@@ -155,37 +155,39 @@ struct LCTweakFolderView : View {
                     }
                 }
 
-                Section {
-                    ForEach(Self.bundledPresets) { preset in
-                        let isInstalled = isPresetInstalled(preset)
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Label(preset.name, systemImage: preset.icon)
-                                    .font(.headline)
-                                Spacer()
-                                Button {
-                                    installBundledPreset(preset)
-                                } label: {
-                                    Text(isInstalled ? "Reinstall" : "Install & Assign")
-                                        .font(.subheadline.bold())
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 4)
-                                        .background(isInstalled ? Color.orange.opacity(0.15) : Color.blue.opacity(0.15))
-                                        .foregroundColor(isInstalled ? .orange : .blue)
-                                        .cornerRadius(8)
+                let installablePresets = Self.bundledPresets.filter { !isPresetInstalled($0) }
+                if !installablePresets.isEmpty {
+                    Section {
+                        ForEach(installablePresets) { preset in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Label(preset.name, systemImage: preset.icon)
+                                        .font(.headline)
+                                    Spacer()
+                                    Button {
+                                        installBundledPreset(preset)
+                                    } label: {
+                                        Text("Install & Assign")
+                                            .font(.subheadline.bold())
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 4)
+                                            .background(Color.blue.opacity(0.15))
+                                            .foregroundColor(.blue)
+                                            .cornerRadius(8)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
+                                Text(preset.description)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
-                            Text(preset.description)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            .padding(.vertical, 4)
                         }
-                        .padding(.vertical, 4)
+                    } header: {
+                        Text("Available Game Tweaks")
+                    } footer: {
+                        Text("Installed game tweaks are updated in place and appear once in the folder list below.")
                     }
-                } header: {
-                    Text("Bundled Game Tweaks")
-                } footer: {
-                    Text("Installing a bundled tweak creates its app folder, patches RPATH, and automatically assigns the folder to matching installed guest apps. Relaunch the game after installing.")
                 }
             }
 

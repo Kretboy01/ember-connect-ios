@@ -27,7 +27,6 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
-#import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import "../Shared/EmberMenu.h"
 
@@ -37,24 +36,12 @@
 #define GOI_RVA_TIME_SET_TIMESCALE        0x11954FCUL
 #define GOI_RVA_TIME_SET_FIXEDDELTATIME   0x119542CUL
 #define GOI_RVA_PHYSICS2D_SET_GRAVITY_INJ 0x11BED18UL
-#define GOI_RVA_PLAYERCONTROL_UPDATE       0xE048E0UL
-#define GOI_RVA_PLAYER_SET_SENSITIVITY     0xE045A0UL
-#define GOI_RVA_PLAYER_PAUSE_INPUT         0xE045A8UL
-#define GOI_RVA_PLAYER_HAMMER_RETURN       0xE04784UL
-#define GOI_RVA_PLAYER_SET_HIGH_CURVE      0xE03C50UL
-#define GOI_RVA_PLAYER_SET_STANDARD_CURVE  0xE038B0UL
-#define GOI_RVA_PLAYER_SET_LOW_CURVE       0xE03FF0UL
-#define GOI_RVA_PLAYER_SET_NO_CURVE        0xE04380UL
-#define GOI_RVA_BEHAVIOUR_SET_ENABLED      0x1165048UL
 #define GOI_GRAVITY_BASE_Y                (-9.81f)
 #define GOI_BASE_FIXED_DELTA              0.02f
 
 static void *g_image_base = NULL;
 static BOOL g_binary_verified = NO;
 static CFAbsoluteTime g_loadTime = 0;
-static void *g_player_control = NULL;
-static BOOL g_player_hook_installed = NO;
-static void (*g_player_update_original)(void *self, void *methodInfo) = NULL;
 
 /// The engine must be fully initialized before our direct calls are safe —
 /// an early auto-applied call crashed the process (verified on-device).
@@ -108,9 +95,7 @@ static void EmberGoiLog(NSString *fmt, ...) {
 @property (nonatomic, strong) EmberMenuPanel *panel;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 @property (nonatomic, assign) BOOL appliedOnce;
-@property (nonatomic, assign) CGFloat sensitivity;
 @property (nonatomic, assign) BOOL paused;
-@property (nonatomic, assign) BOOL hammerCollisionEnabled;
 + (instancetype)sharedController;
 - (void)start;
 - (void)stop;
@@ -251,25 +236,6 @@ static void toast_goi(NSString *message) {
 
 #pragma mark - Runtime + direct calls
 
-static void EmberGoiPlayerUpdateHook(void *self, void *methodInfo) {
-    if (self) g_player_control = self;
-    if (g_player_update_original) g_player_update_original(self, methodInfo);
-}
-
-static void EmberGoiInstallPlayerHook(void) {
-    if (g_player_hook_installed || !g_image_base) return;
-    typedef void (*MSHookFunctionType)(void *symbol, void *replace, void **result);
-    MSHookFunctionType hook = (MSHookFunctionType)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (!hook) {
-        EmberGoiLog(@"MSHookFunction unavailable; instance tools disabled");
-        return;
-    }
-    void *target = (char *)g_image_base + GOI_RVA_PLAYERCONTROL_UPDATE;
-    hook(target, (void *)&EmberGoiPlayerUpdateHook, (void **)&g_player_update_original);
-    g_player_hook_installed = YES;
-    EmberGoiLog(@"PlayerControl.Update hook installed at %p", target);
-}
-
 /// Verifies the Getting Over It binary is loaded and records its load
 /// address. In a LiveContainer guest the game binary is loaded as a dynamic
 /// image (image 0 is the host's LiveContainer executable!), so we must scan
@@ -277,10 +243,7 @@ static void EmberGoiInstallPlayerHook(void) {
 /// vmaddr (0x100000000), and _dyld_get_image_header(i) is exactly
 /// slide + vmaddr, so target = header + RVA.
 static BOOL EmberGoiEnsureRuntime(void) {
-    if (g_image_base) {
-        EmberGoiInstallPlayerHook();
-        return YES;
-    }
+    if (g_image_base) return YES;
 
     static BOOL loggedFailure = NO;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -291,7 +254,6 @@ static BOOL EmberGoiEnsureRuntime(void) {
             g_image_base = (void *)_dyld_get_image_header(i);
             EmberGoiLog(@"guest binary found (image %u) at %p, slide=%lld",
                         i, g_image_base, (long long)_dyld_get_image_vmaddr_slide(i));
-            EmberGoiInstallPlayerHook();
             return YES;
         }
     }
@@ -315,38 +277,6 @@ static void EmberGoiApplyTimeScale(CGFloat factor) {
     float fixedDelta = GOI_BASE_FIXED_DELTA * MAX(clamped, 0.01f);
     setFixed(fixedDelta, NULL);
     EmberGoiLog(@"timeScale -> %.2f (fixedDeltaTime %.4f)", clamped, fixedDelta);
-}
-
-static BOOL EmberGoiPlayerReady(void) {
-    EmberGoiEnsureRuntime();
-    return g_player_control != NULL;
-}
-
-static void EmberGoiPlayerCallVoid(uintptr_t rva) {
-    if (!EmberGoiPlayerReady()) return;
-    ((void (*)(void *, void *))((char *)g_image_base + rva))(g_player_control, NULL);
-}
-
-static void EmberGoiSetSensitivity(float value) {
-    if (!EmberGoiPlayerReady()) return;
-    ((void (*)(void *, float, void *))((char *)g_image_base + GOI_RVA_PLAYER_SET_SENSITIVITY))
-        (g_player_control, value, NULL);
-    EmberGoiLog(@"sensitivity -> %.2f", value);
-}
-
-static void EmberGoiPauseInput(float seconds) {
-    if (!EmberGoiPlayerReady()) return;
-    ((void (*)(void *, float, void *))((char *)g_image_base + GOI_RVA_PLAYER_PAUSE_INPUT))
-        (g_player_control, seconds, NULL);
-}
-
-static void EmberGoiSetHammerCollision(BOOL enabled) {
-    if (!EmberGoiPlayerReady()) return;
-    void *hammerCollider = *(void **)((char *)g_player_control + 0xB8);
-    if (!hammerCollider) return;
-    ((void (*)(void *, BOOL, void *))((char *)g_image_base + GOI_RVA_BEHAVIOUR_SET_ENABLED))
-        (hammerCollider, enabled, NULL);
-    EmberGoiLog(@"hammer collision -> %@", enabled ? @"on" : @"off");
 }
 
 static void EmberGoiApplyGravity(CGFloat factor) {
@@ -377,8 +307,6 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     if (self) {
         _speedFactor = 1.0;
         _gravityFactor = 1.0;
-        _sensitivity = 1.0;
-        _hammerCollisionEnabled = YES;
     }
     return self;
 }
@@ -458,8 +386,6 @@ static void EmberGoiLogWindowInventory(void) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults setDouble:self.speedFactor forKey:@"EmberGOI.speedFactor"];
     [defaults setDouble:self.gravityFactor forKey:@"EmberGOI.gravityFactor"];
-    [defaults setDouble:self.sensitivity forKey:@"EmberGOI.sensitivity"];
-    [defaults setBool:self.hammerCollisionEnabled forKey:@"EmberGOI.hammerCollisionEnabled"];
     [defaults setDouble:self.button.center.x forKey:@"EmberGOI.buttonX"];
     [defaults setDouble:self.button.center.y forKey:@"EmberGOI.buttonY"];
 }
@@ -468,14 +394,9 @@ static void EmberGoiLogWindowInventory(void) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     double speed = [defaults doubleForKey:@"EmberGOI.speedFactor"];
     double gravity = [defaults doubleForKey:@"EmberGOI.gravityFactor"];
-    double sensitivity = [defaults doubleForKey:@"EmberGOI.sensitivity"];
     if (speed > 0.04 && speed <= 4.0) self.speedFactor = speed;
     if (gravity >= -3.0 && gravity <= 3.0 && [defaults objectForKey:@"EmberGOI.gravityFactor"]) {
         self.gravityFactor = gravity;
-    }
-    if (sensitivity >= 0.1 && sensitivity <= 4.0) self.sensitivity = sensitivity;
-    if ([defaults objectForKey:@"EmberGOI.hammerCollisionEnabled"]) {
-        self.hammerCollisionEnabled = [defaults boolForKey:@"EmberGOI.hammerCollisionEnabled"];
     }
 }
 
@@ -594,10 +515,8 @@ static void EmberGoiLogWindowInventory(void) {
     if (!panel) return;
     [panel clearRows];
     BOOL runtimeReady = EmberGoiReadyToApply();
-    BOOL playerReady = EmberGoiPlayerReady();
-    [panel setStatus:[NSString stringWithFormat:@"RUNTIME %@  |  PLAYER %@  |  %.2fx / %.2xG",
+    [panel setStatus:[NSString stringWithFormat:@"RUNTIME %@  |  SAFE MODE  |  %.2fx / %.2xG",
                       runtimeReady ? @"ONLINE" : @"WAITING",
-                      playerReady ? @"CAPTURED" : @"WAITING",
                       self.paused ? 0.0 : self.speedFactor,
                       self.gravityFactor]];
 
@@ -634,31 +553,6 @@ static void EmberGoiLogWindowInventory(void) {
             });
         }];
     } else if (tab == 1) {
-        [panel addSection:@"HAMMER CONTROL"];
-        [panel addSlider:@"INPUT SENSITIVITY" value:(float)self.sensitivity min:0.2f max:3.0f format:@"%.2fx" handler:^(float value) {
-            if (!EmberGoiPlayerReady()) return;
-            weakSelf.sensitivity = value;
-            [weakSelf saveSettings];
-            EmberGoiSetSensitivity(value);
-        }];
-        [panel addToggle:@"HAMMER COLLISION" detail:@"Off gives a true pass-through practice hammer" enabled:self.hammerCollisionEnabled handler:^(BOOL enabled) {
-            if (!EmberGoiPlayerReady()) return;
-            weakSelf.hammerCollisionEnabled = enabled;
-            [weakSelf saveSettings];
-            EmberGoiSetHammerCollision(enabled);
-        }];
-        [panel addAction:@"RETURN HAMMER" detail:@"Calls PlayerControl.HammerReturn" handler:^{
-            EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_HAMMER_RETURN);
-        }];
-        [panel addAction:@"PAUSE INPUT FOR 3 SECONDS" detail:@"World continues while hammer input is frozen" handler:^{
-            EmberGoiPauseInput(3.0f);
-        }];
-        [panel addSection:@"RESPONSE CURVES"];
-        [panel addAction:@"HIGH ACCELERATION" detail:nil handler:^{ EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_SET_HIGH_CURVE); }];
-        [panel addAction:@"STANDARD" detail:nil handler:^{ EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_SET_STANDARD_CURVE); }];
-        [panel addAction:@"LOW ACCELERATION" detail:nil handler:^{ EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_SET_LOW_CURVE); }];
-        [panel addAction:@"RAW / NO CURVE" detail:nil handler:^{ EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_SET_NO_CURVE); }];
-    } else if (tab == 2) {
         [panel addSection:@"PRACTICE PROFILES"];
         [panel addAction:@"BULLET TIME" detail:@"0.10x speed · normal gravity" handler:^{ [weakSelf applyProfileSpeed:0.10 gravity:1.0]; }];
         [panel addAction:@"EASY CLIMB" detail:@"0.65x speed · 0.45x gravity" handler:^{ [weakSelf applyProfileSpeed:0.65 gravity:0.45]; }];
@@ -668,23 +562,19 @@ static void EmberGoiLogWindowInventory(void) {
         [panel addAction:@"SPEED RUN" detail:@"1.50x speed · normal gravity" handler:^{ [weakSelf applyProfileSpeed:1.50 gravity:1.0]; }];
     } else {
         [panel addSection:@"SESSION"];
-        [panel addAction:@"RESET EVERYTHING" detail:@"Restores physics, sensitivity, collision, and time" handler:^{
+        [panel addAction:@"RESET EVERYTHING" detail:@"Restores speed, gravity, and time" handler:^{
             weakSelf.speedFactor = 1.0;
             weakSelf.gravityFactor = 1.0;
-            weakSelf.sensitivity = 1.0;
-            weakSelf.hammerCollisionEnabled = YES;
             weakSelf.paused = NO;
             [weakSelf saveSettings];
             [weakSelf applyAll];
-            EmberGoiSetSensitivity(1.0f);
-            EmberGoiSetHammerCollision(YES);
-            [weakSelf renderTab:3];
+            [weakSelf renderTab:2];
         }];
         [panel addAction:@"REAPPLY CURRENT SETTINGS" detail:@"Useful after a scene reload" handler:^{ [weakSelf applyAll]; }];
         [panel addAction:@"WRITE DIAGNOSTIC SNAPSHOT" detail:@"Documents/EmberConnect/GettingOverIt-diag.log" handler:^{
-            EmberGoiLog(@"snapshot: runtime=%d player=%p speed=%.2f gravity=%.2f sensitivity=%.2f collision=%d",
-                        g_image_base != NULL, g_player_control, weakSelf.speedFactor,
-                        weakSelf.gravityFactor, weakSelf.sensitivity, weakSelf.hammerCollisionEnabled);
+            EmberGoiLog(@"snapshot: runtime=%d safeMode=1 speed=%.2f gravity=%.2f paused=%d",
+                        g_image_base != NULL, weakSelf.speedFactor,
+                        weakSelf.gravityFactor, weakSelf.paused);
         }];
     }
 }
@@ -697,7 +587,7 @@ static void EmberGoiLogWindowInventory(void) {
                                                       accentColor:[UIColor colorWithRed:1.0 green:0.48 blue:0.12 alpha:1.0]];
     __weak typeof(self) weakSelf = self;
     panel.onClose = ^{ [weakSelf closePanel]; };
-    [panel setTabs:@[@"Movement", @"Hammer", @"Practice", @"System"] activeTab:0 handler:^(NSInteger index) {
+    [panel setTabs:@[@"Movement", @"Practice", @"System"] activeTab:0 handler:^(NSInteger index) {
         [weakSelf renderTab:index];
     }];
     self.panel = panel;

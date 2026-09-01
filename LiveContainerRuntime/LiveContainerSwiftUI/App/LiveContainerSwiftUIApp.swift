@@ -71,6 +71,18 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
             
             // load tweak folders
             try fm.createDirectory(at: LCPath.tweakPath, withIntermediateDirectories: true)
+
+            // GOI has one canonical identity. Older Ember builds created these
+            // differently named folders, which made one game appear multiple
+            // times in Tweaks and could leave an obsolete dylib assigned. The
+            // bundled canonical copy below is always replaced in place.
+            let legacyGOIFolders = ["Getting Over It", "Getting Over It.disabled"]
+            for legacyName in legacyGOIFolders {
+                let legacyURL = LCPath.tweakPath.appendingPathComponent(legacyName)
+                if fm.fileExists(atPath: legacyURL.path) {
+                    try? fm.removeItem(at: legacyURL)
+                }
+            }
             
             // Auto-deploy bundled game tweaks to the exact folders and filenames
             // assigned to their guests. The resource name inside EmberTweaks can
@@ -115,7 +127,10 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                         let bId = app.bundleIdentifier.lowercased()
                         let dName = app.displayName.lowercased()
                         if tweak.bundleIds.contains(bId) || tweak.keywords.contains(where: { bId.contains($0) || dName.contains($0) }) {
-                            if app.appInfo.tweakFolder == nil || app.appInfo.tweakFolder?.isEmpty == true {
+                            let assignedFolder = app.appInfo.tweakFolder ?? ""
+                            let isLegacyGOIAssignment = tweak.resource == "GettingOverIt"
+                                && legacyGOIFolders.contains(assignedFolder)
+                            if assignedFolder.isEmpty || isLegacyGOIAssignment {
                                 app.appInfo.tweakFolder = tweak.folder
                             }
                         }
