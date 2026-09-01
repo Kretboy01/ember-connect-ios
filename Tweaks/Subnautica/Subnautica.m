@@ -104,9 +104,12 @@ static void EmberSnLog(NSString *fmt, ...) {
     }
 }
 
+@class EmberSnMenuPanel;
+
 @interface EmberSnController : NSObject
 @property (nonatomic, strong) UIButton *button;
 @property (nonatomic, strong) UIWindow *hostWindow;
+@property (nonatomic, strong) EmberSnMenuPanel *panel;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 + (instancetype)sharedController;
 - (void)start;
@@ -320,6 +323,115 @@ static BOOL EmberSnSendCommand(NSString *command) {
     return exception == NULL;
 }
 
+#pragma mark - Custom menu panel (same as GOI)
+
+@interface EmberSnMenuPanel : UIView
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *subtitleLabel;
+@property (nonatomic, strong) UIStackView *rows;
+@property (nonatomic, assign) NSUInteger rowCount;
+@property (nonatomic, copy) void (^onClose)(void);
+@end
+
+@implementation EmberSnMenuPanel
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithWhite:0.04 alpha:0.96];
+        self.layer.cornerRadius = 14;
+        self.layer.borderWidth = 1;
+        self.layer.borderColor = [UIColor colorWithRed:0.2 green:0.75 blue:0.85 alpha:0.35].CGColor;
+        self.layer.shadowColor = UIColor.blackColor.CGColor;
+        self.layer.shadowOpacity = 0.5;
+        self.layer.shadowRadius = 10;
+
+        self.titleLabel = [UILabel new];
+        self.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
+        self.titleLabel.textColor = UIColor.whiteColor;
+        self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:self.titleLabel];
+
+        self.subtitleLabel = [UILabel new];
+        self.subtitleLabel.font = [UIFont systemFontOfSize:11];
+        self.subtitleLabel.textColor = [UIColor colorWithWhite:1 alpha:0.55];
+        self.subtitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:self.subtitleLabel];
+
+        UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+        close.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
+        [close setTitle:@"✕" forState:UIControlStateNormal];
+        close.tintColor = [UIColor colorWithWhite:1 alpha:0.8];
+        close.translatesAutoresizingMaskIntoConstraints = NO;
+        [close addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:close];
+
+        self.rows = [[UIStackView alloc] init];
+        self.rows.axis = UILayoutConstraintAxisVertical;
+        self.rows.spacing = 6;
+        self.rows.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:self.rows];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [self.titleLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+            [self.titleLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+            [self.subtitleLabel.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:2],
+            [self.subtitleLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+            [close.topAnchor constraintEqualToAnchor:self.topAnchor constant:10],
+            [close.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-10],
+            [close.widthAnchor constraintEqualToConstant:24],
+            [self.rows.topAnchor constraintEqualToAnchor:self.subtitleLabel.bottomAnchor constant:10],
+            [self.rows.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
+            [self.rows.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
+            [self.rows.bottomAnchor constraintLessThanOrEqualToAnchor:self.bottomAnchor constant:-12],
+        ]];
+    }
+    return self;
+}
+
+- (void)closeTapped {
+    if (self.onClose) self.onClose();
+}
+
+- (void)setHeader:(NSString *)title subtitle:(NSString *)subtitle {
+    self.titleLabel.text = title;
+    self.subtitleLabel.text = subtitle;
+}
+
+- (void)addOption:(NSString *)title handler:(void (^)(void))handler {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold];
+    [button setTitle:title forState:UIControlStateNormal];
+    button.tintColor = [UIColor colorWithRed:0.55 green:0.9 blue:1 alpha:1];
+    button.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+    button.layer.cornerRadius = 8;
+    button.contentEdgeInsets = UIEdgeInsetsMake(8, 10, 8, 10);
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    [button.heightAnchor constraintEqualToConstant:36].active = YES;
+    if (handler) {
+        [button addTarget:self action:@selector(optionTapped:) forControlEvents:UIControlEventTouchUpInside];
+        objc_setAssociatedObject(button, "handler", handler, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+    [self.rows addArrangedSubview:button];
+    self.rowCount += 1;
+}
+
+- (void)optionTapped:(UIButton *)sender {
+    void (^handler)(void) = objc_getAssociatedObject(sender, "handler");
+    if (handler) handler();
+}
+
+- (void)finalizeLayout {
+    CGFloat height = 64 + 14 + self.rowCount * 42 + 12;
+    CGFloat width = 300;
+    CGRect frame = self.frame;
+    frame.size = CGSizeMake(width, height);
+    self.frame = frame;
+}
+
+@end
+
 #pragma mark - Controller
 
 @implementation EmberSnController
@@ -427,143 +539,121 @@ static BOOL EmberSnSendCommand(NSString *command) {
     }
 }
 
+- (void)closeSnPanel {
+    [self.panel removeFromSuperview];
+    self.panel = nil;
+}
+
+- (void)showSnPanel:(void (^)(EmberSnMenuPanel *panel))build {
+    UIWindow *host = self.hostWindow ?: UIApplication.sharedApplication.keyWindow;
+    if (!host) return;
+    [self closeSnPanel];
+    EmberSnMenuPanel *panel = [[EmberSnMenuPanel alloc] initWithFrame:CGRectZero];
+    panel.onClose = ^{ [self closeSnPanel]; };
+    build(panel);
+    [panel finalizeLayout];
+    panel.center = CGPointMake(CGRectGetMidX(host.bounds),
+                               CGRectGetMidY(host.bounds));
+    panel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                             UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    [host addSubview:panel];
+    [host bringSubviewToFront:panel];
+    self.panel = panel;
+}
+
 - (void)showMainMenu {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
-
-    NSString *header = g_resolved
-        ? @"Tools run the game's own developer console commands."
-        : @"Waiting for Unity to finish loading. The menu is live but commands only work once the engine is ready.";
-
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Subnautica Tools"
-                                                                  message:header
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
-    void (^send)(NSString *) = ^(NSString *command) {
-        [weakSelf dispatchCommand:command];
-    };
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"Refill Oxygen"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { send(@"oxygen"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Restore Food & Water"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { send(@"survival"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Set Day"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { send(@"day"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Set Night"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { send(@"night"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Cheats & Toggles…"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { [weakSelf showCheatsMenu]; }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Game Speed…"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { [weakSelf showTimeScaleMenu]; }]];
-    // Plain dismiss — re-presenting here created an endless menu loop.
-    [menu addAction:[UIAlertAction actionWithTitle:@"Close"
-                                             style:UIAlertActionStyleCancel
-                                           handler:nil]];
-    menu.popoverPresentationController.sourceView = self.button;
-    menu.popoverPresentationController.sourceRect = self.button.bounds;
-    [presenter presentViewController:menu animated:YES completion:nil];
+    [self showSnPanel:^(EmberSnMenuPanel *panel) {
+        NSString *header = g_resolved
+            ? @"Commands run the game's own developer console."
+            : @"Waiting for Unity to load — commands work once the engine is ready.";
+        [panel setHeader:@"Subnautica Tools" subtitle:header];
+        [panel addOption:@"Refill Oxygen" handler:^{ [weakSelf dispatchCommand:@"oxygen"]; }];
+        [panel addOption:@"Restore Food & Water" handler:^{ [weakSelf dispatchCommand:@"survival"]; }];
+        [panel addOption:@"Set Day" handler:^{ [weakSelf dispatchCommand:@"day"]; }];
+        [panel addOption:@"Set Night" handler:^{ [weakSelf dispatchCommand:@"night"]; }];
+        [panel addOption:@"Cheats & Toggles ▸" handler:^{ [weakSelf showCheatsPanel]; }];
+        [panel addOption:@"Vehicles & Blueprints ▸" handler:^{ [weakSelf showUnlockPanel]; }];
+        [panel addOption:@"Game Speed ▸" handler:^{ [weakSelf showSpeedPanel]; }];
+    }];
 }
 
-- (void)showCheatsMenu {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Cheats (toggle — tap again to undo)"
-                                                                  message:nil
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+- (void)showCheatsPanel {
     __weak typeof(self) weakSelf = self;
-    void (^sendClose)(NSString *) = ^(NSString *command) {
-        [weakSelf dispatchCommand:command];
-    };
-    // Re-present after the current alert finishes dismissing; presenting
-    // during dismissal fails silently in UIKit.
-    void (^backToMain)() = ^() {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showMainMenu]; });
-    };
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"Toggle No Damage"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { sendClose(@"nodamage"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Toggle No Crafting Costs"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { sendClose(@"nocost"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Toggle Fast Growth"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { sendClose(@"fastgrow"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Toggle Fast Scan"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { sendClose(@"fastscan"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Toggle Fast Build"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { sendClose(@"fastbuild"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Toggle Fast Swim"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { sendClose(@"fastswim"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Toggle Invisible (creatures ignore you)"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { sendClose(@"invisible"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Unlock All Blueprints"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { sendClose(@"unlockall"); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Back"
-                                             style:UIAlertActionStyleCancel
-                                           handler:^(UIAlertAction *a) { backToMain(); }]];
-    menu.popoverPresentationController.sourceView = self.button;
-    menu.popoverPresentationController.sourceRect = self.button.bounds;
-    [presenter presentViewController:menu animated:YES completion:nil];
+    [self showSnPanel:^(EmberSnMenuPanel *panel) {
+        [panel setHeader:@"Cheats" subtitle:@"Toggle — tap again to undo"];
+        void (^send)(NSString *) = ^(NSString *command) {
+            [weakSelf dispatchCommand:command];
+        };
+        [panel addOption:@"Toggle No Damage" handler:^{ send(@"nodamage"); }];
+        [panel addOption:@"Toggle No Crafting Costs" handler:^{ send(@"nocost"); }];
+        [panel addOption:@"Toggle Invisible" handler:^{ send(@"invisible"); }];
+        [panel addOption:@"Toggle Fast Growth" handler:^{ send(@"fastgrow"); }];
+        [panel addOption:@"Toggle Fast Scan" handler:^{ send(@"fastscan"); }];
+        [panel addOption:@"Toggle Fast Build" handler:^{ send(@"fastbuild"); }];
+        [panel addOption:@"Toggle Fast Hatching" handler:^{ send(@"fasthatch"); }];
+        [panel addOption:@"Toggle Fast Filtration" handler:^{ send(@"filterfast"); }];
+        [panel addOption:@"Toggle No Radiation" handler:^{ send(@"radiation"); }];
+        [panel addOption:@"Toggle Infection Cure" handler:^{ send(@"playerinfection"); }];
+        [panel addOption:@"Bob the Builder (tools + blueprints)" handler:^{ send(@"bobthebuilder"); }];
+        [panel addOption:@"Creative Mode" handler:^{ send(@"creative"); }];
+        [panel addOption:@"Back to Main ◄" handler:^{ [weakSelf showMainMenu]; }];
+    }];
 }
 
-- (void)showTimeScaleMenu {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter) return;
-    if (!g_set_time_scale_icall) {
-        toast_sn(@"Time scale is not available in this build.");
-        return;
-    }
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Game Speed"
-                                                                  message:nil
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+- (void)showUnlockPanel {
     __weak typeof(self) weakSelf = self;
-    void (^apply)(float) = ^(float scale) {
-        ((void (*)(float))g_set_time_scale_icall)(scale);
-        EmberSnLog(@"timeScale set to %.2f", scale);
-        [weakSelf showTimeScaleMenu];
-    };
-    [menu addAction:[UIAlertAction actionWithTitle:@"0.5x — slow motion"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(0.5f); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"1x — normal"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(1.0f); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"2x — fast"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(2.0f); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"3x — very fast"
-                                             style:UIAlertActionStyleDefault
-                                           handler:^(UIAlertAction *a) { apply(3.0f); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Back"
-                                             style:UIAlertActionStyleCancel
-                                           handler:^(UIAlertAction *a) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [weakSelf showMainMenu]; });
-    }]];
-    menu.popoverPresentationController.sourceView = self.button;
-    menu.popoverPresentationController.sourceRect = self.button.bounds;
-    [presenter presentViewController:menu animated:YES completion:nil];
+    [self showSnPanel:^(EmberSnMenuPanel *panel) {
+        [panel setHeader:@"Vehicles & Blueprints" subtitle:@"One-shot unlocks"];
+        void (^send)(NSString *) = ^(NSString *command) {
+            [weakSelf dispatchCommand:command];
+            [weakSelf closeSnPanel];
+        };
+        [panel addOption:@"Unlock All Blueprints" handler:^{ send(@"unlockall"); }];
+        [panel addOption:@"Unlock Precursor Doors" handler:^{ send(@"unlockdoors"); }];
+        [panel addOption:@"Seamoth Upgrades" handler:^{ send(@"seamothupgrades"); }];
+        [panel addOption:@"Exosuit Arms" handler:^{ send(@"exosuitarms"); }];
+        [panel addOption:@"Exosuit Upgrades" handler:^{ send(@"exosuitupgrades"); }];
+        [panel addOption:@"Cyclops Upgrades" handler:^{ send(@"cyclopsupgrades"); }];
+        [panel addOption:@"Vehicle Upgrades" handler:^{ send(@"vehicleupgrades"); }];
+        [panel addOption:@"Back to Main ◄" handler:^{ [weakSelf showMainMenu]; }];
+    }];
+}
+
+- (void)showSpeedPanel {
+    __weak typeof(self) weakSelf = self;
+    [self showSnPanel:^(EmberSnMenuPanel *panel) {
+        [panel setHeader:@"Game Speed" subtitle:@"Movement speed + engine time scale"];
+        void (^speed)(NSString *) = ^(NSString *command) {
+            [weakSelf dispatchCommand:command];
+            [weakSelf showSpeedPanel];
+        };
+        void (^scale)(float) = ^(float value) {
+            if (g_set_time_scale_icall) {
+                ((void (*)(float))g_set_time_scale_icall)(value);
+                EmberSnLog(@"timeScale set to %.2f", value);
+            }
+            [weakSelf showSpeedPanel];
+        };
+        [panel addOption:@"Swim 1x (normal)" handler:^{ speed(@"speed"); }];
+        [panel addOption:@"Swim 3x" handler:^{ speed(@"speed 3"); }];
+        [panel addOption:@"Swim 5x" handler:^{ speed(@"speed 5"); }];
+        [panel addOption:@"Swim 10x" handler:^{ speed(@"speed 10"); }];
+        [panel addOption:@"Time 0.5x — slow motion" handler:^{ scale(0.5f); }];
+        [panel addOption:@"Time 1x — normal" handler:^{ scale(1.0f); }];
+        [panel addOption:@"Time 2x — fast" handler:^{ scale(2.0f); }];
+        [panel addOption:@"Time 3x — very fast" handler:^{ scale(3.0f); }];
+        [panel addOption:@"Back to Main ◄" handler:^{ [weakSelf showMainMenu]; }];
+    }];
 }
 
 - (void)tapped {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
+    if (self.panel) {
+        [self closeSnPanel];
+        return;
+    }
     [self showMainMenu];
 }
-
 @end
 
 #pragma mark - Bootstrap

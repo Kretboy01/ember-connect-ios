@@ -34,8 +34,10 @@
 
 // Offsets produced by Il2CppDumper (goi-binary + global-metadata.dat v24.1).
 #define GOI_RVA_TIME_SET_TIMESCALE        0x11954FCUL
+#define GOI_RVA_TIME_SET_FIXEDDELTATIME   0x119542CUL
 #define GOI_RVA_PHYSICS2D_SET_GRAVITY_INJ 0x11BED18UL
 #define GOI_GRAVITY_BASE_Y                (-9.81f)
+#define GOI_BASE_FIXED_DELTA              0.02f
 
 static void *g_image_base = NULL;
 static BOOL g_binary_verified = NO;
@@ -50,6 +52,7 @@ static BOOL EmberGoiReadyToApply(void) {
 }
 
 typedef void (*TimeSetTimeScaleFunc)(float value, void *methodInfo);
+typedef void (*TimeSetFixedDeltaTimeFunc)(float value, void *methodInfo);
 typedef void (*Physics2DSetGravityInjectedFunc)(void *gravity, void *methodInfo);
 
 #pragma mark - Diagnostics
@@ -268,7 +271,13 @@ static void EmberGoiApplyTimeScale(CGFloat factor) {
         (TimeSetTimeScaleFunc)((char *)g_image_base + GOI_RVA_TIME_SET_TIMESCALE);
     float clamped = (float)MAX(0.05, MIN(4.0, factor));
     setTimeScale(clamped, NULL);
-    EmberGoiLog(@"timeScale -> %.2f", clamped);
+    // Scale the physics step with the time scale so slow motion stays smooth
+    // instead of stuttering (classic Unity slow-mo trick).
+    TimeSetFixedDeltaTimeFunc setFixed =
+        (TimeSetFixedDeltaTimeFunc)((char *)g_image_base + GOI_RVA_TIME_SET_FIXEDDELTATIME);
+    float fixedDelta = GOI_BASE_FIXED_DELTA * clamped;
+    setFixed(fixedDelta, NULL);
+    EmberGoiLog(@"timeScale -> %.2f (fixedDeltaTime %.4f)", clamped, fixedDelta);
 }
 
 static void EmberGoiApplyGravity(CGFloat factor) {
@@ -539,6 +548,7 @@ static void EmberGoiLogWindowInventory(void) {
             [weakSelf updateButtonTitle];
             [weakSelf closePanel];
         };
+        [panel addOption:@"0.1x — bullet time" handler:^{ apply(0.1); }];
         [panel addOption:@"0.25x — ultra slow" handler:^{ apply(0.25); }];
         [panel addOption:@"0.5x — slow" handler:^{ apply(0.5); }];
         [panel addOption:@"0.65x — easy climb" handler:^{ apply(0.65); }];
