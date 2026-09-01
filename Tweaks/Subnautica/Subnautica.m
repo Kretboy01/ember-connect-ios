@@ -57,6 +57,9 @@ static Il2CppType *(*g_il2cpp_class_get_type)(Il2CppClass *) = NULL;
 static Il2CppObject *(*g_il2cpp_type_get_object)(Il2CppType *) = NULL;
 static int (*g_il2cpp_method_get_flags)(const Il2CppMethod *, uint32_t *) = NULL;
 static Il2CppString *(*g_il2cpp_string_new)(const char *) = NULL;
+static void *(*g_il2cpp_object_unbox)(Il2CppObject *) = NULL;
+static Il2CppClass *(*g_il2cpp_object_get_class)(Il2CppObject *) = NULL;
+static const char *(*g_il2cpp_class_get_name)(Il2CppClass *) = NULL;
 
 typedef void (*UnityPauseFunc)(int);
 static UnityPauseFunc g_unity_pause = NULL;
@@ -68,6 +71,15 @@ static Il2CppClass *g_unity_object_class = NULL;
 static const Il2CppMethod *g_find_objects_of_type_method = NULL;
 static void *g_console_instance = NULL;
 static const void *g_set_time_scale_icall = NULL;
+
+typedef struct { float x, y, z; } EmberSnVector3;
+static Il2CppClass *g_creature_class = NULL;
+static const Il2CppMethod *g_component_get_transform_method = NULL;
+static const Il2CppMethod *g_transform_get_position_method = NULL;
+static const Il2CppMethod *g_camera_get_main_method = NULL;
+static const Il2CppMethod *g_camera_world_to_screen_method = NULL;
+static const Il2CppMethod *g_screen_get_width_method = NULL;
+static const Il2CppMethod *g_screen_get_height_method = NULL;
 
 static BOOL g_resolved = NO;
 static BOOL g_attached = NO;
@@ -110,6 +122,11 @@ static void EmberSnLog(NSString *fmt, ...) {
 @property (nonatomic, strong) UIWindow *hostWindow;
 @property (nonatomic, strong) EmberMenuPanel *panel;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
+@property (nonatomic, strong) UIView *espView;
+@property (nonatomic, assign) BOOL espEnabled;
+@property (nonatomic, assign) BOOL espLeviathansOnly;
+@property (nonatomic, assign) BOOL espShowNames;
+@property (nonatomic, assign) float espMaxDistance;
 + (instancetype)sharedController;
 - (void)start;
 - (void)stop;
@@ -152,6 +169,9 @@ static void EmberSnProbeHandle(void *handle, NSString *label) {
         {"il2cpp_type_get_object", (void **)&g_il2cpp_type_get_object},
         {"il2cpp_method_get_flags", (void **)&g_il2cpp_method_get_flags},
         {"il2cpp_string_new", (void **)&g_il2cpp_string_new},
+        {"il2cpp_object_unbox", (void **)&g_il2cpp_object_unbox},
+        {"il2cpp_object_get_class", (void **)&g_il2cpp_object_get_class},
+        {"il2cpp_class_get_name", (void **)&g_il2cpp_class_get_name},
         {"UnityPause", (void **)&g_unity_pause},
     };
     for (size_t i = 0; i < sizeof(symbols) / sizeof(symbols[0]); i++) {
@@ -232,6 +252,34 @@ static void EmberSnResolveRuntime(void) {
                        g_find_objects_of_type_method ? @"yes" : @"no");
         }
     }
+
+    // Hook-free ESP surface: enumerate Creature components and project their
+    // Transform positions through Camera.main. All calls go through managed
+    // reflection/runtime_invoke, so no executable code is patched.
+    g_creature_class = g_il2cpp_class_from_name(gameImage, "", "Creature");
+    if (unityImage) {
+        Il2CppClass *componentClass = g_il2cpp_class_from_name(unityImage, "UnityEngine", "Component");
+        Il2CppClass *transformClass = g_il2cpp_class_from_name(unityImage, "UnityEngine", "Transform");
+        Il2CppClass *cameraClass = g_il2cpp_class_from_name(unityImage, "UnityEngine", "Camera");
+        Il2CppClass *screenClass = g_il2cpp_class_from_name(unityImage, "UnityEngine", "Screen");
+        if (componentClass) g_component_get_transform_method =
+            g_il2cpp_class_get_method_from_name(componentClass, "get_transform", 0);
+        if (transformClass) g_transform_get_position_method =
+            g_il2cpp_class_get_method_from_name(transformClass, "get_position", 0);
+        if (cameraClass) {
+            g_camera_get_main_method = g_il2cpp_class_get_method_from_name(cameraClass, "get_main", 0);
+            g_camera_world_to_screen_method =
+                g_il2cpp_class_get_method_from_name(cameraClass, "WorldToScreenPoint", 1);
+        }
+        if (screenClass) {
+            g_screen_get_width_method = g_il2cpp_class_get_method_from_name(screenClass, "get_width", 0);
+            g_screen_get_height_method = g_il2cpp_class_get_method_from_name(screenClass, "get_height", 0);
+        }
+    }
+    EmberSnLog(@"ESP reflection creature=%p transform=%p position=%p camera=%p project=%p screen=%p/%p",
+               g_creature_class, g_component_get_transform_method, g_transform_get_position_method,
+               g_camera_get_main_method, g_camera_world_to_screen_method,
+               g_screen_get_width_method, g_screen_get_height_method);
 
     Il2CppClass *consoleClass = g_il2cpp_class_from_name(gameImage, "", "DevConsole");
     if (!consoleClass) {
@@ -431,6 +479,84 @@ static BOOL EmberSnSendCommand(NSString *command) {
 
 @end
 
+#pragma mark - Entity ESP overlay
+
+@interface EmberSnESPView : UIView
+@property (nonatomic, copy) NSArray<NSDictionary *> *markers;
+@end
+
+@implementation EmberSnESPView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = UIColor.clearColor;
+        self.opaque = NO;
+        self.userInteractionEnabled = NO;
+        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    }
+    return self;
+}
+
+- (void)drawRect:(CGRect)rect {
+    CGContextRef context = UIGraphicsGetCurrentContext();
+    if (!context) return;
+    CGContextSetLineWidth(context, 1.5);
+    for (NSDictionary *marker in self.markers ?: @[]) {
+        CGRect box = [marker[@"rect"] CGRectValue];
+        BOOL leviathan = [marker[@"leviathan"] boolValue];
+        UIColor *color = leviathan
+            ? [UIColor colorWithRed:1.0 green:0.20 blue:0.16 alpha:0.95]
+            : [UIColor colorWithRed:0.15 green:0.88 blue:1.0 alpha:0.90];
+        CGContextSetStrokeColorWithColor(context, color.CGColor);
+        CGContextStrokeRect(context, box);
+
+        NSString *label = marker[@"label"];
+        if (label.length > 0) {
+            NSDictionary *attributes = @{
+                NSFontAttributeName: [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightBold],
+                NSForegroundColorAttributeName: color,
+                NSStrokeColorAttributeName: UIColor.blackColor,
+                NSStrokeWidthAttributeName: @(-2.0)
+            };
+            [label drawAtPoint:CGPointMake(CGRectGetMinX(box), MAX(0, CGRectGetMinY(box) - 13))
+                withAttributes:attributes];
+        }
+    }
+}
+
+@end
+
+static Il2CppObject *EmberSnInvoke(const Il2CppMethod *method, void *instance, void **args) {
+    if (!method || !g_il2cpp_runtime_invoke) return NULL;
+    Il2CppException *exception = NULL;
+    Il2CppObject *result = g_il2cpp_runtime_invoke(method, instance, args, &exception);
+    return exception ? NULL : result;
+}
+
+static BOOL EmberSnUnboxVector3(Il2CppObject *boxed, EmberSnVector3 *value) {
+    if (!boxed || !value || !g_il2cpp_object_unbox) return NO;
+    void *payload = g_il2cpp_object_unbox(boxed);
+    if (!payload) return NO;
+    memcpy(value, payload, sizeof(*value));
+    return YES;
+}
+
+static int EmberSnUnboxInt(Il2CppObject *boxed) {
+    if (!boxed || !g_il2cpp_object_unbox) return 0;
+    int *payload = (int *)g_il2cpp_object_unbox(boxed);
+    return payload ? *payload : 0;
+}
+
+static BOOL EmberSnIsLeviathanName(NSString *className) {
+    NSString *name = className.lowercaseString;
+    return [name containsString:@"leviathan"] ||
+           [name containsString:@"reaper"] ||
+           [name containsString:@"seadragon"] ||
+           [name containsString:@"seatreader"] ||
+           [name containsString:@"emperor"];
+}
+
 #pragma mark - Controller
 
 @implementation EmberSnController
@@ -438,7 +564,16 @@ static BOOL EmberSnSendCommand(NSString *command) {
 + (instancetype)sharedController {
     static EmberSnController *controller = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ controller = [[EmberSnController alloc] init]; });
+    dispatch_once(&once, ^{
+        controller = [[EmberSnController alloc] init];
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        controller.espEnabled = [defaults boolForKey:@"EmberSubnautica.espEnabled"];
+        controller.espLeviathansOnly = [defaults boolForKey:@"EmberSubnautica.espLeviathansOnly"];
+        controller.espShowNames = [defaults objectForKey:@"EmberSubnautica.espShowNames"]
+            ? [defaults boolForKey:@"EmberSubnautica.espShowNames"] : YES;
+        float savedRange = [defaults floatForKey:@"EmberSubnautica.espMaxDistance"];
+        controller.espMaxDistance = savedRange >= 50.0f ? savedRange : 300.0f;
+    });
     return controller;
 }
 
@@ -456,6 +591,10 @@ static BOOL EmberSnSendCommand(NSString *command) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults setDouble:self.button.center.x forKey:@"EmberSubnautica.buttonX"];
     [defaults setDouble:self.button.center.y forKey:@"EmberSubnautica.buttonY"];
+    [defaults setBool:self.espEnabled forKey:@"EmberSubnautica.espEnabled"];
+    [defaults setBool:self.espLeviathansOnly forKey:@"EmberSubnautica.espLeviathansOnly"];
+    [defaults setBool:self.espShowNames forKey:@"EmberSubnautica.espShowNames"];
+    [defaults setFloat:self.espMaxDistance forKey:@"EmberSubnautica.espMaxDistance"];
 }
 
 - (void)updateButtonTitle {
@@ -476,13 +615,105 @@ static BOOL EmberSnSendCommand(NSString *command) {
     }
 }
 
+- (void)updateESP {
+    EmberSnESPView *overlay = (EmberSnESPView *)self.espView;
+    if (!self.espEnabled || !overlay || !g_resolved || !g_creature_class ||
+        !g_find_objects_of_type_method || !g_il2cpp_class_get_type ||
+        !g_il2cpp_type_get_object || !g_component_get_transform_method ||
+        !g_transform_get_position_method || !g_camera_get_main_method ||
+        !g_camera_world_to_screen_method || !g_screen_get_width_method ||
+        !g_screen_get_height_method) {
+        overlay.markers = @[];
+        [overlay setNeedsDisplay];
+        return;
+    }
+
+    Il2CppObject *camera = EmberSnInvoke(g_camera_get_main_method, NULL, NULL);
+    int screenWidth = EmberSnUnboxInt(EmberSnInvoke(g_screen_get_width_method, NULL, NULL));
+    int screenHeight = EmberSnUnboxInt(EmberSnInvoke(g_screen_get_height_method, NULL, NULL));
+    if (!camera || screenWidth <= 0 || screenHeight <= 0) return;
+
+    void *creatureType = g_il2cpp_type_get_object(g_il2cpp_class_get_type(g_creature_class));
+    void *findArgs[1] = { creatureType };
+    Il2CppObject *array = EmberSnInvoke(g_find_objects_of_type_method, NULL, findArgs);
+    if (!array) return;
+    uintptr_t count = *(uintptr_t *)((char *)array + 0x18);
+    NSMutableArray<NSDictionary *> *markers = [NSMutableArray arrayWithCapacity:MIN(count, (uintptr_t)80)];
+    CGRect bounds = overlay.bounds;
+
+    for (uintptr_t i = 0; i < count && markers.count < 80; i++) {
+        Il2CppObject *creature = *(Il2CppObject **)((char *)array + 0x20 + i * sizeof(void *));
+        if (!creature) continue;
+
+        NSString *className = @"Creature";
+        if (g_il2cpp_object_get_class && g_il2cpp_class_get_name) {
+            Il2CppClass *klass = g_il2cpp_object_get_class(creature);
+            const char *rawName = klass ? g_il2cpp_class_get_name(klass) : NULL;
+            if (rawName) className = [NSString stringWithUTF8String:rawName] ?: @"Creature";
+        }
+        BOOL leviathan = EmberSnIsLeviathanName(className);
+        if (self.espLeviathansOnly && !leviathan) continue;
+
+        Il2CppObject *transform = EmberSnInvoke(g_component_get_transform_method, creature, NULL);
+        EmberSnVector3 world = {0};
+        if (!transform || !EmberSnUnboxVector3(
+                EmberSnInvoke(g_transform_get_position_method, transform, NULL), &world)) continue;
+
+        void *projectArgs[1] = { &world };
+        EmberSnVector3 screen = {0};
+        if (!EmberSnUnboxVector3(
+                EmberSnInvoke(g_camera_world_to_screen_method, camera, projectArgs), &screen)) continue;
+        if (screen.z <= 0.1f || screen.z > self.espMaxDistance) continue;
+
+        CGFloat x = (screen.x / (CGFloat)screenWidth) * CGRectGetWidth(bounds);
+        CGFloat y = CGRectGetHeight(bounds) -
+                    (screen.y / (CGFloat)screenHeight) * CGRectGetHeight(bounds);
+        if (x < -40 || x > CGRectGetWidth(bounds) + 40 ||
+            y < -40 || y > CGRectGetHeight(bounds) + 40) continue;
+
+        CGFloat scale = 15.0 / MAX(screen.z, 5.0f);
+        CGFloat width = leviathan ? 220.0 * scale : 80.0 * scale;
+        width = MAX(leviathan ? 28.0 : 14.0, MIN(leviathan ? 190.0 : 72.0, width));
+        CGFloat height = width * (leviathan ? 0.62 : 0.82);
+        CGRect box = CGRectMake(x - width * 0.5, y - height * 0.5, width, height);
+        NSString *label = self.espShowNames
+            ? [NSString stringWithFormat:@"%@  %.0fm", className, screen.z]
+            : @"";
+        [markers addObject:@{
+            @"rect": [NSValue valueWithCGRect:box],
+            @"leviathan": @(leviathan),
+            @"label": label
+        }];
+    }
+
+    overlay.markers = markers;
+    [overlay setNeedsDisplay];
+}
+
 - (void)install {
     UIWindow *host = UIApplication.sharedApplication.keyWindow;
     if (!host) return;
-    if (self.button.superview == host) return;
     if (self.hostWindow && self.hostWindow != host) {
         [self.button removeFromSuperview];
+        [self.espView removeFromSuperview];
         self.button = nil;
+        self.espView = nil;
+    }
+
+    if (self.espEnabled && self.espView.superview != host) {
+        EmberSnESPView *overlay = [[EmberSnESPView alloc] initWithFrame:host.bounds];
+        [host addSubview:overlay];
+        self.espView = overlay;
+    } else if (!self.espEnabled && self.espView) {
+        [self.espView removeFromSuperview];
+        self.espView = nil;
+    }
+
+    if (self.button.superview == host) {
+        if (self.espView) [host bringSubviewToFront:self.espView];
+        [host bringSubviewToFront:self.button];
+        if (self.panel) [host bringSubviewToFront:self.panel];
+        return;
     }
 
     UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -508,6 +739,7 @@ static BOOL EmberSnSendCommand(NSString *command) {
     [button addGestureRecognizer:pan];
 
     [host addSubview:button];
+    if (self.espView) [host bringSubviewToFront:self.espView];
     [host bringSubviewToFront:button];
     self.button = button;
     self.hostWindow = host;
@@ -523,6 +755,7 @@ static BOOL EmberSnSendCommand(NSString *command) {
                                                             block:^(NSTimer *timer) {
         [weakSelf install];
         EmberSnResolveRuntime();
+        [weakSelf updateESP];
         [weakSelf updateButtonTitle];
     }];
 }
@@ -584,6 +817,33 @@ static BOOL EmberSnSendCommand(NSString *command) {
         [panel addAction:@"PRAWN UPGRADES" detail:nil handler:^{ send(@"exosuitupgrades"); }];
         [panel addAction:@"CYCLOPS UPGRADES" detail:nil handler:^{ send(@"cyclopsupgrades"); }];
         [panel addAction:@"ALL VEHICLE UPGRADES" detail:nil handler:^{ send(@"vehicleupgrades"); }];
+    } else if (tab == 3) {
+        [panel addSection:@"ENTITY BOX ESP"];
+        [panel addToggle:@"ENABLE ESP" detail:@"Cyan fish boxes; red leviathan boxes" enabled:self.espEnabled handler:^(BOOL enabled) {
+            weakSelf.espEnabled = enabled;
+            [weakSelf saveSettings];
+            [weakSelf install];
+            [weakSelf updateESP];
+        }];
+        [panel addToggle:@"LEVIATHANS ONLY" detail:@"Hide ordinary fish and predators" enabled:self.espLeviathansOnly handler:^(BOOL enabled) {
+            weakSelf.espLeviathansOnly = enabled;
+            [weakSelf saveSettings];
+            [weakSelf updateESP];
+        }];
+        [panel addToggle:@"SHOW TYPE + DISTANCE" detail:@"Labels use each creature's runtime class" enabled:self.espShowNames handler:^(BOOL enabled) {
+            weakSelf.espShowNames = enabled;
+            [weakSelf saveSettings];
+            [weakSelf updateESP];
+        }];
+        [panel addSlider:@"MAX RANGE" value:self.espMaxDistance min:50.0f max:600.0f format:@"%.0fm" handler:^(float value) {
+            weakSelf.espMaxDistance = value;
+            [weakSelf saveSettings];
+            [weakSelf updateESP];
+        }];
+        [panel addSection:@"IMPLEMENTATION"];
+        [panel addAction:@"REFRESH ENTITIES" detail:@"Re-enumerate active Creature components now" handler:^{
+            [weakSelf updateESP];
+        }];
     } else {
         [panel addSection:@"WORLD TIME SCALE"];
         [panel addSlider:@"TIME SCALE" value:1.0f min:0.1f max:3.0f format:@"%.2fx" handler:^(float value) {
@@ -608,7 +868,7 @@ static BOOL EmberSnSendCommand(NSString *command) {
                                                       accentColor:[UIColor colorWithRed:0.10 green:0.78 blue:0.92 alpha:1.0]];
     __weak typeof(self) weakSelf = self;
     panel.onClose = ^{ [weakSelf closeSnPanel]; };
-    [panel setTabs:@[@"Survival", @"Cheats", @"Build", @"Speed"] activeTab:0 handler:^(NSInteger index) {
+    [panel setTabs:@[@"Survival", @"Cheats", @"Build", @"ESP", @"Speed"] activeTab:0 handler:^(NSInteger index) {
         [weakSelf renderSnTab:index];
     }];
     self.panel = panel;

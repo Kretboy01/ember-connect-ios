@@ -8,6 +8,7 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <mach-o/dyld.h>
+#import <dlfcn.h>
 #import "../Shared/EmberMenu.h"
 
 #define EMBER_CLOVER_BUTTON_TAG                  0xC10E4
@@ -24,9 +25,18 @@
 #define CLOVER_RVA_TIME_SET_TIMESCALE             0x4A791A0UL
 
 static void *g_clover_image = NULL;
+static void *g_clover_handle = NULL;
 static CFAbsoluteTime g_clover_load_time = 0;
 static NSMutableString *g_clover_log = nil;
 static NSString *g_clover_log_path = nil;
+static void *g_slot_machine = NULL;
+
+typedef void *(*Il2CppDomainGetFunc)(void);
+typedef const void **(*Il2CppDomainGetAssembliesFunc)(const void *domain, size_t *size);
+typedef const void *(*Il2CppAssemblyGetImageFunc)(const void *assembly);
+typedef void *(*Il2CppClassFromNameFunc)(const void *image, const char *namespaze, const char *name);
+typedef void *(*Il2CppClassGetFieldFromNameFunc)(void *klass, const char *name);
+typedef void (*Il2CppFieldStaticGetValueFunc)(void *field, void *value);
 
 static void CloverLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 static void CloverLog(NSString *fmt, ...) {
@@ -58,6 +68,7 @@ static BOOL CloverEnsureRuntime(void) {
         if ([path.lastPathComponent isEqualToString:@"UnityFramework"] &&
             [path.lowercaseString containsString:@"cloverpit"]) {
             g_clover_image = (void *)_dyld_get_image_header(i);
+            g_clover_handle = dlopen(name, RTLD_LAZY | RTLD_NOLOAD);
             CloverLog(@"UnityFramework found at %p (image %u, slide=%lld)",
                       g_clover_image, i, (long long)_dyld_get_image_vmaddr_slide(i));
             return YES;
@@ -68,6 +79,63 @@ static BOOL CloverEnsureRuntime(void) {
 
 static BOOL CloverReady(void) {
     return CloverEnsureRuntime() && (CACurrentMediaTime() - g_clover_load_time) > 7.0;
+}
+
+static void *CloverResolveExport(const char *name) {
+    void *symbol = dlsym(RTLD_DEFAULT, name);
+    return symbol ?: (g_clover_handle ? dlsym(g_clover_handle, name) : NULL);
+}
+
+// Resolve the live singleton through IL2CPP metadata instead of installing an
+// inline hook. This only reads runtime metadata and the class's static field;
+// no executable page is modified (important under LiveContainer code signing).
+static void *CloverSlotMachineInstance(void) {
+    if (!CloverReady()) return NULL;
+
+    Il2CppDomainGetFunc domainGet = (Il2CppDomainGetFunc)CloverResolveExport("il2cpp_domain_get");
+    Il2CppDomainGetAssembliesFunc assembliesGet =
+        (Il2CppDomainGetAssembliesFunc)CloverResolveExport("il2cpp_domain_get_assemblies");
+    Il2CppAssemblyGetImageFunc imageGet =
+        (Il2CppAssemblyGetImageFunc)CloverResolveExport("il2cpp_assembly_get_image");
+    Il2CppClassFromNameFunc classFromName =
+        (Il2CppClassFromNameFunc)CloverResolveExport("il2cpp_class_from_name");
+    Il2CppClassGetFieldFromNameFunc fieldGet =
+        (Il2CppClassGetFieldFromNameFunc)CloverResolveExport("il2cpp_class_get_field_from_name");
+    Il2CppFieldStaticGetValueFunc staticGet =
+        (Il2CppFieldStaticGetValueFunc)CloverResolveExport("il2cpp_field_static_get_value");
+    if (!domainGet || !assembliesGet || !imageGet || !classFromName || !fieldGet || !staticGet) {
+        CloverLog(@"IL2CPP metadata exports unavailable; reel replacement disabled");
+        return NULL;
+    }
+
+    void *domain = domainGet();
+    size_t count = 0;
+    const void **assemblies = assembliesGet(domain, &count);
+    for (size_t i = 0; assemblies && i < count; i++) {
+        const void *image = imageGet(assemblies[i]);
+        void *klass = image ? classFromName(image, "", "SlotMachineScript") : NULL;
+        if (!klass) continue;
+        void *instanceField = fieldGet(klass, "instance");
+        if (!instanceField) break;
+        staticGet(instanceField, &g_slot_machine);
+        CloverLog(@"SlotMachineScript.instance -> %p", g_slot_machine);
+        break;
+    }
+    return g_slot_machine;
+}
+
+static void CloverReplacementUnavailableNotice(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = UIApplication.sharedApplication.keyWindow;
+        UIViewController *top = window.rootViewController;
+        while (top.presentedViewController) top = top.presentedViewController;
+        if (!top) return;
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Reels not ready"
+                                                                       message:@"Wait until the machine is fully idle, then choose the symbol again."
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [top presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 static void CloverCallInt(uintptr_t rva, int value) {
@@ -86,11 +154,30 @@ static void CloverAddTickets(long long value) {
     CloverLog(@"tickets add -> %lld", value);
 }
 
-static void CloverReplaceSymbols(int kind, int modifier) {
-    if (!CloverReady()) return;
+static BOOL CloverReplaceSymbols(int kind, int modifier) {
+    void *slotMachine = CloverSlotMachineInstance();
+    if (!slotMachine) {
+        CloverLog(@"replace skipped: slot machine instance unavailable");
+        return NO;
+    }
+
+    // SlotMachineScript.State: idle=3, spinning=4. Replacing while a spin is
+    // advancing can invalidate the scoring list, so wait for the same state
+    // the game's own replacement flow expects.
+    int state = *(int *)((char *)slotMachine + 0x1C4);
+    if (state != 3) {
+        CloverLog(@"replace skipped: machine state=%d (idle=3 required)", state);
+        return NO;
+    }
+
+    // Symbol_ReplaceVisible rejects calls while this instance guard is false.
+    // Set the live object's data flag immediately before the legitimate static
+    // replacement method; the game remains free to update it afterward.
+    *(BOOL *)((char *)slotMachine + 0x1E8) = YES;
     ((void (*)(int, int, BOOL, void *))((char *)g_clover_image + CLOVER_RVA_REPLACE_ALL_VISIBLE))
         (kind, modifier, NO, NULL);
-    CloverLog(@"replace visible symbols kind=%d modifier=%d", kind, modifier);
+    CloverLog(@"replace visible symbols kind=%d modifier=%d state=%d legal=1", kind, modifier, state);
+    return YES;
 }
 
 @interface EmberCloverController : NSObject
@@ -142,6 +229,9 @@ static void CloverReplaceSymbols(int kind, int modifier) {
     [panel setStatus:CloverReady() ? @"IL2CPP ONLINE  |  GAMEPLAY DATA READY"
                                   : @"WAITING FOR CLOVER PIT RUNTIME"];
     __weak typeof(self) weakSelf = self;
+    void (^replace)(int, int) = ^(int kind, int modifier) {
+        if (!CloverReplaceSymbols(kind, modifier)) CloverReplacementUnavailableNotice();
+    };
 
     if (tab == 0) {
         [panel addSection:@"SPINS"];
@@ -188,12 +278,12 @@ static void CloverReplaceSymbols(int kind, int modifier) {
         }];
     } else if (tab == 2) {
         [panel addSection:@"VISIBLE REEL OVERRIDE"];
-        [panel addAction:@"ALL SEVENS" detail:@"Replace visible symbols before scoring" handler:^{ CloverReplaceSymbols(6, 0); }];
-        [panel addAction:@"ALL GOLDEN SEVENS" detail:@"Seven symbols with golden modifier" handler:^{ CloverReplaceSymbols(6, 3); }];
-        [panel addAction:@"ALL DIAMONDS" detail:nil handler:^{ CloverReplaceSymbols(4, 0); }];
-        [panel addAction:@"ALL CLOVERS" detail:nil handler:^{ CloverReplaceSymbols(2, 0); }];
-        [panel addAction:@"ALL COINS" detail:nil handler:^{ CloverReplaceSymbols(5, 0); }];
-        [panel addAction:@"ALL TICKET CLOVERS" detail:@"Clover symbols with ticket modifier" handler:^{ CloverReplaceSymbols(2, 2); }];
+        [panel addAction:@"ALL SEVENS" detail:@"Use while the reels are fully idle" handler:^{ replace(6, 0); }];
+        [panel addAction:@"ALL GOLDEN SEVENS" detail:@"Seven symbols with golden modifier" handler:^{ replace(6, 3); }];
+        [panel addAction:@"ALL DIAMONDS" detail:nil handler:^{ replace(4, 0); }];
+        [panel addAction:@"ALL CLOVERS" detail:nil handler:^{ replace(2, 0); }];
+        [panel addAction:@"ALL COINS" detail:nil handler:^{ replace(5, 0); }];
+        [panel addAction:@"ALL TICKET CLOVERS" detail:@"Clover symbols with ticket modifier" handler:^{ replace(2, 2); }];
         [panel addSection:@"DANGER CONTROL"];
         [panel addToggle:@"SUPPRESS 666" detail:@"Continuously books 999 safe spins" enabled:self.suppress666 handler:^(BOOL enabled) {
             weakSelf.suppress666 = enabled;
