@@ -27,6 +27,7 @@ struct LCTweakItem : Hashable {
 struct BundledTweakPreset: Identifiable {
     let id: String
     let name: String
+    let resourceName: String
     let dylibName: String
     let folderName: String
     let targetBundleIdentifiers: [String]
@@ -56,6 +57,7 @@ struct LCTweakFolderView : View {
         BundledTweakPreset(
             id: "eightbp-offline-lines",
             name: "8BP Offline Lines",
+            resourceName: "EightBPOfflineLines",
             dylibName: "EightBPOfflineLines.dylib",
             folderName: "8BP Offline Lines",
             targetBundleIdentifiers: ["com.miniclip.8ballpoolmult"],
@@ -66,6 +68,7 @@ struct LCTweakFolderView : View {
         BundledTweakPreset(
             id: "flappy",
             name: "Flappy Practice",
+            resourceName: "FlappyPractice",
             dylibName: "FlappyPractice.dylib",
             folderName: "Flappy Practice",
             targetBundleIdentifiers: ["org.brandonplank.flappybird"],
@@ -76,12 +79,24 @@ struct LCTweakFolderView : View {
         BundledTweakPreset(
             id: "gettingoverit",
             name: "Getting Over It Tools",
-            dylibName: "GettingOverIt.dylib",
-            folderName: "Getting Over It",
-            targetBundleIdentifiers: ["com.BennettFoddy.GettingOverIt", "com.noodlecake.gettingoverit", "com.noodlecake.gettingoveritios"],
+            resourceName: "GettingOverIt",
+            dylibName: "EmberGOITools.dylib",
+            folderName: "GOI Tools",
+            targetBundleIdentifiers: ["net.Foddy.GettingOverIt", "com.BennettFoddy.GettingOverIt", "com.noodlecake.gettingoverit", "com.noodlecake.gettingoveritios"],
             targetNameKeywords: ["getting over it", "gettingoverit", "bennettfoddy"],
             icon: "figure.climbing",
             description: "Practice tools for Getting Over It: Time.timeScale speed control, Physics2D gravity control, ghost mode, and HUD."
+        ),
+        BundledTweakPreset(
+            id: "subnautica",
+            name: "Subnautica Tools",
+            resourceName: "Subnautica",
+            dylibName: "Subnautica.dylib",
+            folderName: "Subnautica",
+            targetBundleIdentifiers: ["com.UnknownWorlds.Subnautica"],
+            targetNameKeywords: ["subnautica"],
+            icon: "water.waves",
+            description: "Console-backed survival, cheat, vehicle, blueprint, and game-speed controls for Subnautica."
         )
     ]
     
@@ -317,8 +332,7 @@ struct LCTweakFolderView : View {
     }
 
     func installBundledPreset(_ preset: BundledTweakPreset) {
-        let baseDylibName = preset.dylibName.hasSuffix(".dylib") ? String(preset.dylibName.dropLast(6)) : preset.dylibName
-        guard let source = Bundle.main.url(forResource: baseDylibName,
+        guard let source = Bundle.main.url(forResource: preset.resourceName,
                                            withExtension: "dylib",
                                            subdirectory: "EmberTweaks") else {
             errorShow = true

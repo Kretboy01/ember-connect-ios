@@ -72,22 +72,26 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
             // load tweak folders
             try fm.createDirectory(at: LCPath.tweakPath, withIntermediateDirectories: true)
             
-            // Auto-deploy bundled game tweaks (Flappy Practice & Getting Over It) to their app folders
-            let bundledTweaks: [(String, String, [String], [String])] = [
-                ("FlappyPractice", "Flappy Practice", ["org.brandonplank.flappybird"], ["flappy"]),
-                ("GettingOverIt", "Getting Over It", ["com.bennettfoddy.gettingoverit", "com.noodlecake.gettingoverit", "com.noodlecake.gettingoveritios"], ["getting over it", "gettingoverit", "bennettfoddy"])
+            // Auto-deploy bundled game tweaks to the exact folders and filenames
+            // assigned to their guests. The resource name inside EmberTweaks can
+            // differ from the on-disk filename (GOI uses a private folder/name so
+            // older builds cannot overwrite it accidentally).
+            let bundledTweaks: [(resource: String, folder: String, destination: String, bundleIds: [String], keywords: [String])] = [
+                ("FlappyPractice", "Flappy Practice", "FlappyPractice.dylib", ["org.brandonplank.flappybird"], ["flappy"]),
+                ("GettingOverIt", "GOI Tools", "EmberGOITools.dylib", ["net.foddy.gettingoverit", "com.bennettfoddy.gettingoverit", "com.noodlecake.gettingoverit", "com.noodlecake.gettingoveritios"], ["getting over it", "gettingoverit", "bennettfoddy"]),
+                ("Subnautica", "Subnautica", "Subnautica.dylib", ["com.unknownworlds.subnautica"], ["subnautica"])
             ]
-            for (tweakFile, folderName, bundleIds, keywords) in bundledTweaks {
+            for tweak in bundledTweaks {
                 // Remove loose root dylib if it exists from older installs to prevent double injection
-                let globalDest = LCPath.tweakPath.appendingPathComponent("\(tweakFile).dylib")
+                let globalDest = LCPath.tweakPath.appendingPathComponent("\(tweak.resource).dylib")
                 if fm.fileExists(atPath: globalDest.path) {
                     try? fm.removeItem(at: globalDest)
                 }
                 
-                if let source = Bundle.main.url(forResource: tweakFile, withExtension: "dylib", subdirectory: "EmberTweaks") {
-                    let folderUrl = LCPath.tweakPath.appendingPathComponent(folderName)
+                if let source = Bundle.main.url(forResource: tweak.resource, withExtension: "dylib", subdirectory: "EmberTweaks") {
+                    let folderUrl = LCPath.tweakPath.appendingPathComponent(tweak.folder)
                     try? fm.createDirectory(at: folderUrl, withIntermediateDirectories: true)
-                    let destUrl = folderUrl.appendingPathComponent("\(tweakFile).dylib")
+                    let destUrl = folderUrl.appendingPathComponent(tweak.destination)
 
                     // Replace when contents differ. mtime comparison was
                     // unreliable — zip extraction shuffles timestamps enough
@@ -109,9 +113,9 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
                     for app in tempApps {
                         let bId = app.bundleIdentifier.lowercased()
                         let dName = app.displayName.lowercased()
-                        if bundleIds.contains(bId) || keywords.contains(where: { bId.contains($0) || dName.contains($0) }) {
+                        if tweak.bundleIds.contains(bId) || tweak.keywords.contains(where: { bId.contains($0) || dName.contains($0) }) {
                             if app.appInfo.tweakFolder == nil || app.appInfo.tweakFolder?.isEmpty == true {
-                                app.appInfo.tweakFolder = folderName
+                                app.appInfo.tweakFolder = tweak.folder
                             }
                         }
                     }
