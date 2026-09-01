@@ -733,6 +733,29 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
 
     overlay.markers = markers;
     [overlay setNeedsDisplay];
+
+    // Once per second: log a sample projection so the coordinate mapping can
+    // be verified/corrected with real numbers instead of guesses.
+    static CFAbsoluteTime lastSample = 0;
+    CFAbsoluteTime now = CACurrentMediaTime();
+    if (now - lastSample > 1.0 && markers.count > 0) {
+        lastSample = now;
+        Il2CppObject *camTransform = EmberSnInvoke(g_component_get_transform_method, camera, NULL);
+        EmberSnVector3 camPos = {0};
+        if (camTransform) {
+            EmberSnUnboxVector3(EmberSnInvoke(g_transform_get_position_method, camTransform, NULL), &camPos);
+        }
+        NSDictionary *first = markers[0];
+        CGRect box = [first[@"rect"] CGRectValue];
+        BOOL unityLandscape = screenWidth > screenHeight;
+        BOOL viewLandscape = CGRectGetWidth(bounds) > CGRectGetHeight(bounds);
+        EmberSnLog(@"esp sample: unity %dx%d (%@) view %.0fx%.0f (%@) cam(%.1f,%.1f,%.1f) box(%.0f,%.0f %.0fx%.0f) ents=%lu",
+            screenWidth, screenHeight, unityLandscape ? @"landscape" : @"portrait",
+            CGRectGetWidth(bounds), CGRectGetHeight(bounds), viewLandscape ? @"landscape" : @"portrait",
+            camPos.x, camPos.y, camPos.z,
+            box.origin.x, box.origin.y, box.size.width, box.size.height,
+            (unsigned long)self.espEntities.count);
+    }
 }
 
 - (void)espFrame:(CADisplayLink *)displayLink {
