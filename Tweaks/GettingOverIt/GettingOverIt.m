@@ -29,6 +29,7 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import "../Shared/EmberMenu.h"
 
 #define EMBER_GOI_BUTTON_TAG 0xFB003
 
@@ -36,12 +37,24 @@
 #define GOI_RVA_TIME_SET_TIMESCALE        0x11954FCUL
 #define GOI_RVA_TIME_SET_FIXEDDELTATIME   0x119542CUL
 #define GOI_RVA_PHYSICS2D_SET_GRAVITY_INJ 0x11BED18UL
+#define GOI_RVA_PLAYERCONTROL_UPDATE       0xE048E0UL
+#define GOI_RVA_PLAYER_SET_SENSITIVITY     0xE045A0UL
+#define GOI_RVA_PLAYER_PAUSE_INPUT         0xE045A8UL
+#define GOI_RVA_PLAYER_HAMMER_RETURN       0xE04784UL
+#define GOI_RVA_PLAYER_SET_HIGH_CURVE      0xE03C50UL
+#define GOI_RVA_PLAYER_SET_STANDARD_CURVE  0xE038B0UL
+#define GOI_RVA_PLAYER_SET_LOW_CURVE       0xE03FF0UL
+#define GOI_RVA_PLAYER_SET_NO_CURVE        0xE04380UL
+#define GOI_RVA_BEHAVIOUR_SET_ENABLED      0x1165048UL
 #define GOI_GRAVITY_BASE_Y                (-9.81f)
 #define GOI_BASE_FIXED_DELTA              0.02f
 
 static void *g_image_base = NULL;
 static BOOL g_binary_verified = NO;
 static CFAbsoluteTime g_loadTime = 0;
+static void *g_player_control = NULL;
+static BOOL g_player_hook_installed = NO;
+static void (*g_player_update_original)(void *self, void *methodInfo) = NULL;
 
 /// The engine must be fully initialized before our direct calls are safe —
 /// an early auto-applied call crashed the process (verified on-device).
@@ -88,15 +101,16 @@ static void EmberGoiLog(NSString *fmt, ...) {
     }
 }
 
-@class EmberGoiMenuPanel;
-
 @interface EmberGoiController : NSObject
 @property (nonatomic, assign) CGFloat speedFactor;       // Time.timeScale
 @property (nonatomic, assign) CGFloat gravityFactor;     // Physics2D.gravity scale
 @property (nonatomic, strong) UIButton *button;
-@property (nonatomic, strong) EmberGoiMenuPanel *panel;
+@property (nonatomic, strong) EmberMenuPanel *panel;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 @property (nonatomic, assign) BOOL appliedOnce;
+@property (nonatomic, assign) CGFloat sensitivity;
+@property (nonatomic, assign) BOOL paused;
+@property (nonatomic, assign) BOOL hammerCollisionEnabled;
 + (instancetype)sharedController;
 - (void)start;
 - (void)stop;
@@ -237,6 +251,25 @@ static void toast_goi(NSString *message) {
 
 #pragma mark - Runtime + direct calls
 
+static void EmberGoiPlayerUpdateHook(void *self, void *methodInfo) {
+    if (self) g_player_control = self;
+    if (g_player_update_original) g_player_update_original(self, methodInfo);
+}
+
+static void EmberGoiInstallPlayerHook(void) {
+    if (g_player_hook_installed || !g_image_base) return;
+    typedef void (*MSHookFunctionType)(void *symbol, void *replace, void **result);
+    MSHookFunctionType hook = (MSHookFunctionType)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (!hook) {
+        EmberGoiLog(@"MSHookFunction unavailable; instance tools disabled");
+        return;
+    }
+    void *target = (char *)g_image_base + GOI_RVA_PLAYERCONTROL_UPDATE;
+    hook(target, (void *)&EmberGoiPlayerUpdateHook, (void **)&g_player_update_original);
+    g_player_hook_installed = YES;
+    EmberGoiLog(@"PlayerControl.Update hook installed at %p", target);
+}
+
 /// Verifies the Getting Over It binary is loaded and records its load
 /// address. In a LiveContainer guest the game binary is loaded as a dynamic
 /// image (image 0 is the host's LiveContainer executable!), so we must scan
@@ -244,7 +277,10 @@ static void toast_goi(NSString *message) {
 /// vmaddr (0x100000000), and _dyld_get_image_header(i) is exactly
 /// slide + vmaddr, so target = header + RVA.
 static BOOL EmberGoiEnsureRuntime(void) {
-    if (g_image_base) return YES;
+    if (g_image_base) {
+        EmberGoiInstallPlayerHook();
+        return YES;
+    }
 
     static BOOL loggedFailure = NO;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -255,6 +291,7 @@ static BOOL EmberGoiEnsureRuntime(void) {
             g_image_base = (void *)_dyld_get_image_header(i);
             EmberGoiLog(@"guest binary found (image %u) at %p, slide=%lld",
                         i, g_image_base, (long long)_dyld_get_image_vmaddr_slide(i));
+            EmberGoiInstallPlayerHook();
             return YES;
         }
     }
@@ -269,15 +306,47 @@ static void EmberGoiApplyTimeScale(CGFloat factor) {
     if (!EmberGoiEnsureRuntime()) return;
     TimeSetTimeScaleFunc setTimeScale =
         (TimeSetTimeScaleFunc)((char *)g_image_base + GOI_RVA_TIME_SET_TIMESCALE);
-    float clamped = (float)MAX(0.05, MIN(4.0, factor));
+    float clamped = (float)MAX(0.0, MIN(4.0, factor));
     setTimeScale(clamped, NULL);
     // Scale the physics step with the time scale so slow motion stays smooth
     // instead of stuttering (classic Unity slow-mo trick).
     TimeSetFixedDeltaTimeFunc setFixed =
         (TimeSetFixedDeltaTimeFunc)((char *)g_image_base + GOI_RVA_TIME_SET_FIXEDDELTATIME);
-    float fixedDelta = GOI_BASE_FIXED_DELTA * clamped;
+    float fixedDelta = GOI_BASE_FIXED_DELTA * MAX(clamped, 0.01f);
     setFixed(fixedDelta, NULL);
     EmberGoiLog(@"timeScale -> %.2f (fixedDeltaTime %.4f)", clamped, fixedDelta);
+}
+
+static BOOL EmberGoiPlayerReady(void) {
+    EmberGoiEnsureRuntime();
+    return g_player_control != NULL;
+}
+
+static void EmberGoiPlayerCallVoid(uintptr_t rva) {
+    if (!EmberGoiPlayerReady()) return;
+    ((void (*)(void *, void *))((char *)g_image_base + rva))(g_player_control, NULL);
+}
+
+static void EmberGoiSetSensitivity(float value) {
+    if (!EmberGoiPlayerReady()) return;
+    ((void (*)(void *, float, void *))((char *)g_image_base + GOI_RVA_PLAYER_SET_SENSITIVITY))
+        (g_player_control, value, NULL);
+    EmberGoiLog(@"sensitivity -> %.2f", value);
+}
+
+static void EmberGoiPauseInput(float seconds) {
+    if (!EmberGoiPlayerReady()) return;
+    ((void (*)(void *, float, void *))((char *)g_image_base + GOI_RVA_PLAYER_PAUSE_INPUT))
+        (g_player_control, seconds, NULL);
+}
+
+static void EmberGoiSetHammerCollision(BOOL enabled) {
+    if (!EmberGoiPlayerReady()) return;
+    void *hammerCollider = *(void **)((char *)g_player_control + 0xB8);
+    if (!hammerCollider) return;
+    ((void (*)(void *, BOOL, void *))((char *)g_image_base + GOI_RVA_BEHAVIOUR_SET_ENABLED))
+        (hammerCollider, enabled, NULL);
+    EmberGoiLog(@"hammer collision -> %@", enabled ? @"on" : @"off");
 }
 
 static void EmberGoiApplyGravity(CGFloat factor) {
@@ -308,6 +377,8 @@ static void EmberGoiApplyGravity(CGFloat factor) {
     if (self) {
         _speedFactor = 1.0;
         _gravityFactor = 1.0;
+        _sensitivity = 1.0;
+        _hammerCollisionEnabled = YES;
     }
     return self;
 }
@@ -387,6 +458,8 @@ static void EmberGoiLogWindowInventory(void) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     [defaults setDouble:self.speedFactor forKey:@"EmberGOI.speedFactor"];
     [defaults setDouble:self.gravityFactor forKey:@"EmberGOI.gravityFactor"];
+    [defaults setDouble:self.sensitivity forKey:@"EmberGOI.sensitivity"];
+    [defaults setBool:self.hammerCollisionEnabled forKey:@"EmberGOI.hammerCollisionEnabled"];
     [defaults setDouble:self.button.center.x forKey:@"EmberGOI.buttonX"];
     [defaults setDouble:self.button.center.y forKey:@"EmberGOI.buttonY"];
 }
@@ -395,9 +468,14 @@ static void EmberGoiLogWindowInventory(void) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     double speed = [defaults doubleForKey:@"EmberGOI.speedFactor"];
     double gravity = [defaults doubleForKey:@"EmberGOI.gravityFactor"];
+    double sensitivity = [defaults doubleForKey:@"EmberGOI.sensitivity"];
     if (speed > 0.04 && speed <= 4.0) self.speedFactor = speed;
     if (gravity >= -3.0 && gravity <= 3.0 && [defaults objectForKey:@"EmberGOI.gravityFactor"]) {
         self.gravityFactor = gravity;
+    }
+    if (sensitivity >= 0.1 && sensitivity <= 4.0) self.sensitivity = sensitivity;
+    if ([defaults objectForKey:@"EmberGOI.hammerCollisionEnabled"]) {
+        self.hammerCollisionEnabled = [defaults boolForKey:@"EmberGOI.hammerCollisionEnabled"];
     }
 }
 
@@ -473,6 +551,7 @@ static void EmberGoiLogWindowInventory(void) {
 }
 
 - (void)start {
+    [self loadSettings];
     [self install];
     [self updateButtonTitle];
     [self.keepAliveTimer invalidate];
@@ -496,115 +575,134 @@ static void EmberGoiLogWindowInventory(void) {
     self.panel = nil;
 }
 
-- (void)showPanel:(void (^)(EmberGoiMenuPanel *panel))build {
-    UIWindow *host = EmberGoiHostWindow();
-    if (!host) return;
-    [self closePanel];
-    EmberGoiMenuPanel *panel = [[EmberGoiMenuPanel alloc] initWithFrame:CGRectZero];
-    panel.onClose = ^{ [self closePanel]; };
-    build(panel);
-    [panel finalizeLayout];
-    panel.center = CGPointMake(CGRectGetMidX(host.bounds),
-                               CGRectGetMidY(host.bounds));
-    panel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
-                             UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-    [host addSubview:panel];
-    [host bringSubviewToFront:panel];
-    self.panel = panel;
+- (void)applyProfileSpeed:(CGFloat)s gravity:(CGFloat)g {
+    if (!EmberGoiReadyToApply()) {
+        toast_goi(@"Give the game a few more seconds to load, then try again.");
+        return;
+    }
+    self.speedFactor = s;
+    self.gravityFactor = g;
+    self.paused = NO;
+    [self saveSettings];
+    EmberGoiApplyTimeScale(s);
+    EmberGoiApplyGravity(g);
+    [self updateButtonTitle];
+}
+
+- (void)renderTab:(NSInteger)tab {
+    EmberMenuPanel *panel = self.panel;
+    if (!panel) return;
+    [panel clearRows];
+    BOOL runtimeReady = EmberGoiReadyToApply();
+    BOOL playerReady = EmberGoiPlayerReady();
+    [panel setStatus:[NSString stringWithFormat:@"RUNTIME %@  |  PLAYER %@  |  %.2fx / %.2xG",
+                      runtimeReady ? @"ONLINE" : @"WAITING",
+                      playerReady ? @"CAPTURED" : @"WAITING",
+                      self.paused ? 0.0 : self.speedFactor,
+                      self.gravityFactor]];
+
+    __weak typeof(self) weakSelf = self;
+    if (tab == 0) {
+        [panel addSection:@"WORLD PHYSICS"];
+        [panel addSlider:@"GAME SPEED" value:(float)self.speedFactor min:0.05f max:2.5f format:@"%.2fx" handler:^(float value) {
+            if (!EmberGoiReadyToApply()) return;
+            weakSelf.speedFactor = value;
+            weakSelf.paused = NO;
+            [weakSelf saveSettings];
+            EmberGoiApplyTimeScale(value);
+            [weakSelf updateButtonTitle];
+        }];
+        [panel addSlider:@"GRAVITY SCALE" value:(float)self.gravityFactor min:-1.0f max:2.0f format:@"%.2fx" handler:^(float value) {
+            if (!EmberGoiReadyToApply()) return;
+            weakSelf.gravityFactor = value;
+            [weakSelf saveSettings];
+            EmberGoiApplyGravity(value);
+            [weakSelf updateButtonTitle];
+        }];
+        [panel addToggle:@"PAUSE WORLD" detail:@"Time scale 0; settings remain intact" enabled:self.paused handler:^(BOOL enabled) {
+            if (!EmberGoiReadyToApply()) return;
+            weakSelf.paused = enabled;
+            EmberGoiApplyTimeScale(enabled ? 0.0 : weakSelf.speedFactor);
+            [weakSelf renderTab:0];
+        }];
+        [panel addAction:@"FRAME STEP" detail:@"Advance roughly one rendered frame while paused" handler:^{
+            if (!EmberGoiReadyToApply()) return;
+            EmberGoiApplyTimeScale(1.0);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.017 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                EmberGoiApplyTimeScale(0.0);
+                weakSelf.paused = YES;
+            });
+        }];
+    } else if (tab == 1) {
+        [panel addSection:@"HAMMER CONTROL"];
+        [panel addSlider:@"INPUT SENSITIVITY" value:(float)self.sensitivity min:0.2f max:3.0f format:@"%.2fx" handler:^(float value) {
+            if (!EmberGoiPlayerReady()) return;
+            weakSelf.sensitivity = value;
+            [weakSelf saveSettings];
+            EmberGoiSetSensitivity(value);
+        }];
+        [panel addToggle:@"HAMMER COLLISION" detail:@"Off gives a true pass-through practice hammer" enabled:self.hammerCollisionEnabled handler:^(BOOL enabled) {
+            if (!EmberGoiPlayerReady()) return;
+            weakSelf.hammerCollisionEnabled = enabled;
+            [weakSelf saveSettings];
+            EmberGoiSetHammerCollision(enabled);
+        }];
+        [panel addAction:@"RETURN HAMMER" detail:@"Calls PlayerControl.HammerReturn" handler:^{
+            EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_HAMMER_RETURN);
+        }];
+        [panel addAction:@"PAUSE INPUT FOR 3 SECONDS" detail:@"World continues while hammer input is frozen" handler:^{
+            EmberGoiPauseInput(3.0f);
+        }];
+        [panel addSection:@"RESPONSE CURVES"];
+        [panel addAction:@"HIGH ACCELERATION" detail:nil handler:^{ EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_SET_HIGH_CURVE); }];
+        [panel addAction:@"STANDARD" detail:nil handler:^{ EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_SET_STANDARD_CURVE); }];
+        [panel addAction:@"LOW ACCELERATION" detail:nil handler:^{ EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_SET_LOW_CURVE); }];
+        [panel addAction:@"RAW / NO CURVE" detail:nil handler:^{ EmberGoiPlayerCallVoid(GOI_RVA_PLAYER_SET_NO_CURVE); }];
+    } else if (tab == 2) {
+        [panel addSection:@"PRACTICE PROFILES"];
+        [panel addAction:@"BULLET TIME" detail:@"0.10x speed · normal gravity" handler:^{ [weakSelf applyProfileSpeed:0.10 gravity:1.0]; }];
+        [panel addAction:@"EASY CLIMB" detail:@"0.65x speed · 0.45x gravity" handler:^{ [weakSelf applyProfileSpeed:0.65 gravity:0.45]; }];
+        [panel addAction:@"MOON CLIMB" detail:@"Normal speed · 0.30x gravity" handler:^{ [weakSelf applyProfileSpeed:1.0 gravity:0.30]; }];
+        [panel addAction:@"ZERO-G FLOAT" detail:@"Normal speed · no gravity" handler:^{ [weakSelf applyProfileSpeed:1.0 gravity:0.0]; }];
+        [panel addAction:@"INVERTED GRAVITY" detail:@"Normal speed · -0.45x gravity" handler:^{ [weakSelf applyProfileSpeed:1.0 gravity:-0.45]; }];
+        [panel addAction:@"SPEED RUN" detail:@"1.50x speed · normal gravity" handler:^{ [weakSelf applyProfileSpeed:1.50 gravity:1.0]; }];
+    } else {
+        [panel addSection:@"SESSION"];
+        [panel addAction:@"RESET EVERYTHING" detail:@"Restores physics, sensitivity, collision, and time" handler:^{
+            weakSelf.speedFactor = 1.0;
+            weakSelf.gravityFactor = 1.0;
+            weakSelf.sensitivity = 1.0;
+            weakSelf.hammerCollisionEnabled = YES;
+            weakSelf.paused = NO;
+            [weakSelf saveSettings];
+            [weakSelf applyAll];
+            EmberGoiSetSensitivity(1.0f);
+            EmberGoiSetHammerCollision(YES);
+            [weakSelf renderTab:3];
+        }];
+        [panel addAction:@"REAPPLY CURRENT SETTINGS" detail:@"Useful after a scene reload" handler:^{ [weakSelf applyAll]; }];
+        [panel addAction:@"WRITE DIAGNOSTIC SNAPSHOT" detail:@"Documents/EmberConnect/GettingOverIt-diag.log" handler:^{
+            EmberGoiLog(@"snapshot: runtime=%d player=%p speed=%.2f gravity=%.2f sensitivity=%.2f collision=%d",
+                        g_image_base != NULL, g_player_control, weakSelf.speedFactor,
+                        weakSelf.gravityFactor, weakSelf.sensitivity, weakSelf.hammerCollisionEnabled);
+        }];
+    }
 }
 
 - (void)showMainPanel {
+    UIWindow *host = EmberGoiHostWindow();
+    if (!host) return;
+    [self closePanel];
+    EmberMenuPanel *panel = [[EmberMenuPanel alloc] initWithTitle:@"GETTING OVER IT  //  EMBER TOOLKIT"
+                                                      accentColor:[UIColor colorWithRed:1.0 green:0.48 blue:0.12 alpha:1.0]];
     __weak typeof(self) weakSelf = self;
-    [self showPanel:^(EmberGoiMenuPanel *panel) {
-        [panel setHeader:@"Getting Over It Tools"
-                subtitle:[NSString stringWithFormat:@"Speed %.2fx · Gravity %.2fx",
-                          weakSelf.speedFactor, weakSelf.gravityFactor]];
-        [panel addOption:@"Game Speed ▸" handler:^{ [weakSelf showSpeedPanel]; }];
-        [panel addOption:@"Gravity ▸" handler:^{ [weakSelf showGravityPanel]; }];
-        [panel addOption:@"Profiles ▸" handler:^{ [weakSelf showProfilesPanel]; }];
-        [panel addOption:@"Reset to 1x speed / 1x gravity" handler:^{
-            weakSelf.speedFactor = 1.0;
-            weakSelf.gravityFactor = 1.0;
-            [weakSelf saveSettings];
-            [weakSelf applyAll];
-            [weakSelf updateButtonTitle];
-            [weakSelf closePanel];
-        }];
+    panel.onClose = ^{ [weakSelf closePanel]; };
+    [panel setTabs:@[@"Movement", @"Hammer", @"Practice", @"System"] activeTab:0 handler:^(NSInteger index) {
+        [weakSelf renderTab:index];
     }];
-}
-
-- (void)showSpeedPanel {
-    __weak typeof(self) weakSelf = self;
-    [self showPanel:^(EmberGoiMenuPanel *panel) {
-        [panel setHeader:@"Game Speed" subtitle:@"Time.timeScale"];
-        void (^apply)(CGFloat) = ^(CGFloat factor) {
-            if (!EmberGoiReadyToApply()) {
-                toast_goi(@"Give the game a few more seconds to load, then try again.");
-                return;
-            }
-            weakSelf.speedFactor = factor;
-            [weakSelf saveSettings];
-            EmberGoiApplyTimeScale(factor);
-            [weakSelf updateButtonTitle];
-            [weakSelf closePanel];
-        };
-        [panel addOption:@"0.1x — bullet time" handler:^{ apply(0.1); }];
-        [panel addOption:@"0.25x — ultra slow" handler:^{ apply(0.25); }];
-        [panel addOption:@"0.5x — slow" handler:^{ apply(0.5); }];
-        [panel addOption:@"0.65x — easy climb" handler:^{ apply(0.65); }];
-        [panel addOption:@"1x — normal" handler:^{ apply(1.0); }];
-        [panel addOption:@"1.5x — speed run" handler:^{ apply(1.5); }];
-    }];
-}
-
-
-- (void)showGravityPanel {
-    __weak typeof(self) weakSelf = self;
-    [self showPanel:^(EmberGoiMenuPanel *panel) {
-        [panel setHeader:@"Gravity" subtitle:@"Physics2D.gravity scale"];
-        void (^apply)(CGFloat) = ^(CGFloat factor) {
-            if (!EmberGoiReadyToApply()) {
-                toast_goi(@"Give the game a few more seconds to load, then try again.");
-                return;
-            }
-            weakSelf.gravityFactor = factor;
-            [weakSelf saveSettings];
-            EmberGoiApplyGravity(factor);
-            [weakSelf updateButtonTitle];
-            [weakSelf closePanel];
-        };
-        [panel addOption:@"0x — zero-G float" handler:^{ apply(0.0); }];
-        [panel addOption:@"0.3x — moon" handler:^{ apply(0.3); }];
-        [panel addOption:@"0.45x — easy climb" handler:^{ apply(0.45); }];
-        [panel addOption:@"1x — normal" handler:^{ apply(1.0); }];
-        [panel addOption:@"1.5x — heavy" handler:^{ apply(1.5); }];
-    }];
-}
-
-
-- (void)showProfilesPanel {
-    __weak typeof(self) weakSelf = self;
-    [self showPanel:^(EmberGoiMenuPanel *panel) {
-        [panel setHeader:@"Practice Profiles" subtitle:@"Applies instantly"];
-        void (^apply)(CGFloat, CGFloat) = ^(CGFloat s, CGFloat g) {
-            if (!EmberGoiReadyToApply()) {
-                toast_goi(@"Give the game a few more seconds to load, then try again.");
-                return;
-            }
-            weakSelf.speedFactor = s;
-            weakSelf.gravityFactor = g;
-            [weakSelf saveSettings];
-            EmberGoiApplyTimeScale(s);
-            EmberGoiApplyGravity(g);
-            [weakSelf updateButtonTitle];
-            [weakSelf closePanel];
-        };
-        [panel addOption:@"Easy Climb — 0.65x speed, 0.45x gravity" handler:^{ apply(0.65, 0.45); }];
-        [panel addOption:@"Moon Jump — 1x speed, 0.3x gravity" handler:^{ apply(1.0, 0.3); }];
-        [panel addOption:@"Zero-G Float — 1x speed, no gravity" handler:^{ apply(1.0, 0.0); }];
-        [panel addOption:@"Speed Run — 1.5x speed, 1x gravity" handler:^{ apply(1.5, 1.0); }];
-        [panel addOption:@"Defaults — 1x / 1x" handler:^{ apply(1.0, 1.0); }];
-    }];
+    self.panel = panel;
+    [self renderTab:0];
+    [panel presentInWindow:host];
 }
 
 - (void)tapped {

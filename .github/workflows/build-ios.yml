@@ -99,6 +99,7 @@ jobs:
             -fobjc-arc \
             -fblocks \
             -dynamiclib \
+            Tweaks/Shared/EmberMenu.m \
             Tweaks/GettingOverIt/GettingOverIt.m \
             -framework Foundation \
             -framework UIKit \
@@ -118,6 +119,7 @@ jobs:
             -fobjc-arc \
             -fblocks \
             -dynamiclib \
+            Tweaks/Shared/EmberMenu.m \
             Tweaks/Subnautica/Subnautica.m \
             -framework Foundation \
             -framework UIKit \
@@ -128,6 +130,26 @@ jobs:
 
           file BuiltTweaks/Subnautica.dylib
           xcrun otool -L BuiltTweaks/Subnautica.dylib
+
+          # Clover Pit — IL2CPP practice controls using verified GameplayData
+          # and SlotMachineScript methods from the installed iOS build.
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -fblocks \
+            -dynamiclib \
+            Tweaks/Shared/EmberMenu.m \
+            Tweaks/CloverPit/CloverPit.m \
+            -framework Foundation \
+            -framework UIKit \
+            -framework QuartzCore \
+            -framework CoreGraphics \
+            -install_name @rpath/CloverPit.dylib \
+            -o BuiltTweaks/CloverPit.dylib
+
+          file BuiltTweaks/CloverPit.dylib
+          xcrun otool -L BuiltTweaks/CloverPit.dylib
 
       - name: Assemble Ember container host
         run: |
@@ -154,6 +176,7 @@ jobs:
           cp BuiltTweaks/EightBPOfflineLines.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/GettingOverIt.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/Subnautica.dylib "$APP/EmberTweaks/"
+          cp BuiltTweaks/CloverPit.dylib "$APP/EmberTweaks/"
 
       - name: Verify container, branding, and App ID usage
         run: |
@@ -176,6 +199,7 @@ jobs:
           test -f "$APP/EmberTweaks/EightBPOfflineLines.dylib"
           test -f "$APP/EmberTweaks/GettingOverIt.dylib"
           test -f "$APP/EmberTweaks/Subnautica.dylib"
+          test -f "$APP/EmberTweaks/CloverPit.dylib"
 
           echo "Verified Ember Connect host with one ReplayKit extension."
 
@@ -197,3 +221,4 @@ jobs:
             BuiltTweaks/EightBPOfflineLines.dylib
             BuiltTweaks/GettingOverIt.dylib
             BuiltTweaks/Subnautica.dylib
+            BuiltTweaks/CloverPit.dylib

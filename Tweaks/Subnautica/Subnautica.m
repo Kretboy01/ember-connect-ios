@@ -26,6 +26,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import "../Shared/EmberMenu.h"
 
 #define EMBER_SN_BUTTON_TAG 0x5301
 #define EMBER_SN_METHOD_ATTRIBUTE_STATIC 0x0010
@@ -104,12 +105,10 @@ static void EmberSnLog(NSString *fmt, ...) {
     }
 }
 
-@class EmberSnMenuPanel;
-
 @interface EmberSnController : NSObject
 @property (nonatomic, strong) UIButton *button;
 @property (nonatomic, strong) UIWindow *hostWindow;
-@property (nonatomic, strong) EmberSnMenuPanel *panel;
+@property (nonatomic, strong) EmberMenuPanel *panel;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 + (instancetype)sharedController;
 - (void)start;
@@ -544,107 +543,77 @@ static BOOL EmberSnSendCommand(NSString *command) {
     self.panel = nil;
 }
 
-- (void)showSnPanel:(void (^)(EmberSnMenuPanel *panel))build {
-    UIWindow *host = self.hostWindow ?: UIApplication.sharedApplication.keyWindow;
-    if (!host) return;
-    [self closeSnPanel];
-    EmberSnMenuPanel *panel = [[EmberSnMenuPanel alloc] initWithFrame:CGRectZero];
-    panel.onClose = ^{ [self closeSnPanel]; };
-    build(panel);
-    [panel finalizeLayout];
-    panel.center = CGPointMake(CGRectGetMidX(host.bounds),
-                               CGRectGetMidY(host.bounds));
-    panel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
-                             UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
-    [host addSubview:panel];
-    [host bringSubviewToFront:panel];
-    self.panel = panel;
-}
-
-- (void)showMainMenu {
+- (void)renderSnTab:(NSInteger)tab {
+    EmberMenuPanel *panel = self.panel;
+    if (!panel) return;
+    [panel clearRows];
+    [panel setStatus:g_resolved ? @"UNITY ONLINE  |  DEVCONSOLE READY"
+                                : @"WAITING FOR UNITY / DEVCONSOLE"];
     __weak typeof(self) weakSelf = self;
-    [self showSnPanel:^(EmberSnMenuPanel *panel) {
-        NSString *header = g_resolved
-            ? @"Commands run the game's own developer console."
-            : @"Waiting for Unity to load — commands work once the engine is ready.";
-        [panel setHeader:@"Subnautica Tools" subtitle:header];
-        [panel addOption:@"Refill Oxygen" handler:^{ [weakSelf dispatchCommand:@"oxygen"]; }];
-        [panel addOption:@"Restore Food & Water" handler:^{ [weakSelf dispatchCommand:@"survival"]; }];
-        [panel addOption:@"Set Day" handler:^{ [weakSelf dispatchCommand:@"day"]; }];
-        [panel addOption:@"Set Night" handler:^{ [weakSelf dispatchCommand:@"night"]; }];
-        [panel addOption:@"Cheats & Toggles ▸" handler:^{ [weakSelf showCheatsPanel]; }];
-        [panel addOption:@"Vehicles & Blueprints ▸" handler:^{ [weakSelf showUnlockPanel]; }];
-        [panel addOption:@"Game Speed ▸" handler:^{ [weakSelf showSpeedPanel]; }];
-    }];
-}
+    void (^send)(NSString *) = ^(NSString *command) { [weakSelf dispatchCommand:command]; };
 
-- (void)showCheatsPanel {
-    __weak typeof(self) weakSelf = self;
-    [self showSnPanel:^(EmberSnMenuPanel *panel) {
-        [panel setHeader:@"Cheats" subtitle:@"Toggle — tap again to undo"];
-        void (^send)(NSString *) = ^(NSString *command) {
-            [weakSelf dispatchCommand:command];
-        };
-        [panel addOption:@"Toggle No Damage" handler:^{ send(@"nodamage"); }];
-        [panel addOption:@"Toggle No Crafting Costs" handler:^{ send(@"nocost"); }];
-        [panel addOption:@"Toggle Invisible" handler:^{ send(@"invisible"); }];
-        [panel addOption:@"Toggle Fast Growth" handler:^{ send(@"fastgrow"); }];
-        [panel addOption:@"Toggle Fast Scan" handler:^{ send(@"fastscan"); }];
-        [panel addOption:@"Toggle Fast Build" handler:^{ send(@"fastbuild"); }];
-        [panel addOption:@"Toggle Fast Hatching" handler:^{ send(@"fasthatch"); }];
-        [panel addOption:@"Toggle Fast Filtration" handler:^{ send(@"filterfast"); }];
-        [panel addOption:@"Toggle No Radiation" handler:^{ send(@"radiation"); }];
-        [panel addOption:@"Toggle Infection Cure" handler:^{ send(@"playerinfection"); }];
-        [panel addOption:@"Bob the Builder (tools + blueprints)" handler:^{ send(@"bobthebuilder"); }];
-        [panel addOption:@"Creative Mode" handler:^{ send(@"creative"); }];
-        [panel addOption:@"Back to Main ◄" handler:^{ [weakSelf showMainMenu]; }];
-    }];
-}
-
-- (void)showUnlockPanel {
-    __weak typeof(self) weakSelf = self;
-    [self showSnPanel:^(EmberSnMenuPanel *panel) {
-        [panel setHeader:@"Vehicles & Blueprints" subtitle:@"One-shot unlocks"];
-        void (^send)(NSString *) = ^(NSString *command) {
-            [weakSelf dispatchCommand:command];
-            [weakSelf closeSnPanel];
-        };
-        [panel addOption:@"Unlock All Blueprints" handler:^{ send(@"unlockall"); }];
-        [panel addOption:@"Unlock Precursor Doors" handler:^{ send(@"unlockdoors"); }];
-        [panel addOption:@"Seamoth Upgrades" handler:^{ send(@"seamothupgrades"); }];
-        [panel addOption:@"Exosuit Arms" handler:^{ send(@"exosuitarms"); }];
-        [panel addOption:@"Exosuit Upgrades" handler:^{ send(@"exosuitupgrades"); }];
-        [panel addOption:@"Cyclops Upgrades" handler:^{ send(@"cyclopsupgrades"); }];
-        [panel addOption:@"Vehicle Upgrades" handler:^{ send(@"vehicleupgrades"); }];
-        [panel addOption:@"Back to Main ◄" handler:^{ [weakSelf showMainMenu]; }];
-    }];
-}
-
-- (void)showSpeedPanel {
-    __weak typeof(self) weakSelf = self;
-    [self showSnPanel:^(EmberSnMenuPanel *panel) {
-        [panel setHeader:@"Game Speed" subtitle:@"Movement speed + engine time scale"];
-        void (^speed)(NSString *) = ^(NSString *command) {
-            [weakSelf dispatchCommand:command];
-            [weakSelf showSpeedPanel];
-        };
-        void (^scale)(float) = ^(float value) {
+    if (tab == 0) {
+        [panel addSection:@"SURVIVAL"];
+        [panel addAction:@"REFILL OXYGEN" detail:@"Restore the current oxygen supply" handler:^{ send(@"oxygen"); }];
+        [panel addAction:@"RESTORE FOOD + WATER" detail:@"Refill survival meters" handler:^{ send(@"survival"); }];
+        [panel addSection:@"WORLD"];
+        [panel addAction:@"SET DAY" detail:nil handler:^{ send(@"day"); }];
+        [panel addAction:@"SET NIGHT" detail:nil handler:^{ send(@"night"); }];
+    } else if (tab == 1) {
+        [panel addSection:@"PLAYER TOGGLES  //  TAP AGAIN TO DISABLE"];
+        [panel addAction:@"NO DAMAGE" detail:@"Toggle player and vehicle damage" handler:^{ send(@"nodamage"); }];
+        [panel addAction:@"NO CRAFTING COSTS" detail:@"Toggle free construction and crafting" handler:^{ send(@"nocost"); }];
+        [panel addAction:@"INVISIBLE" detail:@"Toggle creature aggro suppression" handler:^{ send(@"invisible"); }];
+        [panel addAction:@"NO RADIATION" detail:@"Toggle radiation protection" handler:^{ send(@"radiation"); }];
+        [panel addAction:@"CURE INFECTION" detail:nil handler:^{ send(@"playerinfection"); }];
+        [panel addSection:@"FAST SYSTEMS"];
+        [panel addAction:@"FAST GROW" detail:nil handler:^{ send(@"fastgrow"); }];
+        [panel addAction:@"FAST SCAN" detail:nil handler:^{ send(@"fastscan"); }];
+        [panel addAction:@"FAST BUILD" detail:nil handler:^{ send(@"fastbuild"); }];
+        [panel addAction:@"FAST HATCH" detail:nil handler:^{ send(@"fasthatch"); }];
+        [panel addAction:@"FAST FILTER" detail:nil handler:^{ send(@"filterfast"); }];
+    } else if (tab == 2) {
+        [panel addSection:@"GLOBAL UNLOCKS"];
+        [panel addAction:@"BOB THE BUILDER" detail:@"Tools, blueprints, build helpers" handler:^{ send(@"bobthebuilder"); }];
+        [panel addAction:@"CREATIVE MODE" detail:@"Switch to creative rules" handler:^{ send(@"creative"); }];
+        [panel addAction:@"UNLOCK ALL BLUEPRINTS" detail:nil handler:^{ send(@"unlockall"); }];
+        [panel addAction:@"UNLOCK PRECURSOR DOORS" detail:nil handler:^{ send(@"unlockdoors"); }];
+        [panel addSection:@"VEHICLES"];
+        [panel addAction:@"SEAMOTH UPGRADES" detail:nil handler:^{ send(@"seamothupgrades"); }];
+        [panel addAction:@"PRAWN ARMS" detail:nil handler:^{ send(@"exosuitarms"); }];
+        [panel addAction:@"PRAWN UPGRADES" detail:nil handler:^{ send(@"exosuitupgrades"); }];
+        [panel addAction:@"CYCLOPS UPGRADES" detail:nil handler:^{ send(@"cyclopsupgrades"); }];
+        [panel addAction:@"ALL VEHICLE UPGRADES" detail:nil handler:^{ send(@"vehicleupgrades"); }];
+    } else {
+        [panel addSection:@"WORLD TIME SCALE"];
+        [panel addSlider:@"TIME SCALE" value:1.0f min:0.1f max:3.0f format:@"%.2fx" handler:^(float value) {
             if (g_set_time_scale_icall) {
                 ((void (*)(float))g_set_time_scale_icall)(value);
                 EmberSnLog(@"timeScale set to %.2f", value);
             }
-            [weakSelf showSpeedPanel];
-        };
-        [panel addOption:@"Swim 1x (normal)" handler:^{ speed(@"speed"); }];
-        [panel addOption:@"Swim 3x" handler:^{ speed(@"speed 3"); }];
-        [panel addOption:@"Swim 5x" handler:^{ speed(@"speed 5"); }];
-        [panel addOption:@"Swim 10x" handler:^{ speed(@"speed 10"); }];
-        [panel addOption:@"Time 0.5x — slow motion" handler:^{ scale(0.5f); }];
-        [panel addOption:@"Time 1x — normal" handler:^{ scale(1.0f); }];
-        [panel addOption:@"Time 2x — fast" handler:^{ scale(2.0f); }];
-        [panel addOption:@"Time 3x — very fast" handler:^{ scale(3.0f); }];
-        [panel addOption:@"Back to Main ◄" handler:^{ [weakSelf showMainMenu]; }];
+        }];
+        [panel addSection:@"SWIM SPEED"];
+        [panel addAction:@"NORMAL" detail:@"1x movement" handler:^{ send(@"speed"); }];
+        [panel addAction:@"FAST" detail:@"3x movement" handler:^{ send(@"speed 3"); }];
+        [panel addAction:@"VERY FAST" detail:@"5x movement" handler:^{ send(@"speed 5"); }];
+        [panel addAction:@"EXTREME" detail:@"10x movement" handler:^{ send(@"speed 10"); }];
+    }
+}
+
+- (void)showMainMenu {
+    UIWindow *host = self.hostWindow ?: UIApplication.sharedApplication.keyWindow;
+    if (!host) return;
+    [self closeSnPanel];
+    EmberMenuPanel *panel = [[EmberMenuPanel alloc] initWithTitle:@"SUBNAUTICA  //  EMBER TOOLKIT"
+                                                      accentColor:[UIColor colorWithRed:0.10 green:0.78 blue:0.92 alpha:1.0]];
+    __weak typeof(self) weakSelf = self;
+    panel.onClose = ^{ [weakSelf closeSnPanel]; };
+    [panel setTabs:@[@"Survival", @"Cheats", @"Build", @"Speed"] activeTab:0 handler:^(NSInteger index) {
+        [weakSelf renderSnTab:index];
     }];
+    self.panel = panel;
+    [self renderSnTab:0];
+    [panel presentInWindow:host];
 }
 
 - (void)tapped {
@@ -688,4 +657,3 @@ static void EmberSubnauticaInit(void) {
                        dispatch_get_main_queue(), ^{ [controller start]; });
     });
 }
-

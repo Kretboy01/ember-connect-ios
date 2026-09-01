@@ -97,6 +97,17 @@ struct LCTweakFolderView : View {
             targetNameKeywords: ["subnautica"],
             icon: "water.waves",
             description: "Console-backed survival, cheat, vehicle, blueprint, and game-speed controls for Subnautica."
+        ),
+        BundledTweakPreset(
+            id: "cloverpit",
+            name: "Clover Pit Tools",
+            resourceName: "CloverPit",
+            dylibName: "CloverPit.dylib",
+            folderName: "Clover Pit",
+            targetBundleIdentifiers: ["com.PanikArcade.CloverPit"],
+            targetNameKeywords: ["clover pit", "cloverpit"],
+            icon: "clover.fill",
+            description: "Tabbed practice controls for spins, tickets, luck, reel symbols, danger suppression, and game speed."
         )
     ]
     

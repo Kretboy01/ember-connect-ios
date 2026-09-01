@@ -79,7 +79,8 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
             let bundledTweaks: [(resource: String, folder: String, destination: String, bundleIds: [String], keywords: [String])] = [
                 ("FlappyPractice", "Flappy Practice", "FlappyPractice.dylib", ["org.brandonplank.flappybird"], ["flappy"]),
                 ("GettingOverIt", "GOI Tools", "EmberGOITools.dylib", ["net.foddy.gettingoverit", "com.bennettfoddy.gettingoverit", "com.noodlecake.gettingoverit", "com.noodlecake.gettingoveritios"], ["getting over it", "gettingoverit", "bennettfoddy"]),
-                ("Subnautica", "Subnautica", "Subnautica.dylib", ["com.unknownworlds.subnautica"], ["subnautica"])
+                ("Subnautica", "Subnautica", "Subnautica.dylib", ["com.unknownworlds.subnautica"], ["subnautica"]),
+                ("CloverPit", "Clover Pit", "CloverPit.dylib", ["com.panikarcade.cloverpit"], ["clover pit", "cloverpit"])
             ]
             for tweak in bundledTweaks {
                 // Remove loose root dylib if it exists from older installs to prevent double injection
