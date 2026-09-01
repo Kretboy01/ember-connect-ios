@@ -642,7 +642,7 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
         BOOL leviathan = EmberSnIsLeviathanName(className);
         if (self.espLeviathansOnly && !leviathan) continue;
         [entities addObject:@{
-            @"obj": creature,
+            @"obj": [NSValue valueWithPointer:creature],
             @"name": className,
             @"leviathan": @(leviathan)
         }];
@@ -681,7 +681,7 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
     BOOL viewLandscape = CGRectGetWidth(bounds) > CGRectGetHeight(bounds);
 
     for (NSDictionary *entity in self.espEntities) {
-        Il2CppObject *creature = entity[@"obj"];
+        Il2CppObject *creature = [(NSValue *)entity[@"obj"] pointerValue];
         if (!creature) continue;
         NSString *className = entity[@"name"];
         BOOL leviathan = [entity[@"leviathan"] boolValue];
