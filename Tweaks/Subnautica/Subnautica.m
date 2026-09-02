@@ -565,6 +565,8 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
 
 #pragma mark - Controller
 
+#import "EmberSnNative.h"
+
 @implementation EmberSnController
 
 + (instancetype)sharedController {
@@ -806,6 +808,7 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
                                                             block:^(NSTimer *timer) {
         [weakSelf install];
         EmberSnResolveRuntime();
+        if (g_resolved) [EmberSnNativeShared() tickInWindow:weakSelf.hostWindow];
         [weakSelf updateESP];
         [weakSelf updateButtonTitle];
     }];
@@ -832,6 +835,7 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
     EmberMenuPanel *panel = self.panel;
     if (!panel) return;
     [panel clearRows];
+    [panel setFooter:@"EMBER TOOLKIT  |  SN native v1 + viewport ESP"];
     [panel setStatus:g_resolved ? @"UNITY ONLINE  |  DEVCONSOLE READY"
                                 : @"WAITING FOR UNITY / DEVCONSOLE"];
     __weak typeof(self) weakSelf = self;
@@ -901,6 +905,8 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
         [panel addAction:@"REFRESH ENTITIES" detail:@"Re-enumerate active Creature components now" handler:^{
             [weakSelf updateESP];
         }];
+    } else if (tab == 5) {
+        [EmberSnNativeShared() render:panel];
     } else {
         [panel addSection:@"WORLD TIME SCALE"];
         [panel addSlider:@"TIME SCALE" value:1.0f min:0.1f max:3.0f format:@"%.2fx" handler:^(float value) {
@@ -925,11 +931,11 @@ static BOOL EmberSnIsLeviathanName(NSString *className) {
                                                       accentColor:[UIColor colorWithRed:0.10 green:0.78 blue:0.92 alpha:1.0]];
     __weak typeof(self) weakSelf = self;
     panel.onClose = ^{ [weakSelf closeSnPanel]; };
-    [panel setTabs:@[@"Survival", @"Cheats", @"Build", @"ESP", @"Speed"] activeTab:0 handler:^(NSInteger index) {
+    [panel setTabs:@[@"Survival", @"Cheats", @"Build", @"ESP", @"Speed", @"Mods"] activeTab:5 handler:^(NSInteger index) {
         [weakSelf renderSnTab:index];
     }];
     self.panel = panel;
-    [self renderSnTab:0];
+    [self renderSnTab:5];
     [panel presentInWindow:host];
 }
 

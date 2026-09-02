@@ -180,6 +180,8 @@ static BOOL CloverReplaceSymbols(int kind, int modifier) {
     return YES;
 }
 
+#import "EmberCloverNative.h"
+
 @interface EmberCloverController : NSObject
 @property (nonatomic, strong) UIButton *button;
 @property (nonatomic, strong) EmberMenuPanel *panel;
@@ -226,6 +228,7 @@ static BOOL CloverReplaceSymbols(int kind, int modifier) {
     EmberMenuPanel *panel = self.panel;
     if (!panel) return;
     [panel clearRows];
+    [panel setFooter:@"EMBER TOOLKIT  |  Clover native lab v1"];
     [panel setStatus:CloverReady() ? @"IL2CPP ONLINE  |  GAMEPLAY DATA READY"
                                   : @"WAITING FOR CLOVER PIT RUNTIME"];
     __weak typeof(self) weakSelf = self;
@@ -292,6 +295,8 @@ static BOOL CloverReplaceSymbols(int kind, int modifier) {
         [panel addAction:@"REMOVE VISIBLE 666" detail:nil handler:^{
             if (CloverReady()) ((void (*)(void *))((char *)g_clover_image + CLOVER_RVA_REMOVE_VISIBLE_666))(NULL);
         }];
+    } else if (tab == 4) {
+        [EmberCloverNativeShared() render:panel];
     } else {
         [panel addSection:@"GAME SPEED"];
         [panel addSlider:@"TIME SCALE" value:1.0f min:0.1f max:3.0f format:@"%.2fx" handler:^(float value) {
@@ -314,11 +319,11 @@ static BOOL CloverReplaceSymbols(int kind, int modifier) {
                                                       accentColor:[UIColor colorWithRed:0.35 green:0.92 blue:0.38 alpha:1.0]];
     __weak typeof(self) weakSelf = self;
     panel.onClose = ^{ [weakSelf closePanel]; };
-    [panel setTabs:@[@"Run", @"Luck", @"Reels", @"System"] activeTab:0 handler:^(NSInteger index) {
+    [panel setTabs:@[@"Run", @"Luck", @"Reels", @"System", @"Lab"] activeTab:4 handler:^(NSInteger index) {
         [weakSelf renderTab:index];
     }];
     self.panel = panel;
-    [self renderTab:0];
+    [self renderTab:4];
     [panel presentInWindow:host];
 }
 
