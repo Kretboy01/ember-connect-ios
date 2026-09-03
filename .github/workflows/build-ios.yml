@@ -21,6 +21,11 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      - name: Test Fortnite compatibility guards
+        run: |
+          clang -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined tests/fortnite_guards.c -o /tmp/ember-fortnite-guards
+          /tmp/ember-fortnite-guards
+
       - name: Generate ReplayKit extension project
         run: xcodegen generate
 

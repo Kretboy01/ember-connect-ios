@@ -146,14 +146,28 @@ static void EmberInstallFrameHooks(void) {
 /// keeps a spare around.
 - (UIWindow *)hostWindow {
     UIWindow *best = nil;
+    NSMutableOrderedSet<UIWindow *> *windows = [NSMutableOrderedSet orderedSet];
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-            if (window.hidden || !window.rootViewController) continue;
-            if (window.windowLevel > UIWindowLevelNormal) continue;
-            if (window == self.button.superview) { best = window; break; }
-            if (!best || window.windowLevel >= best.windowLevel) best = window;
-        }
+        if (scene.activationState == UISceneActivationStateUnattached ||
+            scene.activationState == UISceneActivationStateBackground) continue;
+        [windows addObjectsFromArray:((UIWindowScene *)scene).windows];
+    }
+    // Legacy UIApplicationDelegate games (including the inspected Fortnite
+    // build with no scene manifest) may have no connected UIWindowScene.
+    // These APIs are intentionally retained for those existing guest windows.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    [windows addObjectsFromArray:UIApplication.sharedApplication.windows];
+    UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+    if (keyWindow) [windows addObject:keyWindow];
+#pragma clang diagnostic pop
+    for (UIWindow *window in windows) {
+        if (window.hidden || !window.rootViewController || CGRectIsEmpty(window.bounds)) continue;
+        if (window.windowLevel > UIWindowLevelNormal) continue;
+        if (window.isKeyWindow) return window;
+        if (!best || window.windowLevel > best.windowLevel ||
+            (window.windowLevel == best.windowLevel && window == self.button.superview)) best = window;
     }
     return best;
 }
@@ -187,6 +201,7 @@ static void EmberInstallFrameHooks(void) {
     if (!host) return;
 
     if (self.button && self.button.superview == host) {
+        [self clampIntoBounds];
         [host bringSubviewToFront:self.button];
         if (self.fpsLabel && !self.fpsLabel.hidden) [host bringSubviewToFront:self.fpsLabel];
         return;
@@ -587,6 +602,14 @@ static void EmberReturnButtonInit(void) {
     // dock, so a second escape hatch would just cover its content.
     if (NSUserDefaults.isLiveProcess) return;
     if ([NSUserDefaults.lcUserDefaults boolForKey:kEmberHideReturnButtonKey]) return;
+
+    // A late-loaded loader may have missed the activation notification.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+            [[EmberReturnButtonController shared] install];
+            [[EmberReturnButtonController shared] startKeepAlive];
+        }
+    });
 
     // Attach on activation, and again whenever a window appears or takes key —
     // that is what a game moving between screens usually looks like from out
