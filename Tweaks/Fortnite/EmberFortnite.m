@@ -267,19 +267,22 @@ static uintptr_t fn_world(void) {
     return (w >= 0x100000000ULL) ? w : 0;
 }
 
+static float g_fn_pcm_fov_override = 0.f; // PlayerCameraManager+0x278 when set
+
 static BOOL fn_read_pov(uintptr_t pov) {
     double cx = fn_f64(pov+0x00), cy = fn_f64(pov+0x08), cz = fn_f64(pov+0x10);
-    double pitch = fn_f64(pov+0x18), yaw = fn_f64(pov+0x20), roll = fn_f64(pov+0x28);
+    double pitch = fn_f64(pov+0x18), yaw = fn_f64(pov+0x20);
     float  fov   = fn_f32(pov+0x30);
     if (isnan(cx)||isnan(cy)||isnan(cz)||isnan(pitch)||isnan(yaw)) return NO;
     if (isnan(fov)||fov<5.f||fov>179.f) return NO;
-    // Sanity: location should be in a plausible Fortnite world range.
     if (fabs(cx) > 1e7 || fabs(cy) > 1e7 || fabs(cz) > 1e7) return NO;
+    // Prefer LockedFOV on the manager when the game has one (GetFOVAngle path).
+    if (g_fn_pcm_fov_override > 5.f && g_fn_pcm_fov_override < 179.f)
+        fov = g_fn_pcm_fov_override;
     g_fn_cam_loc   = (EmberFnVec3){cx, cy, cz, YES};
-    g_fn_cam_pitch = pitch; // degrees
+    g_fn_cam_pitch = pitch;
     g_fn_cam_yaw   = yaw;
-    g_fn_cam_roll  = 0.0;   // Windows external zeros roll for W2S
-    (void)roll;
+    g_fn_cam_roll  = 0.0;
     g_fn_fov       = fov;
     return YES;
 }
@@ -296,9 +299,19 @@ static void fn_update_camera(uintptr_t world) {
     uintptr_t pcm  = fn_ptr(pc  + FN_OFF_PC_CAMERA_MANAGER);
     if (pcm < 0x100000000ULL) return;
 
-    // Prefer ViewTarget.POV (live view), fall back to CameraCachePrivate.POV.
-    if (fn_read_pov(pcm + FN_OFF_PCM_VIEW_TARGET + FN_OFF_VIEWTARGET_POV)) return;
+    // GetFOVAngle: ldr s0, [x0, #0x278] then fall back to POV.FOV
+    float locked = fn_f32(pcm + 0x278);
+    g_fn_pcm_fov_override = (!isnan(locked) && locked > 5.f && locked < 179.f) ? locked : 0.f;
+
+    // CameraCachePrivate.POV only — ViewTarget packing is easy to mis-align.
     fn_read_pov(pcm + FN_OFF_PCM_CACHE_PRIVATE + FN_OFF_CACHE_POV);
+}
+
+static float fn_capsule_half_height(uintptr_t root) {
+    // UCapsuleComponent::CapsuleHalfHeight candidate on this build.
+    float h = fn_f32(root + 0x57c);
+    if (!isnan(h) && h > 40.f && h < 120.f) return h;
+    return 80.f; // Fortnite players are shorter than the default 88 mannequin
 }
 
 static void fn_update_players(uintptr_t world) {
@@ -326,9 +339,11 @@ static void fn_update_players(uintptr_t world) {
         double py = fn_f64(root+FN_OFF_ROOT_LOC_Y);
         double pz = fn_f64(root+FN_OFF_ROOT_LOC_Z);
         if (isnan(px)||isnan(py)||isnan(pz)) continue;
-        // Capsule centre → feet / head (Windows uses HumanBase bone; we approximate).
-        EmberFnVec3 feet = { px, py, pz - FN_CAPSULE_HALF_HEIGHT, YES };
-        EmberFnVec3 head = { px, py, pz + FN_CAPSULE_HALF_HEIGHT, YES };
+        double half = (double)fn_capsule_half_height(root);
+        // Capsule centre → feet / head. Slightly less than full half-height so the
+        // marker sits on the soles, not underground (mesh sits inside the capsule).
+        EmberFnVec3 feet = { px, py, pz - half * 0.92, YES };
+        EmberFnVec3 head = { px, py, pz + half * 0.95, YES };
         g_fn_dots[count].feet = feet;
         g_fn_dots[count].head = head;
         g_fn_dots[count].is_local = (pawn == local_pawn);
@@ -345,41 +360,40 @@ static void fn_tick(void) {
     fn_update_players(w);
 }
 
-// ── Projection — Windows ProjectWorldToScreen (sdk.hpp) ───────────────────────
-// Windows:
-//   matrix = to_matrix(pitch,yaw,roll)   // Unreal FRotationMatrix
-//   transformed = (delta·Y, delta·Z, delta·X)  // right, up, forward
-//   sx = center_x + x * (center_x / tan(fov*PI/360)) / z
-//   sy = center_y - y * (center_x / tan(fov*PI/360)) / z
-// Returns PIXEL coordinates (not NDC).
+// ── Projection ────────────────────────────────────────────────────────────────
+// Windows ProjectWorldToScreen axis math. FOV is horizontal; both axes use
+// (width/2)/tan(halfFov) — that is the correct aspect handling for a real
+// iPhone aspect (~19.5:9). No 16:9 monitor fudge factor.
 static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, float *out_y) {
     if (!g_fn_cam_loc.valid || width <= 1.f || height <= 1.f) return NO;
+
     double dx = wl.x - g_fn_cam_loc.x;
     double dy = wl.y - g_fn_cam_loc.y;
     double dz = wl.z - g_fn_cam_loc.z;
 
     double radpitch = g_fn_cam_pitch * (M_PI / 180.0);
     double radyaw   = g_fn_cam_yaw   * (M_PI / 180.0);
-    double radroll  = g_fn_cam_roll  * (M_PI / 180.0);
     double SP = sin(radpitch), CP = cos(radpitch);
     double SY = sin(radyaw),   CY = cos(radyaw);
-    double SR = sin(radroll),  CR = cos(radroll);
 
-    // Axis X = forward, Y = right, Z = up (same as Windows to_matrix rows).
-    double axisx_x = CP * CY,               axisx_y = CP * SY,               axisx_z = SP;
-    double axisy_x = SR * SP * CY - CR * SY, axisy_y = SR * SP * SY + CR * CY, axisy_z = -SR * CP;
-    double axisz_x = -(CR * SP * CY + SR * SY), axisz_y = CY * SR - CR * SP * SY, axisz_z = CR * CP;
+    // Roll = 0. Axes match Unreal FRotationMatrix / Windows to_matrix.
+    double axisx_x = CP * CY,  axisx_y = CP * SY,  axisx_z = SP;
+    double axisy_x = -SY,      axisy_y = CY,       axisy_z = 0.0;
+    double axisz_x = -SP * CY, axisz_y = -SP * SY, axisz_z = CP;
 
-    double tx = dx * axisy_x + dy * axisy_y + dz * axisy_z; // right
-    double ty = dx * axisz_x + dy * axisz_y + dz * axisz_z; // up
-    double tz = dx * axisx_x + dy * axisx_y + dz * axisx_z; // forward
-    if (tz < 1.0) tz = 1.0;
+    double tx = dx * axisy_x + dy * axisy_y + dz * axisy_z;
+    double ty = dx * axisz_x + dy * axisz_y + dz * axisz_z;
+    double tz = dx * axisx_x + dy * axisx_y + dz * axisx_z;
+    if (tz < 1.0) return NO;
 
+    double half = tan(g_fn_fov * M_PI / 360.0);
+    if (half < 1e-4) return NO;
     double center_x = width  * 0.5;
     double center_y = height * 0.5;
-    double fov_factor = center_x / tan(g_fn_fov * M_PI / 360.0);
-    *out_x = (float)(center_x + tx * fov_factor / tz);
-    *out_y = (float)(center_y - ty * fov_factor / tz);
+    double focal = center_x / half;
+
+    *out_x = (float)(center_x + tx * focal / tz);
+    *out_y = (float)(center_y - ty * focal / tz);
     return YES;
 }
 
@@ -427,13 +441,12 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         if (bx < -50 || bx > W+50 || by < -50 || by > H+50) continue;
 
         CGFloat box_h = (CGFloat)fabs(by - hy);
-        if (box_h < 10.f) box_h = 10.f;
-        CGFloat box_w = box_h * 0.6f;
+        if (box_h < 8.f) box_h = 8.f;
+        CGFloat box_w = box_h * 0.45f;
         CGFloat left = bx - box_w * 0.5f;
-        CGFloat top  = hy - box_h * 0.15f; // slight head padding like Windows *1.15
-        CGFloat bottom = by;
+        CGFloat top = MIN(hy, by);
+        CGFloat bottom = MAX(hy, by);
         box_h = bottom - top;
-        if (box_h < 10.f) { box_h = 10.f; top = bottom - box_h; }
 
         UIColor *col = [UIColor colorWithRed:1 green:0.18 blue:0.18 alpha:0.95];
         CGContextSetStrokeColorWithColor(ctx, col.CGColor);
