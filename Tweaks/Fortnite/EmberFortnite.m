@@ -16,6 +16,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <math.h>
+#import <objc/runtime.h>
 #import <string.h>
 #import "../Shared/EmberMenu.h"
 #import "EmberFortniteProjection.h"
@@ -39,6 +40,7 @@ static const uint8_t EmberFnExpectedUUID[16] = {
 #define FN_OFF_WORLD_GAMEINSTANCE   0x2f0
 #define FN_OFF_GI_LOCALPLAYERS_DATA 0x38
 #define FN_OFF_LP_CONTROLLER        0x30
+#define FN_OFF_LP_ASPECT_AXIS       0xb8   // EAspectRatioAxisConstraint byte
 #define FN_OFF_PC_CAMERA_MANAGER    0x318
 #define FN_OFF_PC_CAMERA_FOV        0x364  // normalized FOV; render degrees = value * 90
 #define FN_OFF_PCM_CACHE_PRIVATE    0x1540  // inline FCameraCacheEntry
@@ -112,6 +114,10 @@ static float       g_fn_fov        = 80.0f;
 static float       g_fn_pov_fov    = 0.0f;
 static float       g_fn_fov_scalar = 0.0f;
 static BOOL        g_fn_logged_camera_source = NO;
+static uint8_t     g_fn_aspect_axis = 1; // fail-safe: MaintainXFOV
+static uint8_t     g_fn_storekit_suppression_mask = 0;
+
+static void EmberFnSuppressStoreKitPrompts(void);
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 static NSMutableString *g_fn_log     = nil;
@@ -327,6 +333,8 @@ static BOOL fn_update_camera(uintptr_t world) {
     if (lp0 < 0x100000000ULL) return NO;
     uintptr_t pc   = fn_ptr(lp0 + FN_OFF_LP_CONTROLLER);
     if (pc  < 0x100000000ULL) return NO;
+    uint8_t axis = *(volatile uint8_t *)(lp0 + FN_OFF_LP_ASPECT_AXIS);
+    g_fn_aspect_axis = axis <= 2 ? axis : 1;
     uintptr_t pcm  = fn_ptr(pc  + FN_OFF_PC_CAMERA_MANAGER);
     if (pcm < 0x100000000ULL) return NO;
 
@@ -346,8 +354,8 @@ static BOOL fn_update_camera(uintptr_t world) {
     }
     if (!g_fn_logged_camera_source) {
         g_fn_logged_camera_source = YES;
-        EmberFnLog(@"camera source: PCM POV loc/rot; POV.FOV=%.3f PC+0x364=%.6f renderFOV=%.3f",
-                   g_fn_pov_fov, scalar, g_fn_fov);
+        EmberFnLog(@"camera source: PCM POV loc/rot; POV.FOV=%.3f PC+0x364=%.6f renderFOV=%.3f axis=%u",
+                   g_fn_pov_fov, scalar, g_fn_fov, g_fn_aspect_axis);
     }
     return YES;
 }
@@ -420,6 +428,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         (EmberFnProjectionVec3){wl.x, wl.y, wl.z},
         (EmberFnProjectionVec3){g_fn_cam_loc.x, g_fn_cam_loc.y, g_fn_cam_loc.z},
         g_fn_cam_pitch, g_fn_cam_yaw, g_fn_cam_roll, g_fn_fov,
+        g_fn_aspect_axis,
         width, height, &x, &y);
     if (!visible) return NO;
     *out_x = (float)x;
@@ -704,7 +713,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         [panel addAction:[NSString stringWithFormat:@"%d player(s) in array", g_fn_dot_count]
                   detail:@"" handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"Render FOV %.2f°", g_fn_fov]
-                  detail:[NSString stringWithFormat:@"PC+0x364 %.5f | POV %.2f°", g_fn_fov_scalar, g_fn_pov_fov]
+                  detail:[NSString stringWithFormat:@"PC+0x364 %.5f | POV %.2f° | axis %u", g_fn_fov_scalar, g_fn_pov_fov, g_fn_aspect_axis]
                  handler:^{}];
     }
 }
@@ -720,11 +729,64 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
     self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
                                                           repeats:YES
                                                             block:^(NSTimer *_) {
+        EmberFnSuppressStoreKitPrompts();
         [ws install];
         [ws updateButton];
     }];
 }
 @end
+
+// ── Fortnite-only StoreKit prompt suppression ───────────────────────────────
+// StoreKit receipt refresh / purchase restoration can show the system Apple
+// Account password dialog in a sideloaded container. Fortnite's Epic device
+// authentication and EpicPurchasingService are separate and remain untouched.
+static void EmberFnSuppressStoreKitPrompts(void) {
+    if (g_fn_storekit_suppression_mask == 0x7) return;
+    uint8_t before = g_fn_storekit_suppression_mask;
+
+    Class receiptRequest = NSClassFromString(@"SKReceiptRefreshRequest");
+    SEL start = @selector(start);
+    Method startMethod = receiptRequest ? class_getInstanceMethod(receiptRequest, start) : NULL;
+    if (!(g_fn_storekit_suppression_mask & 0x1) && startMethod) {
+        IMP replacement = imp_implementationWithBlock(^(id request) {
+            if ([request respondsToSelector:@selector(cancel)]) [request cancel];
+            EmberFnLog(@"suppressed StoreKit receipt refresh (prevents Apple Account prompt)");
+        });
+        class_replaceMethod(receiptRequest, start, replacement, method_getTypeEncoding(startMethod));
+        g_fn_storekit_suppression_mask |= 0x1;
+    }
+
+    Class paymentQueue = NSClassFromString(@"SKPaymentQueue");
+    NSArray<NSString *> *restoreNames = @[@"restoreCompletedTransactions",
+                                          @"restoreCompletedTransactionsWithApplicationUsername:"];
+    for (NSUInteger index = 0; index < restoreNames.count; index++) {
+        uint8_t bit = (uint8_t)(0x2 << index);
+        if (g_fn_storekit_suppression_mask & bit) continue;
+        NSString *name = restoreNames[index];
+        SEL selector = NSSelectorFromString(name);
+        Method method = paymentQueue ? class_getInstanceMethod(paymentQueue, selector) : NULL;
+        if (!method) continue;
+        IMP replacement;
+        if ([name hasSuffix:@":"]) {
+            replacement = imp_implementationWithBlock(^(id queue, id username) {
+                (void)queue; (void)username;
+                EmberFnLog(@"suppressed StoreKit transaction restore");
+            });
+        } else {
+            replacement = imp_implementationWithBlock(^(id queue) {
+                (void)queue;
+                EmberFnLog(@"suppressed StoreKit transaction restore");
+            });
+        }
+        class_replaceMethod(paymentQueue, selector, replacement, method_getTypeEncoding(method));
+        g_fn_storekit_suppression_mask |= bit;
+    }
+    if (g_fn_storekit_suppression_mask != before || before == 0) {
+        EmberFnLog(@"StoreKit prompt suppression mask 0x%x%@",
+                   g_fn_storekit_suppression_mask,
+                   g_fn_storekit_suppression_mask == 0x7 ? @" ready" : @" (retrying)");
+    }
+}
 
 // ── Constructor ────────────────────────────────────────────────────────────────
 __attribute__((constructor))
@@ -732,6 +794,7 @@ static void EmberFortniteInit(void) {
     EmberFnLog(@"constructor — polling for %s", EMBER_FN_GUEST_BINARY);
     // Start the UI immediately (shows "SEARCHING…")
     dispatch_async(dispatch_get_main_queue(), ^{
+        EmberFnSuppressStoreKitPrompts();
         [[EmberFnController shared] start];
     });
     // Binary polling on background thread

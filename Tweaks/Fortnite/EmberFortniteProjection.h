@@ -21,6 +21,7 @@ static inline bool EmberFnProjectWorldPoint(EmberFnProjectionVec3 world,
                                              double yaw,
                                              double roll,
                                              double horizontalFov,
+                                             unsigned int aspectAxisConstraint,
                                              double width,
                                              double height,
                                              double *screenX,
@@ -52,7 +53,11 @@ static inline bool EmberFnProjectWorldPoint(EmberFnProjectionVec3 world,
 
     const double tangent = tan(horizontalFov * radians * 0.5);
     if (!isfinite(tangent) || tangent <= 1e-6) return false;
-    const double focal = (width * 0.5) / tangent;
+    // Mirrors FSceneView's axis multiplier selection. MaintainYFOV uses the
+    // viewport height for focal length. MajorAxisFOV follows the larger axis.
+    const bool maintainX = aspectAxisConstraint == 1 ||
+        (aspectAxisConstraint == 2 && width >= height);
+    const double focal = ((maintainX ? width : height) * 0.5) / tangent;
     *screenX = width * 0.5 + viewX * focal / depth;
     *screenY = height * 0.5 - viewY * focal / depth;
     return isfinite(*screenX) && isfinite(*screenY);
