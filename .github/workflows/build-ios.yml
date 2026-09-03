@@ -15,6 +15,8 @@ jobs:
         run: |
           cc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined tests/fortnite_guards.c -o /tmp/ember-fortnite-guards
           timeout 30 /tmp/ember-fortnite-guards
+          cc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined tests/fortnite_projection.c -lm -o /tmp/ember-fortnite-projection
+          timeout 30 /tmp/ember-fortnite-projection
 
   build:
     needs: guard-tests
@@ -43,6 +45,10 @@ jobs:
                           "-o", "/tmp/ember-fortnite-guards"], check=True, timeout=90)
           print("Running guard tests", flush=True)
           subprocess.run(["/tmp/ember-fortnite-guards"], check=True, timeout=30)
+          subprocess.run(["xcrun", "clang", "-std=c17", "-Wall", "-Wextra", "-Werror",
+                          "tests/fortnite_projection.c", "-o", "/tmp/ember-fortnite-projection"],
+                         check=True, timeout=90)
+          subprocess.run(["/tmp/ember-fortnite-projection"], check=True, timeout=30)
           PY
 
       - name: Generate ReplayKit extension project

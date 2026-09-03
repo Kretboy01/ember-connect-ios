@@ -17,6 +17,7 @@
 #import <math.h>
 #import <string.h>
 #import "../Shared/EmberMenu.h"
+#import "EmberFortniteProjection.h"
 
 // ── Build identity ─────────────────────────────────────────────────────────────
 // Whole-file SHA-256 0c09c05d… is NOT the __text hash. Live __text is
@@ -39,9 +40,7 @@ static const uint8_t EmberFnExpectedUUID[16] = {
 #define FN_OFF_LP_CONTROLLER        0x30
 #define FN_OFF_PC_CAMERA_MANAGER    0x318
 #define FN_OFF_PCM_CACHE_PRIVATE    0x1540  // inline FCameraCacheEntry
-#define FN_OFF_PCM_VIEW_TARGET      0x2f0   // FTViewTarget (size 2320 on 42.10)
 #define FN_OFF_CACHE_POV            0x10
-#define FN_OFF_VIEWTARGET_POV       0x10    // after Target*
 
 // FMinimalViewInfo at cache+0x10:
 //   +0x00/08/10 = Location XYZ  (f64)
@@ -286,35 +285,8 @@ static BOOL fn_pov_header_ok(const EmberFnPovHeader *h) {
     return YES;
 }
 
-static BOOL fn_read_pov(uintptr_t pov) {
-    if (pov < 0x100000000ULL || (pov & 7)) return NO;
-
-    // Contiguous memcpy — never assemble Location from one instant and
-    // Rotation from another via separate loads (that tears under camera motion
-    // and is exactly the "ESP slides when I look" failure mode).
-    EmberFnPovHeader a = {0}, b = {0};
-    memcpy(&a, (const void *)pov, sizeof(a));
-    memcpy(&b, (const void *)pov, sizeof(b));
-
-    const EmberFnPovHeader *use = NULL;
-    if (fn_pov_header_ok(&a) && fn_pov_header_ok(&b)) {
-        // Prefer a consistent pair; if the camera is moving fast and the two
-        // snaps differ, take the newer one rather than keeping a stale frame.
-        if (fabs(a.loc_x - b.loc_x) <= 1.0 && fabs(a.loc_y - b.loc_y) <= 1.0 &&
-            fabs(a.loc_z - b.loc_z) <= 1.0 && fabs(a.pitch - b.pitch) <= 0.05 &&
-            fabs(a.yaw - b.yaw) <= 0.05 && fabs(a.fov - b.fov) <= 0.05) {
-            use = &a;
-        } else {
-            use = &b;
-        }
-    } else if (fn_pov_header_ok(&b)) {
-        use = &b;
-    } else if (fn_pov_header_ok(&a)) {
-        use = &a;
-    } else {
-        return NO;
-    }
-
+static BOOL fn_apply_pov_header(const EmberFnPovHeader *use) {
+    if (!fn_pov_header_ok(use)) return NO;
     g_fn_cam_loc   = (EmberFnVec3){use->loc_x, use->loc_y, use->loc_z, YES};
     g_fn_cam_pitch = use->pitch;
     g_fn_cam_yaw   = use->yaw;
@@ -324,41 +296,37 @@ static BOOL fn_read_pov(uintptr_t pov) {
     return YES;
 }
 
-static void fn_update_camera(uintptr_t world) {
-    uintptr_t gi   = fn_ptr(world + FN_OFF_WORLD_GAMEINSTANCE);
-    if (gi < 0x100000000ULL) return;
-    uintptr_t lpd  = fn_ptr(gi + FN_OFF_GI_LOCALPLAYERS_DATA);
-    if (lpd < 0x100000000ULL) return;
-    uintptr_t lp0  = fn_ptr(lpd);
-    if (lp0 < 0x100000000ULL) return;
-    uintptr_t pc   = fn_ptr(lp0 + FN_OFF_LP_CONTROLLER);
-    if (pc  < 0x100000000ULL) return;
-    uintptr_t pcm  = fn_ptr(pc  + FN_OFF_PC_CAMERA_MANAGER);
-    if (pcm < 0x100000000ULL) return;
+static BOOL fn_read_camera_cache(uintptr_t cache) {
+    if (cache < 0x100000000ULL || (cache & 7)) return NO;
 
-    uintptr_t cache_pov = pcm + FN_OFF_PCM_CACHE_PRIVATE + FN_OFF_CACHE_POV; // +0x1550
-    uintptr_t view_pov  = pcm + FN_OFF_PCM_VIEW_TARGET + FN_OFF_VIEWTARGET_POV; // +0x300
-
-    // Prefer ViewTarget when its Target* looks live and its POV is near the
-    // published cache (same camera, just fresher). Otherwise use cache only.
-    uintptr_t vt_target = fn_ptr(pcm + FN_OFF_PCM_VIEW_TARGET);
-    EmberFnPovHeader vt = {0}, ch = {0};
-    BOOL vt_ok = (vt_target >= 0x100000000ULL) &&
-                 (memcpy(&vt, (const void *)view_pov, sizeof(vt)), fn_pov_header_ok(&vt));
-    BOOL ch_ok = (memcpy(&ch, (const void *)cache_pov, sizeof(ch)), fn_pov_header_ok(&ch));
-
-    if (vt_ok && ch_ok) {
-        double dloc = fabs(vt.loc_x - ch.loc_x) + fabs(vt.loc_y - ch.loc_y) + fabs(vt.loc_z - ch.loc_z);
-        double drot = fabs(vt.pitch - ch.pitch) + fabs(vt.yaw - ch.yaw);
-        // Same camera system: small delta while turning is expected. Huge delta
-        // means ViewTarget packing is wrong — fall back to cache.
-        if (dloc < 5000.0 && drot < 90.0) {
-            if (fn_read_pov(view_pov)) return;
-        }
-    } else if (vt_ok && !ch_ok) {
-        if (fn_read_pov(view_pov)) return;
+    // FCameraCacheEntry begins with a double timestamp. Accept the POV only if
+    // the timestamp is identical on both sides of the copy, so we never combine
+    // fields from two camera updates.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint64_t before = *(volatile uint64_t *)cache;
+        EmberFnPovHeader header = {0};
+        memcpy(&header, (const void *)(cache + FN_OFF_CACHE_POV), sizeof(header));
+        uint64_t after = *(volatile uint64_t *)cache;
+        if (before == after &&
+            fn_apply_pov_header(&header)) return YES;
     }
-    fn_read_pov(cache_pov);
+    return NO;
+}
+
+static BOOL fn_update_camera(uintptr_t world) {
+    uintptr_t gi   = fn_ptr(world + FN_OFF_WORLD_GAMEINSTANCE);
+    if (gi < 0x100000000ULL) return NO;
+    uintptr_t lpd  = fn_ptr(gi + FN_OFF_GI_LOCALPLAYERS_DATA);
+    if (lpd < 0x100000000ULL) return NO;
+    uintptr_t lp0  = fn_ptr(lpd);
+    if (lp0 < 0x100000000ULL) return NO;
+    uintptr_t pc   = fn_ptr(lp0 + FN_OFF_LP_CONTROLLER);
+    if (pc  < 0x100000000ULL) return NO;
+    uintptr_t pcm  = fn_ptr(pc  + FN_OFF_PC_CAMERA_MANAGER);
+    if (pcm < 0x100000000ULL) return NO;
+
+    // This is the exact POV returned by Fortnite's PCM camera getters.
+    return fn_read_camera_cache(pcm + FN_OFF_PCM_CACHE_PRIVATE);
 }
 
 static float fn_capsule_half_height(uintptr_t root) {
@@ -369,6 +337,7 @@ static float fn_capsule_half_height(uintptr_t root) {
 }
 
 static void fn_update_players(uintptr_t world) {
+    g_fn_dot_count = 0;
     uintptr_t gs  = fn_ptr(world + FN_OFF_WORLD_GAMESTATE);
     if (gs < 0x100000000ULL) return;
     uintptr_t data = fn_ptr(gs + FN_OFF_GS_PLAYERARRAY_DATA);
@@ -410,7 +379,11 @@ static void fn_tick(void) {
     if (!g_fn_binary_verified || !g_fn_dots_enabled) { g_fn_dot_count = 0; return; }
     uintptr_t w = fn_world();
     if (!w) { g_fn_dot_count = 0; return; }
-    fn_update_camera(w);
+    if (!fn_update_camera(w)) {
+        g_fn_cam_loc.valid = NO;
+        g_fn_dot_count = 0;
+        return;
+    }
     fn_update_players(w);
 }
 
@@ -419,43 +392,15 @@ static void fn_tick(void) {
 // horizontal; both axes use (width/2)/tan(halfFov). No 16:9 fudge.
 static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, float *out_y) {
     if (!g_fn_cam_loc.valid || width <= 1.f || height <= 1.f) return NO;
-
-    double dx = wl.x - g_fn_cam_loc.x;
-    double dy = wl.y - g_fn_cam_loc.y;
-    double dz = wl.z - g_fn_cam_loc.z;
-
-    double radpitch = g_fn_cam_pitch * (M_PI / 180.0);
-    double radyaw   = g_fn_cam_yaw   * (M_PI / 180.0);
-    double radroll  = g_fn_cam_roll  * (M_PI / 180.0);
-    double SP = sin(radpitch), CP = cos(radpitch);
-    double SY = sin(radyaw),   CY = cos(radyaw);
-    double SR = sin(radroll),  CR = cos(radroll);
-
-    double axisx_x = CP * CY;
-    double axisx_y = CP * SY;
-    double axisx_z = SP;
-    double axisy_x = SR * SP * CY - CR * SY;
-    double axisy_y = SR * SP * SY + CR * CY;
-    double axisy_z = -SR * CP;
-    double axisz_x = -(CR * SP * CY + SR * SY);
-    double axisz_y = CY * SR - CR * SP * SY;
-    double axisz_z = CR * CP;
-
-    double tx = dx * axisy_x + dy * axisy_y + dz * axisy_z;
-    double ty = dx * axisz_x + dy * axisz_y + dz * axisz_z;
-    double tz = dx * axisx_x + dy * axisx_y + dz * axisx_z;
-    if (tz < 1.0) return NO;
-
-    double half = tan(g_fn_fov * M_PI / 360.0);
-    if (half < 1e-4) return NO;
-    double center_x = width  * 0.5;
-    double center_y = height * 0.5;
-    double focal = center_x / half;
-
-    // Horizontal is mirrored vs the Metal view on this build: looking right
-    // drove the box left of the player (and vice versa). Negate screen X.
-    *out_x = (float)(center_x - tx * focal / tz);
-    *out_y = (float)(center_y - ty * focal / tz);
+    double x = 0, y = 0;
+    BOOL visible = EmberFnProjectWorldPoint(
+        (EmberFnProjectionVec3){wl.x, wl.y, wl.z},
+        (EmberFnProjectionVec3){g_fn_cam_loc.x, g_fn_cam_loc.y, g_fn_cam_loc.z},
+        g_fn_cam_pitch, g_fn_cam_yaw, g_fn_cam_roll, g_fn_fov,
+        width, height, &x, &y);
+    if (!visible) return NO;
+    *out_x = (float)x;
+    *out_y = (float)y;
     return YES;
 }
 
@@ -479,8 +424,11 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
     return self;
 }
 - (void)dealloc { [_dl invalidate]; }
-- (void)tick:(CADisplayLink *)dl { fn_tick(); [self setNeedsDisplay]; }
+- (void)tick:(CADisplayLink *)dl { [self setNeedsDisplay]; }
 - (void)drawRect:(CGRect)r {
+    // Sample camera and actors at draw time, not at CADisplayLink notification
+    // time. This minimizes the interval in which Fortnite can advance its view.
+    fn_tick();
     if (!g_fn_dots_enabled || !g_fn_cam_loc.valid) return;
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
