@@ -424,10 +424,46 @@ static void fn_tick(void) {
     fn_update_players(w);
 }
 
-// ── Projection ────────────────────────────────────────────────────────────────
-// Width-based horizontal FOV only. Live axis=0 (MaintainYFOV) with POV.FOV=52
-// used height/2 as focal and shrank boxes to ~half size with worse edge drift.
-// Do not call Fortnite's projector from CADisplayLink/main thread.
+static CALayer *EmberFnLargestMetalLayer(CALayer *layer, CALayer *best) {
+    Class metal = NSClassFromString(@"CAMetalLayer");
+    if (!metal || !layer) return best;
+    if ([layer isKindOfClass:metal]) {
+        CGFloat area = layer.bounds.size.width * layer.bounds.size.height;
+        CGFloat bestArea = best ? (best.bounds.size.width * best.bounds.size.height) : 0;
+        if (area > bestArea && area > 4096.0) best = layer;
+    }
+    for (CALayer *child in layer.sublayers) {
+        best = EmberFnLargestMetalLayer(child, best);
+    }
+    return best;
+}
+
+// Fortnite's Metal layer can be letterboxed inside the Ember window. Project in
+// that rectangle. This compositor mirrors Unreal +X (centre-aligned, opposite
+// at the edges) so UIKit X is flipped after the shared Unreal helper.
+static CGRect EmberFnRenderViewportInView(UIView *view) {
+    CGRect fallback = view.bounds;
+    UIWindow *win = view.window ?: EmberFnHostWindow();
+    if (!win) return fallback;
+    CALayer *metal = EmberFnLargestMetalLayer(win.layer, nil);
+    if (!metal) return fallback;
+    CGRect rect = [view.layer convertRect:metal.bounds fromLayer:metal];
+    if (rect.size.width < 64.0 || rect.size.height < 64.0) return fallback;
+    static BOOL logged;
+    if (!logged) {
+        logged = YES;
+        CGSize drawable = CGSizeZero;
+        if ([metal respondsToSelector:@selector(drawableSize)]) {
+            drawable = [(id)metal drawableSize];
+        }
+        EmberFnLog(@"render viewport overlay=%.0fx%.0f metal=%.0f,%.0f %.0fx%.0f drawable=%.0fx%.0f",
+                   fallback.size.width, fallback.size.height,
+                   rect.origin.x, rect.origin.y, rect.size.width, rect.size.height,
+                   drawable.width, drawable.height);
+    }
+    return rect;
+}
+
 static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, float *out_y) {
     if (!g_fn_cam_loc.valid || width <= 1.f || height <= 1.f) return NO;
     double x = 0, y = 0;
@@ -437,7 +473,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         g_fn_cam_pitch, g_fn_cam_yaw, g_fn_cam_roll, g_fn_fov,
         width, height, &x, &y);
     if (!visible) return NO;
-    *out_x = (float)x;
+    *out_x = (float)(width - x);
     *out_y = (float)y;
     return YES;
 }
@@ -470,7 +506,8 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
     if (!g_fn_dots_enabled || !g_fn_cam_loc.valid) return;
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
-    CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
+    CGRect vp = EmberFnRenderViewportInView(self);
+    CGFloat W = vp.size.width, H = vp.size.height;
     if (W<=0||H<=0) return;
     int n = g_fn_dot_count;
     EmberFnDot snap[EMBER_FN_MAX_PLAYERS];
@@ -486,7 +523,12 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         float bx=0, by=0, hx=0, hy=0;
         if (!fn_project(snap[i].feet, (float)W, (float)H, &bx, &by)) continue;
         if (!fn_project(snap[i].head, (float)W, (float)H, &hx, &hy)) continue;
-        if (bx < -50 || bx > W+50 || by < -50 || by > H+50) continue;
+        bx += (float)vp.origin.x;
+        by += (float)vp.origin.y;
+        hx += (float)vp.origin.x;
+        hy += (float)vp.origin.y;
+        if (bx < -50 || bx > self.bounds.size.width+50 ||
+            by < -50 || by > self.bounds.size.height+50) continue;
 
         CGFloat box_h = (CGFloat)fabs(by - hy);
         if (box_h < 8.f) box_h = 8.f;
@@ -508,7 +550,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         }
 
         if (g_fn_snapline_enabled) {
-            CGContextMoveToPoint(ctx, W * 0.5, H * 0.5);
+            CGContextMoveToPoint(ctx, vp.origin.x + W * 0.5, vp.origin.y + H * 0.5);
             CGContextAddLineToPoint(ctx, bx, by);
             CGContextStrokePath(ctx);
         }
