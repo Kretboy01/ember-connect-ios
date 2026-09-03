@@ -183,6 +183,7 @@ jobs:
             -fobjc-arc \
             -fblocks \
             -dynamiclib \
+            Tweaks/Shared/EmberMenu.m \
             Tweaks/Fortnite/EmberFortnite.m \
             -framework Foundation \
             -framework UIKit \
