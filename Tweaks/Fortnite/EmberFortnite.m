@@ -439,8 +439,9 @@ static CALayer *EmberFnLargestMetalLayer(CALayer *layer, CALayer *best) {
 }
 
 // Fortnite's Metal layer can be letterboxed inside the Ember window. Project in
-// that rectangle. This compositor mirrors Unreal +X (centre-aligned, opposite
-// at the edges) so UIKit X is flipped after the shared Unreal helper.
+// that rectangle. Device result on 77bdf82: flipping UIKit X made horizontal
+// still opposite; vertical movement is mirrored. Keep Unreal +X and flip Y to
+// match Metal's framebuffer origin (bottom-left vs UIKit top-left).
 static CGRect EmberFnRenderViewportInView(UIView *view) {
     CGRect fallback = view.bounds;
     UIWindow *win = view.window ?: EmberFnHostWindow();
@@ -473,8 +474,8 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         g_fn_cam_pitch, g_fn_cam_yaw, g_fn_cam_roll, g_fn_fov,
         width, height, &x, &y);
     if (!visible) return NO;
-    *out_x = (float)(width - x);
-    *out_y = (float)y;
+    *out_x = (float)x;
+    *out_y = (float)(height - y);
     return YES;
 }
 
