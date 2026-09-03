@@ -2,7 +2,7 @@
 // No game code pages are patched, no executable memory is allocated, and no
 // kernel entitlements are granted. Unknown builds and unrelated exits are untouched.
 #include <CommonCrypto/CommonDigest.h>
-#include <mach/mach_vm.h>
+#include <mach/mach.h>
 #include <malloc/malloc.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -37,9 +37,9 @@ static void EmberFNLog(const char *message) {
 }
 
 static bool EmberFNRead(uintptr_t address, void *out, size_t size) {
-    mach_vm_size_t copied = 0;
-    return address && mach_vm_read_overwrite(mach_task_self(), address, size,
-        (mach_vm_address_t)out, &copied) == KERN_SUCCESS && copied == size;
+    vm_size_t copied = 0;
+    return address && vm_read_overwrite(mach_task_self(), address, size,
+        (vm_address_t)out, &copied) == KERN_SUCCESS && copied == size;
 }
 
 // This function is ordinary signed host code, not debugger/JIT-generated code.
@@ -140,24 +140,24 @@ static void EmberFNImageAdded(const struct mach_header *header, intptr_t slide) 
         EmberFNLog("Live code/import guard failed; no compatibility changes");
         return;
     }
-    mach_vm_address_t region = (uintptr_t)slot;
-    mach_vm_size_t size = 0;
+    vm_address_t region = (uintptr_t)slot;
+    vm_size_t size = 0;
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t object = MACH_PORT_NULL;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &region, &size,
+    kern_return_t kr = vm_region_64(mach_task_self(), &region, &size,
         VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
     if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
     if (kr != KERN_SUCCESS || region > (uintptr_t)slot || (uintptr_t)slot + 8 > region + size) return;
-    mach_vm_address_t page = (uintptr_t)slot & ~((uintptr_t)vm_page_size - 1);
-    kr = mach_vm_protect(mach_task_self(), page, vm_page_size, false,
+    vm_address_t page = (uintptr_t)slot & ~((uintptr_t)vm_page_size - 1);
+    kr = vm_protect(mach_task_self(), page, vm_page_size, false,
                         info.protection | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) { EmberFNLog("Import data page not writable; no compatibility changes"); return; }
     EmberFNBase = base;
     bool changed = __atomic_compare_exchange_n(slot, &original, (uintptr_t)EmberFortniteExitGate,
         false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
     if (!changed) EmberFNBase = 0;
-    kr = mach_vm_protect(mach_task_self(), page, vm_page_size, false, info.protection);
+    kr = vm_protect(mach_task_self(), page, vm_page_size, false, info.protection);
     if (kr != KERN_SUCCESS) EmberFNLog("Warning: could not restore import data page protection");
     EmberFNLog(changed ? "42.10 startup exit gate armed; signed host code only" : "Import changed concurrently; gate not armed");
 }
