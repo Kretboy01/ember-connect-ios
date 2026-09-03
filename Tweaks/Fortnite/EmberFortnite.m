@@ -452,7 +452,9 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
     double center_y = height * 0.5;
     double focal = center_x / half;
 
-    *out_x = (float)(center_x + tx * focal / tz);
+    // Horizontal is mirrored vs the Metal view on this build: looking right
+    // drove the box left of the player (and vice versa). Negate screen X.
+    *out_x = (float)(center_x - tx * focal / tz);
     *out_y = (float)(center_y - ty * focal / tz);
     return YES;
 }
