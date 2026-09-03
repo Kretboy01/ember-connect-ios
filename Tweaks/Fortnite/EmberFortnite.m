@@ -14,15 +14,19 @@
 #import <QuartzCore/QuartzCore.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
-#import <CommonCrypto/CommonDigest.h>
 #import <math.h>
+#import <string.h>
 #import "../Shared/EmberMenu.h"
 
 // ── Build identity ─────────────────────────────────────────────────────────────
-#define EMBER_FN_EXPECTED_SHA256 \
-    "0c09c05d9e84f4379341898643e5c87e02ea40251a9d6231d3e3a7e7767b0c17"
+// Whole-file SHA-256 0c09c05d… is NOT the __text hash. Live __text is
+// 6197060b… (206,163,608 bytes). Runtime lock uses LC_UUID + __text size.
 #define EMBER_FN_BUILD_VERSION   "42.10/57581488.1.4"
 #define EMBER_FN_GUEST_BINARY    "FortniteClient-IOS-Shipping"
+#define EMBER_FN_TEXT_SIZE       206163608ULL
+static const uint8_t EmberFnExpectedUUID[16] = {
+    0x31,0xd1,0xec,0x91,0x7d,0xde,0x31,0x25,0x8f,0x33,0x75,0xaa,0x02,0x3b,0x83,0x4d
+};
 
 // ── Unslid addresses (base 0x100000000) ───────────────────────────────────────
 #define FN_GENGINE_GLOBAL_UNSLID    ((uintptr_t)0x1147fe0b0)
@@ -77,6 +81,7 @@ static inline int32_t fn_i32(uintptr_t addr) {
 // ── State ─────────────────────────────────────────────────────────────────────
 static uintptr_t g_fn_slide           = 0;
 static BOOL      g_fn_binary_verified = NO;
+static NSString *g_fn_status          = @"SEARCHING…";
 static BOOL      g_fn_dots_enabled    = NO;
 static double    g_fn_max_distance    = EMBER_FN_MAX_DIST_DEFAULT;
 static BOOL      g_fn_show_labels     = YES;
@@ -140,20 +145,46 @@ static UIWindow *EmberFnHostWindow(void) {
 #pragma clang diagnostic pop
 }
 
-// ── SHA-256 verify ────────────────────────────────────────────────────────────
-static BOOL EmberFnVerifyHash(const struct mach_header_64 *mh) {
+static BOOL EmberFnPathLooksLikeFortnite(const char *name) {
+    if (!name) return NO;
+    if (strcasestr(name, "FortniteClient") != NULL) return YES;
+    if (strcasestr(name, "FortniteGame") != NULL) return YES;
+    if (strcasestr(name, "fortnite") != NULL) return YES;
+    return NO;
+}
+
+static void EmberFnLogImageInventory(void) {
+    uint32_t n = _dyld_image_count();
+    EmberFnLog(@"dyld image count=%u (LiveContainer remaps index 0 to the guest)", n);
+    uint32_t limit = n < 24 ? n : 24;
+    for (uint32_t i = 0; i < limit; i++) {
+        const char *name = _dyld_get_image_name(i);
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        EmberFnLog(@"  [%u] %s mh=%p", i, name ? name : "(null)", mh);
+    }
+}
+
+static BOOL EmberFnReadUUID(const struct mach_header_64 *mh, uint8_t uuid[16], uint64_t *textSize) {
+    if (!mh || mh->magic != MH_MAGIC_64) return NO;
+    memset(uuid, 0, 16);
+    if (textSize) *textSize = 0;
     const uint8_t *p = (const uint8_t *)(mh + 1);
-    uintptr_t start = 0, size = 0;
-    for (uint32_t i = 0; i < mh->ncmds; i++) {
+    const uint8_t *end = p + mh->sizeofcmds;
+    BOOL gotUUID = NO;
+    for (uint32_t i = 0; i < mh->ncmds && p + sizeof(struct load_command) <= end; i++) {
         const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmdsize < sizeof(*lc) || p + lc->cmdsize > end) break;
+        if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+            memcpy(uuid, ((const struct uuid_command *)lc)->uuid, 16);
+            gotUUID = YES;
+        }
         if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)p;
             if (strncmp(seg->segname, "__TEXT", 6) == 0) {
                 const struct section_64 *sec = (const struct section_64 *)(seg + 1);
                 for (uint32_t s = 0; s < seg->nsects; s++, sec++) {
                     if (strncmp(sec->sectname, "__text", 6) == 0) {
-                        start = (uintptr_t)mh + sec->offset;
-                        size  = sec->size;
+                        if (textSize) *textSize = sec->size;
                         break;
                     }
                 }
@@ -161,29 +192,54 @@ static BOOL EmberFnVerifyHash(const struct mach_header_64 *mh) {
         }
         p += lc->cmdsize;
     }
-    if (!start || !size) { EmberFnLog(@"hash: __text not found"); return NO; }
-    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256((const void *)start, (CC_LONG)size, digest);
-    char hex[65] = {0};
-    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex+2*i, 3, "%02x", digest[i]);
-    if (strcmp(hex, EMBER_FN_EXPECTED_SHA256) == 0) {
-        EmberFnLog(@"hash OK — %s", EMBER_FN_BUILD_VERSION);
-        return YES;
-    }
-    EmberFnLog(@"hash MISMATCH (got %.16s…)", hex);
-    return NO;
+    return gotUUID;
 }
 
-// ── Binary scan ───────────────────────────────────────────────────────────────
-static const struct mach_header_64 *EmberFnFindBinary(void) {
+static BOOL EmberFnVerifyBuild(const struct mach_header_64 *mh, uint32_t imageIndex) {
+    uint8_t uuid[16];
+    uint64_t textSize = 0;
+    if (!EmberFnReadUUID(mh, uuid, &textSize)) {
+        EmberFnLog(@"verify: no LC_UUID on image %u", imageIndex);
+        g_fn_status = @"NO UUID ON IMAGE";
+        return NO;
+    }
+    char hex[33] = {0};
+    for (int i = 0; i < 16; i++) snprintf(hex + 2 * i, 3, "%02x", uuid[i]);
+    EmberFnLog(@"image %u uuid=%s __text=%llu", imageIndex, hex, (unsigned long long)textSize);
+    if (memcmp(uuid, EmberFnExpectedUUID, 16) != 0) {
+        EmberFnLog(@"uuid mismatch — not 42.10");
+        g_fn_status = [NSString stringWithFormat:@"WRONG UUID %.8s", hex];
+        return NO;
+    }
+    if (textSize && textSize != EMBER_FN_TEXT_SIZE) {
+        EmberFnLog(@"__text size mismatch got %llu expected %llu",
+                   (unsigned long long)textSize, (unsigned long long)EMBER_FN_TEXT_SIZE);
+        g_fn_status = @"WRONG __TEXT SIZE";
+        return NO;
+    }
+    EmberFnLog(@"build OK — %s", EMBER_FN_BUILD_VERSION);
+    return YES;
+}
+
+// LiveContainer hooks _dyld_get_image_name so index 0 is the guest, not the host.
+static const struct mach_header_64 *EmberFnFindBinary(uint32_t *outIndex) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (!name) continue;
-        const char *base = strrchr(name, '/');
-        base = base ? base + 1 : name;
-        if (strcasecmp(base, EMBER_FN_GUEST_BINARY) == 0)
-            return (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!EmberFnPathLooksLikeFortnite(name)) continue;
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        if (outIndex) *outIndex = i;
+        return mh;
+    }
+    if (n > 0) {
+        const char *name0 = _dyld_get_image_name(0);
+        const struct mach_header_64 *mh0 = (const struct mach_header_64 *)_dyld_get_image_header(0);
+        if (mh0 && mh0->magic == MH_MAGIC_64) {
+            EmberFnLog(@"no fortnite path; trying hooked image 0: %s", name0 ? name0 : "(null)");
+            if (outIndex) *outIndex = 0;
+            return mh0;
+        }
     }
     return NULL;
 }
@@ -366,7 +422,7 @@ static BOOL fn_project(EmberFnVec3 wl, float aspect, float *sx, float *sy) {
 }
 
 - (NSString *)statusString {
-    if (!g_fn_binary_verified) return @"SEARCHING…";
+    if (!g_fn_binary_verified) return g_fn_status ?: @"SEARCHING…";
     if (!g_fn_dots_enabled)    return @"READY  |  DOTS OFF";
     return [NSString stringWithFormat:@"LIVE  |  %d player%s",
             g_fn_dot_count, g_fn_dot_count==1?"":"s"];
@@ -497,7 +553,7 @@ static BOOL fn_project(EmberFnVec3 wl, float aspect, float *sx, float *sy) {
         // ── Info tab ──
         BOOL ready = g_fn_binary_verified;
         [panel addSection:@"Build"];
-        [panel addAction:(ready ? @"✓ Fortnite 42.10 verified" : @"⏳ Searching for binary…")
+        [panel addAction:(ready ? @"✓ Fortnite 42.10 verified" : (g_fn_status ?: @"⏳ Searching…"))
                   detail:@"" handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"Slide: 0x%lx", (unsigned long)g_fn_slide]
                   detail:@"" handler:^{}];
@@ -539,22 +595,37 @@ static void EmberFortniteInit(void) {
     });
     // Binary polling on background thread
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+        BOOL loggedImages = NO;
         for (int i = 0; i < 240; i++) {   // up to 2 minutes
             [NSThread sleepForTimeInterval:0.5];
-            const struct mach_header_64 *mh = EmberFnFindBinary();
+            if (!loggedImages && i == 2) {
+                EmberFnLogImageInventory();
+                loggedImages = YES;
+            }
+            uint32_t idx = UINT32_MAX;
+            const struct mach_header_64 *mh = EmberFnFindBinary(&idx);
             if (!mh) {
+                g_fn_status = @"NO FORTNITE IMAGE YET";
                 if (i % 20 == 0) EmberFnLog(@"poll %d: binary not found yet", i);
                 continue;
             }
-            intptr_t slide = (intptr_t)mh - (intptr_t)0x100000000;
-            EmberFnLog(@"found at %p slide=0x%lx (attempt %d)", mh, (long)slide, i);
-            if (slide < 0) { EmberFnLog(@"negative slide — aborting"); return; }
-            if (!EmberFnVerifyHash(mh)) return;
+            intptr_t slide = (idx != UINT32_MAX)
+                ? _dyld_get_image_vmaddr_slide(idx)
+                : ((intptr_t)mh - (intptr_t)0x100000000);
+            EmberFnLog(@"candidate image %u at %p slide=0x%lx (attempt %d)",
+                       idx, mh, (long)slide, i);
+            if (slide < 0) {
+                g_fn_status = @"NEGATIVE SLIDE";
+                continue;
+            }
+            if (!EmberFnVerifyBuild(mh, idx)) continue;
             g_fn_slide = (uintptr_t)slide;
             g_fn_binary_verified = YES;
+            g_fn_status = @"VERIFIED 42.10";
             EmberFnLog(@"ready — dots default OFF, tap 🔥 to open menu");
             return;
         }
         EmberFnLog(@"gave up after 120s — binary not found");
+        g_fn_status = @"GAVE UP — SEE LOG";
     });
 }
