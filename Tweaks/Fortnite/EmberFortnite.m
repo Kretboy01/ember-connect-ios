@@ -267,23 +267,60 @@ static uintptr_t fn_world(void) {
     return (w >= 0x100000000ULL) ? w : 0;
 }
 
-static float g_fn_pcm_fov_override = 0.f; // PlayerCameraManager+0x278 when set
+// Contiguous POV header (Location + Rotation + FOV). Copied as one block so a
+// concurrent camera update cannot tear Location from Rotation — that tear is
+// exactly what makes ESP slide off when you look around.
+typedef struct {
+    double loc_x, loc_y, loc_z;
+    double pitch, yaw, roll;
+    float  fov;
+} EmberFnPovHeader;
+
+static BOOL fn_pov_header_ok(const EmberFnPovHeader *h) {
+    if (!h) return NO;
+    if (isnan(h->loc_x)||isnan(h->loc_y)||isnan(h->loc_z)) return NO;
+    if (isnan(h->pitch)||isnan(h->yaw)||isnan(h->roll)) return NO;
+    if (isnan(h->fov)||h->fov < 5.f||h->fov > 179.f) return NO;
+    if (fabs(h->loc_x) > 1e7 || fabs(h->loc_y) > 1e7 || fabs(h->loc_z) > 1e7) return NO;
+    if (fabs(h->pitch) > 360.0 || fabs(h->yaw) > 720.0 || fabs(h->roll) > 360.0) return NO;
+    return YES;
+}
 
 static BOOL fn_read_pov(uintptr_t pov) {
-    double cx = fn_f64(pov+0x00), cy = fn_f64(pov+0x08), cz = fn_f64(pov+0x10);
-    double pitch = fn_f64(pov+0x18), yaw = fn_f64(pov+0x20);
-    float  fov   = fn_f32(pov+0x30);
-    if (isnan(cx)||isnan(cy)||isnan(cz)||isnan(pitch)||isnan(yaw)) return NO;
-    if (isnan(fov)||fov<5.f||fov>179.f) return NO;
-    if (fabs(cx) > 1e7 || fabs(cy) > 1e7 || fabs(cz) > 1e7) return NO;
-    // Prefer LockedFOV on the manager when the game has one (GetFOVAngle path).
-    if (g_fn_pcm_fov_override > 5.f && g_fn_pcm_fov_override < 179.f)
-        fov = g_fn_pcm_fov_override;
-    g_fn_cam_loc   = (EmberFnVec3){cx, cy, cz, YES};
-    g_fn_cam_pitch = pitch;
-    g_fn_cam_yaw   = yaw;
-    g_fn_cam_roll  = 0.0;
-    g_fn_fov       = fov;
+    if (pov < 0x100000000ULL || (pov & 7)) return NO;
+
+    // Contiguous memcpy — never assemble Location from one instant and
+    // Rotation from another via separate loads (that tears under camera motion
+    // and is exactly the "ESP slides when I look" failure mode).
+    EmberFnPovHeader a = {0}, b = {0};
+    memcpy(&a, (const void *)pov, sizeof(a));
+    memcpy(&b, (const void *)pov, sizeof(b));
+
+    const EmberFnPovHeader *use = NULL;
+    if (fn_pov_header_ok(&a) && fn_pov_header_ok(&b)) {
+        // Prefer a consistent pair; if the camera is moving fast and the two
+        // snaps differ, take the newer one rather than keeping a stale frame.
+        if (fabs(a.loc_x - b.loc_x) <= 1.0 && fabs(a.loc_y - b.loc_y) <= 1.0 &&
+            fabs(a.loc_z - b.loc_z) <= 1.0 && fabs(a.pitch - b.pitch) <= 0.05 &&
+            fabs(a.yaw - b.yaw) <= 0.05 && fabs(a.fov - b.fov) <= 0.05) {
+            use = &a;
+        } else {
+            use = &b;
+        }
+    } else if (fn_pov_header_ok(&b)) {
+        use = &b;
+    } else if (fn_pov_header_ok(&a)) {
+        use = &a;
+    } else {
+        return NO;
+    }
+
+    g_fn_cam_loc   = (EmberFnVec3){use->loc_x, use->loc_y, use->loc_z, YES};
+    g_fn_cam_pitch = use->pitch;
+    g_fn_cam_yaw   = use->yaw;
+    g_fn_cam_roll  = use->roll;
+    // POV.FOV only — never LockedFOV (PCM+0x278). Wrong FOV slides ESP off-centre.
+    g_fn_fov       = use->fov;
     return YES;
 }
 
@@ -299,12 +336,29 @@ static void fn_update_camera(uintptr_t world) {
     uintptr_t pcm  = fn_ptr(pc  + FN_OFF_PC_CAMERA_MANAGER);
     if (pcm < 0x100000000ULL) return;
 
-    // GetFOVAngle: ldr s0, [x0, #0x278] then fall back to POV.FOV
-    float locked = fn_f32(pcm + 0x278);
-    g_fn_pcm_fov_override = (!isnan(locked) && locked > 5.f && locked < 179.f) ? locked : 0.f;
+    uintptr_t cache_pov = pcm + FN_OFF_PCM_CACHE_PRIVATE + FN_OFF_CACHE_POV; // +0x1550
+    uintptr_t view_pov  = pcm + FN_OFF_PCM_VIEW_TARGET + FN_OFF_VIEWTARGET_POV; // +0x300
 
-    // CameraCachePrivate.POV only — ViewTarget packing is easy to mis-align.
-    fn_read_pov(pcm + FN_OFF_PCM_CACHE_PRIVATE + FN_OFF_CACHE_POV);
+    // Prefer ViewTarget when its Target* looks live and its POV is near the
+    // published cache (same camera, just fresher). Otherwise use cache only.
+    uintptr_t vt_target = fn_ptr(pcm + FN_OFF_PCM_VIEW_TARGET);
+    EmberFnPovHeader vt = {0}, ch = {0};
+    BOOL vt_ok = (vt_target >= 0x100000000ULL) &&
+                 (memcpy(&vt, (const void *)view_pov, sizeof(vt)), fn_pov_header_ok(&vt));
+    BOOL ch_ok = (memcpy(&ch, (const void *)cache_pov, sizeof(ch)), fn_pov_header_ok(&ch));
+
+    if (vt_ok && ch_ok) {
+        double dloc = fabs(vt.loc_x - ch.loc_x) + fabs(vt.loc_y - ch.loc_y) + fabs(vt.loc_z - ch.loc_z);
+        double drot = fabs(vt.pitch - ch.pitch) + fabs(vt.yaw - ch.yaw);
+        // Same camera system: small delta while turning is expected. Huge delta
+        // means ViewTarget packing is wrong — fall back to cache.
+        if (dloc < 5000.0 && drot < 90.0) {
+            if (fn_read_pov(view_pov)) return;
+        }
+    } else if (vt_ok && !ch_ok) {
+        if (fn_read_pov(view_pov)) return;
+    }
+    fn_read_pov(cache_pov);
 }
 
 static float fn_capsule_half_height(uintptr_t root) {
@@ -361,9 +415,8 @@ static void fn_tick(void) {
 }
 
 // ── Projection ────────────────────────────────────────────────────────────────
-// Windows ProjectWorldToScreen axis math. FOV is horizontal; both axes use
-// (width/2)/tan(halfFov) — that is the correct aspect handling for a real
-// iPhone aspect (~19.5:9). No 16:9 monitor fudge factor.
+// Unreal FRotationMatrix axes (same as Windows to_matrix with roll). FOV is
+// horizontal; both axes use (width/2)/tan(halfFov). No 16:9 fudge.
 static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, float *out_y) {
     if (!g_fn_cam_loc.valid || width <= 1.f || height <= 1.f) return NO;
 
@@ -373,13 +426,20 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
 
     double radpitch = g_fn_cam_pitch * (M_PI / 180.0);
     double radyaw   = g_fn_cam_yaw   * (M_PI / 180.0);
+    double radroll  = g_fn_cam_roll  * (M_PI / 180.0);
     double SP = sin(radpitch), CP = cos(radpitch);
     double SY = sin(radyaw),   CY = cos(radyaw);
+    double SR = sin(radroll),  CR = cos(radroll);
 
-    // Roll = 0. Axes match Unreal FRotationMatrix / Windows to_matrix.
-    double axisx_x = CP * CY,  axisx_y = CP * SY,  axisx_z = SP;
-    double axisy_x = -SY,      axisy_y = CY,       axisy_z = 0.0;
-    double axisz_x = -SP * CY, axisz_y = -SP * SY, axisz_z = CP;
+    double axisx_x = CP * CY;
+    double axisx_y = CP * SY;
+    double axisx_z = SP;
+    double axisy_x = SR * SP * CY - CR * SY;
+    double axisy_y = SR * SP * SY + CR * CY;
+    double axisy_z = -SR * CP;
+    double axisz_x = -(CR * SP * CY + SR * SY);
+    double axisz_y = CY * SR - CR * SP * SY;
+    double axisz_z = CR * CP;
 
     double tx = dx * axisy_x + dy * axisy_y + dz * axisy_z;
     double ty = dx * axisz_x + dy * axisz_y + dz * axisz_z;
