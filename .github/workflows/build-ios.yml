@@ -188,7 +188,6 @@ jobs:
             -framework UIKit \
             -framework QuartzCore \
             -framework CoreGraphics \
-            -framework CommonCrypto \
             -install_name @rpath/EmberFortnite.dylib \
             -o BuiltTweaks/EmberFortnite.dylib
 
