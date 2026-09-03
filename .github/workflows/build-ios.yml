@@ -22,9 +22,17 @@ jobs:
         run: brew install xcodegen
 
       - name: Test Fortnite compatibility guards
+        timeout-minutes: 3
         run: |
-          clang -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined tests/fortnite_guards.c -o /tmp/ember-fortnite-guards
-          /tmp/ember-fortnite-guards
+          python3 -u - <<'PY'
+          import subprocess
+          print("Compiling guard tests", flush=True)
+          subprocess.run(["xcrun", "clang", "-std=c17", "-Wall", "-Wextra", "-Werror",
+                          "-fsanitize=address,undefined", "tests/fortnite_guards.c",
+                          "-o", "/tmp/ember-fortnite-guards"], check=True, timeout=90)
+          print("Running guard tests", flush=True)
+          subprocess.run(["/tmp/ember-fortnite-guards"], check=True, timeout=30)
+          PY
 
       - name: Generate ReplayKit extension project
         run: xcodegen generate
