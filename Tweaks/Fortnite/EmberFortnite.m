@@ -6,8 +6,9 @@
 //      GEngine@0x1147fe0b0 → viewport → world → GameState → PlayerArray → Pawns → Location
 //      world → GameInstance → LocalPlayers[0] → PC → PCM → CameraCachePrivate → POV
 //      PC+0x364 normalized render FOV (same source as Windows get_view_point)
-//  - Uses Fortnite's exact native ProjectWorldToScreen for screen coordinates;
-//    the verified manual camera projection remains a fail-closed fallback.
+//  - Manual Unreal W2S (width-based horizontal FOV). Native ProjectWorldToScreen
+//    is not called: UIKit/CADisplayLink is the wrong thread, and LocalPlayer
+//    axis=0 scaling was proven to shrink boxes. StoreKit prompt hooks stay on.
 //  - EmberMenuPanel (same style as GOI/Subnautica) always appears; shows status.
 //  - Dots drawn by EmberFortniteDotView (CADisplayLink, read-only, default OFF).
 //  - Diagnostics: host Documents/EmberConnect/Fortnite-diag.log
@@ -35,7 +36,6 @@ static const uint8_t EmberFnExpectedUUID[16] = {
 
 // ── Unslid addresses (base 0x100000000) ───────────────────────────────────────
 #define FN_GENGINE_GLOBAL_UNSLID    ((uintptr_t)0x1147fe0b0)
-#define FN_PROJECT_WORLD_TO_SCREEN  ((uintptr_t)0x1052eb430)
 
 #define FN_OFF_ENGINE_VIEWPORT      0xb70
 #define FN_OFF_VIEWPORT_WORLD       0x070
@@ -100,7 +100,6 @@ static double    g_fn_max_distance    = EMBER_FN_MAX_DIST_DEFAULT;
 static BOOL      g_fn_show_labels     = YES;
 
 typedef struct { double x, y, z; BOOL valid; } EmberFnVec3;
-typedef struct { double x, y; } EmberFnVec2;
 typedef struct {
     EmberFnVec3 feet;
     EmberFnVec3 head;
@@ -118,11 +117,7 @@ static float       g_fn_fov        = 80.0f;
 static float       g_fn_pov_fov    = 0.0f;
 static float       g_fn_fov_scalar = 0.0f;
 static BOOL        g_fn_logged_camera_source = NO;
-static uintptr_t   g_fn_player_controller = 0;
-static double      g_fn_native_center_x = 0.0;
-static double      g_fn_native_center_y = 0.0;
-static BOOL        g_fn_logged_native_projection = NO;
-static uint8_t     g_fn_aspect_axis = 1; // fail-safe: MaintainXFOV
+static uint8_t     g_fn_aspect_axis = 1; // diagnostic only; never used for focal
 static uint8_t     g_fn_storekit_suppression_mask = 0;
 
 static void EmberFnSuppressStoreKitPrompts(void);
@@ -341,7 +336,6 @@ static BOOL fn_update_camera(uintptr_t world) {
     if (lp0 < 0x100000000ULL) return NO;
     uintptr_t pc   = fn_ptr(lp0 + FN_OFF_LP_CONTROLLER);
     if (pc  < 0x100000000ULL) return NO;
-    g_fn_player_controller = pc;
     uint8_t axis = *(volatile uint8_t *)(lp0 + FN_OFF_LP_ASPECT_AXIS);
     g_fn_aspect_axis = axis <= 2 ? axis : 1;
     uintptr_t pcm  = fn_ptr(pc  + FN_OFF_PC_CAMERA_MANAGER);
@@ -363,8 +357,8 @@ static BOOL fn_update_camera(uintptr_t world) {
     }
     if (!g_fn_logged_camera_source) {
         g_fn_logged_camera_source = YES;
-        EmberFnLog(@"camera source: PCM POV loc/rot; POV.FOV=%.3f PC+0x364=%.6f renderFOV=%.3f axis=%u",
-                   g_fn_pov_fov, scalar, g_fn_fov, g_fn_aspect_axis);
+        EmberFnLog(@"camera source: PCM POV loc/rot; POV.FOV=%.3f PC+0x364=%.6f renderFOV=%.3f axis=%u pc=%p",
+                   g_fn_pov_fov, scalar, g_fn_fov, g_fn_aspect_axis, (void *)pc);
     }
     return YES;
 }
@@ -418,7 +412,6 @@ static void fn_update_players(uintptr_t world) {
 static void fn_tick(void) {
     if (!g_fn_binary_verified || !g_fn_dots_enabled) {
         g_fn_dot_count = 0;
-        g_fn_player_controller = 0;
         return;
     }
     uintptr_t w = fn_world();
@@ -432,62 +425,11 @@ static void fn_tick(void) {
 }
 
 // ── Projection ────────────────────────────────────────────────────────────────
-typedef bool (*EmberFnNativeProjector)(uintptr_t playerController,
-                                       const EmberFnVec3 *world,
-                                       EmberFnVec2 *screen,
-                                       bool playerViewportRelative);
-
-static BOOL fn_native_project_raw(EmberFnVec3 world, EmberFnVec2 *screen) {
-    if (!screen || !g_fn_binary_verified || !g_fn_player_controller || !g_fn_slide) return NO;
-    EmberFnNativeProjector project = (EmberFnNativeProjector)(FN_PROJECT_WORLD_TO_SCREEN + g_fn_slide);
-    EmberFnVec3 input = {world.x, world.y, world.z, NO};
-    EmberFnVec2 output = {0, 0};
-    bool visible = project(g_fn_player_controller, &input, &output, true);
-    if (!visible || !isfinite(output.x) || !isfinite(output.y)) return NO;
-    *screen = output;
-    return YES;
-}
-
-static BOOL fn_update_native_projection_center(void) {
-    g_fn_native_center_x = 0.0;
-    g_fn_native_center_y = 0.0;
-    if (!g_fn_cam_loc.valid) return NO;
-    const double radians = M_PI / 180.0;
-    double pitch = g_fn_cam_pitch * radians;
-    double yaw = g_fn_cam_yaw * radians;
-    double cosPitch = cos(pitch);
-    EmberFnVec3 forward = {
-        g_fn_cam_loc.x + cosPitch * cos(yaw) * 1000.0,
-        g_fn_cam_loc.y + cosPitch * sin(yaw) * 1000.0,
-        g_fn_cam_loc.z + sin(pitch) * 1000.0,
-        YES
-    };
-    EmberFnVec2 center = {0, 0};
-    if (!fn_native_project_raw(forward, &center) || center.x <= 1.0 || center.y <= 1.0) return NO;
-    g_fn_native_center_x = center.x;
-    g_fn_native_center_y = center.y;
-    return YES;
-}
-
-// Primary path calls Fortnite's exact 42.10 projector. Its coordinates are in
-// the render viewport's units, which may be physical pixels while UIKit draws
-// in points. Projecting the camera-forward ray gives the exact viewport centre
-// in the same units, allowing a resolution-independent mapping to this view.
-// The old formula remains only as a fallback if the native call rejects a point.
+// Width-based horizontal FOV only. Live axis=0 (MaintainYFOV) with POV.FOV=52
+// used height/2 as focal and shrank boxes to ~half size with worse edge drift.
+// Do not call Fortnite's projector from CADisplayLink/main thread.
 static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, float *out_y) {
     if (!g_fn_cam_loc.valid || width <= 1.f || height <= 1.f) return NO;
-    EmberFnVec2 native = {0, 0};
-    if (g_fn_native_center_x > 1.0 && g_fn_native_center_y > 1.0 &&
-        fn_native_project_raw(wl, &native)) {
-        *out_x = (float)(native.x * ((double)width * 0.5 / g_fn_native_center_x));
-        *out_y = (float)(native.y * ((double)height * 0.5 / g_fn_native_center_y));
-        if (!g_fn_logged_native_projection) {
-            g_fn_logged_native_projection = YES;
-            EmberFnLog(@"native W2S active: raw center %.2f,%.2f UIKit %.1f,%.1f",
-                       g_fn_native_center_x, g_fn_native_center_y, width, height);
-        }
-        return isfinite(*out_x) && isfinite(*out_y);
-    }
     double x = 0, y = 0;
     BOOL visible = EmberFnProjectWorldPoint(
         (EmberFnProjectionVec3){wl.x, wl.y, wl.z},
@@ -530,7 +472,6 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
     if (!ctx) return;
     CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
     if (W<=0||H<=0) return;
-    fn_update_native_projection_center();
     int n = g_fn_dot_count;
     EmberFnDot snap[EMBER_FN_MAX_PLAYERS];
     memcpy(snap, g_fn_dots, n * sizeof(EmberFnDot));
@@ -777,11 +718,10 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
                   detail:@"" handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"%d player(s) in array", g_fn_dot_count]
                   detail:@"" handler:^{}];
+        [panel addAction:@"Manual W2S (width FOV)"
+                  detail:@"Native projector off; axis diagnostic only" handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"Render FOV %.2f°", g_fn_fov]
                   detail:[NSString stringWithFormat:@"PC+0x364 %.5f | POV %.2f° | axis %u", g_fn_fov_scalar, g_fn_pov_fov, g_fn_aspect_axis]
-                 handler:^{}];
-        [panel addAction:(g_fn_native_center_x > 1.0 ? @"✓ Native W2S active" : @"⏳ Native W2S pending")
-                  detail:[NSString stringWithFormat:@"raw centre %.1f, %.1f", g_fn_native_center_x, g_fn_native_center_y]
                  handler:^{}];
     }
 }
