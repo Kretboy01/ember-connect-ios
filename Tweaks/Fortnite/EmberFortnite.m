@@ -5,6 +5,7 @@
 //  - Follows raw pointer chain (no Fortnite function calls, no memory writes):
 //      GEngine@0x1147fe0b0 → viewport → world → GameState → PlayerArray → Pawns → Location
 //      world → GameInstance → LocalPlayers[0] → PC → PCM → CameraCachePrivate → POV
+//      PC+0x364 normalized render FOV (same source as Windows get_view_point)
 //  - EmberMenuPanel (same style as GOI/Subnautica) always appears; shows status.
 //  - Dots drawn by EmberFortniteDotView (CADisplayLink, read-only, default OFF).
 //  - Diagnostics: host Documents/EmberConnect/Fortnite-diag.log
@@ -39,6 +40,7 @@ static const uint8_t EmberFnExpectedUUID[16] = {
 #define FN_OFF_GI_LOCALPLAYERS_DATA 0x38
 #define FN_OFF_LP_CONTROLLER        0x30
 #define FN_OFF_PC_CAMERA_MANAGER    0x318
+#define FN_OFF_PC_CAMERA_FOV        0x364  // normalized FOV; render degrees = value * 90
 #define FN_OFF_PCM_CACHE_PRIVATE    0x1540  // inline FCameraCacheEntry
 #define FN_OFF_CACHE_POV            0x10
 
@@ -107,6 +109,9 @@ static double      g_fn_cam_pitch  = 0;
 static double      g_fn_cam_yaw    = 0;
 static double      g_fn_cam_roll   = 0;
 static float       g_fn_fov        = 80.0f;
+static float       g_fn_pov_fov    = 0.0f;
+static float       g_fn_fov_scalar = 0.0f;
+static BOOL        g_fn_logged_camera_source = NO;
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 static NSMutableString *g_fn_log     = nil;
@@ -291,7 +296,7 @@ static BOOL fn_apply_pov_header(const EmberFnPovHeader *use) {
     g_fn_cam_pitch = use->pitch;
     g_fn_cam_yaw   = use->yaw;
     g_fn_cam_roll  = use->roll;
-    // POV.FOV only — never LockedFOV (PCM+0x278). Wrong FOV slides ESP off-centre.
+    g_fn_pov_fov   = use->fov;
     g_fn_fov       = use->fov;
     return YES;
 }
@@ -325,8 +330,26 @@ static BOOL fn_update_camera(uintptr_t world) {
     uintptr_t pcm  = fn_ptr(pc  + FN_OFF_PC_CAMERA_MANAGER);
     if (pcm < 0x100000000ULL) return NO;
 
-    // This is the exact POV returned by Fortnite's PCM camera getters.
-    return fn_read_camera_cache(pcm + FN_OFF_PCM_CACHE_PRIVATE);
+    // Location/rotation come from the exact POV returned by Fortnite's PCM
+    // camera getters. The Windows source's get_view_point does NOT use POV.FOV:
+    // it reads a normalized render FOV from PlayerController and multiplies by
+    // 90. Static ARM64 evidence for 42.10 iOS does the same PC+0x364 load while
+    // constructing view data, so use that source here as well.
+    if (!fn_read_camera_cache(pcm + FN_OFF_PCM_CACHE_PRIVATE)) return NO;
+    float scalar = fn_f32(pc + FN_OFF_PC_CAMERA_FOV);
+    float renderFov = (float)EmberFnRenderFovDegrees(scalar, g_fn_pov_fov);
+    if (!isnan(scalar) && fabsf(renderFov - scalar * 90.0f) < 0.001f) {
+        g_fn_fov_scalar = scalar;
+        g_fn_fov = renderFov;
+    } else {
+        g_fn_fov_scalar = 0.0f;
+    }
+    if (!g_fn_logged_camera_source) {
+        g_fn_logged_camera_source = YES;
+        EmberFnLog(@"camera source: PCM POV loc/rot; POV.FOV=%.3f PC+0x364=%.6f renderFOV=%.3f",
+                   g_fn_pov_fov, scalar, g_fn_fov);
+    }
+    return YES;
 }
 
 static float fn_capsule_half_height(uintptr_t root) {
@@ -501,6 +524,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
 @property (nonatomic, strong) EmberMenuPanel     *panel;
 @property (nonatomic, strong) EmberFortniteDotView *dotView;
 @property (nonatomic, strong) NSTimer            *keepAliveTimer;
+@property (nonatomic, assign) CGSize              installedWindowSize;
 + (instancetype)shared;
 - (void)start;
 @end
@@ -542,8 +566,8 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
         btn.tag = EMBER_FN_BUTTON_TAG;
         btn.frame = CGRectMake(0, 0, 100, 36);
-        CGFloat bx = win.bounds.size.width - 60;
-        CGFloat by = win.bounds.size.height * 0.4;
+        CGFloat bx = MAX(55.0, win.bounds.size.width - 60.0);
+        CGFloat by = MAX(28.0, win.bounds.size.height * 0.4);
         btn.center = CGPointMake(bx, by);
         btn.backgroundColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.1 alpha:0.85];
         btn.layer.cornerRadius = 11;
@@ -563,6 +587,20 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         [self.button removeFromSuperview];
         [win addSubview:self.button];
     }
+    // Fortnite can replace/resize its UIWindow during startup and rotation. A
+    // button created against a zero-sized or portrait window otherwise remains
+    // off-screen even though the tweak and timer are alive.
+    CGSize size = win.bounds.size;
+    BOOL sizeChanged = !CGSizeEqualToSize(size, self.installedWindowSize);
+    CGRect safe = CGRectInset(win.bounds, 8.0, 8.0);
+    if (sizeChanged || !CGRectContainsPoint(safe, self.button.center)) {
+        self.button.center = CGPointMake(MAX(55.0, size.width - 60.0),
+                                         MAX(28.0, size.height * 0.4));
+        self.installedWindowSize = size;
+    }
+    self.button.hidden = NO;
+    self.button.alpha = 1.0;
+    self.button.enabled = YES;
     [win bringSubviewToFront:self.button];
     if (self.panel) [win bringSubviewToFront:self.panel];
     [self updateButton];
@@ -601,6 +639,8 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
     [panel presentInWindow:win];
     self.panel = panel;
     [win bringSubviewToFront:self.dotView];
+    [win bringSubviewToFront:self.button];
+    [win bringSubviewToFront:panel];
 }
 
 - (void)buildPanel:(EmberMenuPanel *)panel {
@@ -663,6 +703,9 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
                   detail:@"" handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"%d player(s) in array", g_fn_dot_count]
                   detail:@"" handler:^{}];
+        [panel addAction:[NSString stringWithFormat:@"Render FOV %.2f°", g_fn_fov]
+                  detail:[NSString stringWithFormat:@"PC+0x364 %.5f | POV %.2f°", g_fn_fov_scalar, g_fn_pov_fov]
+                 handler:^{}];
     }
 }
 

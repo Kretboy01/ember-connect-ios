@@ -6,6 +6,13 @@
 
 typedef struct { double x, y, z; } EmberFnProjectionVec3;
 
+// Fortnite's PlayerController camera field stores FOV as a 90-degree scalar,
+// matching the original Windows get_view_point() implementation.
+static inline double EmberFnRenderFovDegrees(double normalized, double fallback) {
+    const double degrees = normalized * 90.0;
+    return isfinite(degrees) && degrees > 5.0 && degrees < 179.0 ? degrees : fallback;
+}
+
 // Unreal FRotationMatrix world-to-screen projection. Rotation and horizontal
 // FOV are degrees; UIKit's screen origin is at the top left.
 static inline bool EmberFnProjectWorldPoint(EmberFnProjectionVec3 world,

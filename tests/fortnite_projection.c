@@ -8,6 +8,10 @@ static void near(double actual, double expected, double tolerance) {
 }
 
 int main(void) {
+    near(EmberFnRenderFovDegrees(1.0, 80.0), 90.0, 0.001);
+    near(EmberFnRenderFovDegrees(0.0, 80.0), 80.0, 0.001);
+    near(EmberFnRenderFovDegrees(NAN, 75.0), 75.0, 0.001);
+
     const EmberFnProjectionVec3 origin = {0, 0, 0};
     double x = 0, y = 0;
 
