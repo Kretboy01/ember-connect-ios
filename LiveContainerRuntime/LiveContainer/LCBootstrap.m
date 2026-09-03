@@ -385,7 +385,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         return @"App not found";
     }
 
-    EmberFortniteCompatibilityPrepare(appBundle, guestAppInfo, docPath);
+    if (!isLiveProcess) EmberFortniteCompatibilityPrepare(appBundle, guestAppInfo, docPath);
     
     // find container in Info.plist
     NSString* dataUUID = selectedContainer;

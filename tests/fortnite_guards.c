@@ -20,6 +20,8 @@ static void check_name(const char *text, bool expected) {
 }
 
 int main(void) {
+    puts("Starting Fortnite guard tests");
+    fflush(stdout);
     check_name("com.apple.developer.kernel.extended-virtual-addressing", true);
     check_name("com.apple.developer.kernel.increased-memory-limit", true);
     check_name("get-task-allow", false);

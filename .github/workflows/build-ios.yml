@@ -6,7 +6,18 @@ on:
   workflow_dispatch:
 
 jobs:
+  guard-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test guards with address and undefined-behavior sanitizers
+        run: |
+          cc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined tests/fortnite_guards.c -o /tmp/ember-fortnite-guards
+          timeout 30 /tmp/ember-fortnite-guards
+
   build:
+    needs: guard-tests
     runs-on: macos-latest
 
     steps:
@@ -28,7 +39,7 @@ jobs:
           import subprocess
           print("Compiling guard tests", flush=True)
           subprocess.run(["xcrun", "clang", "-std=c17", "-Wall", "-Wextra", "-Werror",
-                          "-fsanitize=address,undefined", "tests/fortnite_guards.c",
+                          "tests/fortnite_guards.c",
                           "-o", "/tmp/ember-fortnite-guards"], check=True, timeout=90)
           print("Running guard tests", flush=True)
           subprocess.run(["/tmp/ember-fortnite-guards"], check=True, timeout=30)
