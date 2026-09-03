@@ -6,9 +6,11 @@
 //      GEngine@0x1147fe0b0 → viewport → world → GameState → PlayerArray → Pawns → Location
 //      world → GameInstance → LocalPlayers[0] → PC → PCM → CameraCachePrivate → POV
 //      PC+0x364 normalized render FOV (same source as Windows get_view_point)
-//  - Manual Unreal W2S (width-based horizontal FOV). Native ProjectWorldToScreen
-//    is not called: UIKit/CADisplayLink is the wrong thread, and LocalPlayer
-//    axis=0 scaling was proven to shrink boxes. StoreKit prompt hooks stay on.
+//  - Native APlayerController::ProjectWorldLocationToScreen at unslid
+//    0x1052eb430 (exec wrapper 0x105445a6c). ABI: x0 PC, x1 FVector*,
+//    x2 FVector2D*, w3 viewport-relative. Manual Unreal W2S is fallback only.
+//    No 2D X/Y flips and no Metal-rect remap — those made tracking worse.
+//  - StoreKit prompt hooks stay on.
 //  - EmberMenuPanel (same style as GOI/Subnautica) always appears; shows status.
 //  - Dots drawn by EmberFortniteDotView (CADisplayLink, read-only, default OFF).
 //  - Diagnostics: host Documents/EmberConnect/Fortnite-diag.log
@@ -20,6 +22,7 @@
 #import <mach-o/loader.h>
 #import <math.h>
 #import <objc/runtime.h>
+#import <stdbool.h>
 #import <string.h>
 #import "../Shared/EmberMenu.h"
 #import "EmberFortniteProjection.h"
@@ -36,6 +39,7 @@ static const uint8_t EmberFnExpectedUUID[16] = {
 
 // ── Unslid addresses (base 0x100000000) ───────────────────────────────────────
 #define FN_GENGINE_GLOBAL_UNSLID    ((uintptr_t)0x1147fe0b0)
+#define FN_PROJECT_WORLD_TO_SCREEN  ((uintptr_t)0x1052eb430)
 
 #define FN_OFF_ENGINE_VIEWPORT      0xb70
 #define FN_OFF_VIEWPORT_WORLD       0x070
@@ -100,6 +104,8 @@ static double    g_fn_max_distance    = EMBER_FN_MAX_DIST_DEFAULT;
 static BOOL      g_fn_show_labels     = YES;
 
 typedef struct { double x, y, z; BOOL valid; } EmberFnVec3;
+typedef struct { double x, y, z; } EmberFnWorld3;
+typedef struct { double x, y; } EmberFnScreen2;
 typedef struct {
     EmberFnVec3 feet;
     EmberFnVec3 head;
@@ -117,6 +123,8 @@ static float       g_fn_fov        = 80.0f;
 static float       g_fn_pov_fov    = 0.0f;
 static float       g_fn_fov_scalar = 0.0f;
 static BOOL        g_fn_logged_camera_source = NO;
+static uintptr_t   g_fn_player_controller = 0;
+static BOOL        g_fn_logged_native_projection = NO;
 static uint8_t     g_fn_aspect_axis = 1; // diagnostic only; never used for focal
 static uint8_t     g_fn_storekit_suppression_mask = 0;
 
@@ -336,6 +344,7 @@ static BOOL fn_update_camera(uintptr_t world) {
     if (lp0 < 0x100000000ULL) return NO;
     uintptr_t pc   = fn_ptr(lp0 + FN_OFF_LP_CONTROLLER);
     if (pc  < 0x100000000ULL) return NO;
+    g_fn_player_controller = pc;
     uint8_t axis = *(volatile uint8_t *)(lp0 + FN_OFF_LP_ASPECT_AXIS);
     g_fn_aspect_axis = axis <= 2 ? axis : 1;
     uintptr_t pcm  = fn_ptr(pc  + FN_OFF_PC_CAMERA_MANAGER);
@@ -412,61 +421,77 @@ static void fn_update_players(uintptr_t world) {
 static void fn_tick(void) {
     if (!g_fn_binary_verified || !g_fn_dots_enabled) {
         g_fn_dot_count = 0;
+        g_fn_player_controller = 0;
         return;
     }
     uintptr_t w = fn_world();
-    if (!w) { g_fn_dot_count = 0; return; }
+    if (!w) { g_fn_dot_count = 0; g_fn_player_controller = 0; return; }
     if (!fn_update_camera(w)) {
         g_fn_cam_loc.valid = NO;
+        g_fn_player_controller = 0;
         g_fn_dot_count = 0;
         return;
     }
     fn_update_players(w);
 }
 
-static CALayer *EmberFnLargestMetalLayer(CALayer *layer, CALayer *best) {
-    Class metal = NSClassFromString(@"CAMetalLayer");
-    if (!metal || !layer) return best;
-    if ([layer isKindOfClass:metal]) {
-        CGFloat area = layer.bounds.size.width * layer.bounds.size.height;
-        CGFloat bestArea = best ? (best.bounds.size.width * best.bounds.size.height) : 0;
-        if (area > bestArea && area > 4096.0) best = layer;
-    }
-    for (CALayer *child in layer.sublayers) {
-        best = EmberFnLargestMetalLayer(child, best);
-    }
-    return best;
+typedef bool (*EmberFnNativeProjector)(uintptr_t playerController,
+                                       const EmberFnWorld3 *world,
+                                       EmberFnScreen2 *screen,
+                                       bool playerViewportRelative);
+
+static BOOL g_fn_native_ok = NO;
+static float g_fn_native_to_points = 1.f;
+
+static BOOL fn_native_project_raw(EmberFnVec3 world, EmberFnScreen2 *screen) {
+    if (!screen || !g_fn_binary_verified || !g_fn_player_controller || !g_fn_slide) return NO;
+    EmberFnNativeProjector project =
+        (EmberFnNativeProjector)(FN_PROJECT_WORLD_TO_SCREEN + g_fn_slide);
+    EmberFnWorld3 input = { world.x, world.y, world.z };
+    EmberFnScreen2 output = { 0, 0 };
+    bool visible = project(g_fn_player_controller, &input, &output, true);
+    if (!visible || !isfinite(output.x) || !isfinite(output.y)) return NO;
+    *screen = output;
+    return YES;
 }
 
-// Fortnite's Metal layer can be letterboxed inside the Ember window. Project in
-// that rectangle. Device result on 77bdf82: flipping UIKit X made horizontal
-// still opposite; vertical movement is mirrored. Keep Unreal +X and flip Y to
-// match Metal's framebuffer origin (bottom-left vs UIKit top-left).
-static CGRect EmberFnRenderViewportInView(UIView *view) {
-    CGRect fallback = view.bounds;
-    UIWindow *win = view.window ?: EmberFnHostWindow();
-    if (!win) return fallback;
-    CALayer *metal = EmberFnLargestMetalLayer(win.layer, nil);
-    if (!metal) return fallback;
-    CGRect rect = [view.layer convertRect:metal.bounds fromLayer:metal];
-    if (rect.size.width < 64.0 || rect.size.height < 64.0) return fallback;
-    static BOOL logged;
-    if (!logged) {
-        logged = YES;
-        CGSize drawable = CGSizeZero;
-        if ([metal respondsToSelector:@selector(drawableSize)]) {
-            drawable = [(id)metal drawableSize];
-        }
-        EmberFnLog(@"render viewport overlay=%.0fx%.0f metal=%.0f,%.0f %.0fx%.0f drawable=%.0fx%.0f",
-                   fallback.size.width, fallback.size.height,
-                   rect.origin.x, rect.origin.y, rect.size.width, rect.size.height,
-                   drawable.width, drawable.height);
-    }
-    return rect;
+// One uniform pixel→point scale. Never independently rescale X vs Y to force
+// the overlay centre (115271b did that and can warp tracking).
+static void fn_learn_native_scale(float width, float height) {
+    if (g_fn_logged_native_projection || !g_fn_cam_loc.valid) return;
+    const double radians = M_PI / 180.0;
+    double pitch = g_fn_cam_pitch * radians;
+    double yaw = g_fn_cam_yaw * radians;
+    double cosPitch = cos(pitch);
+    EmberFnVec3 forward = {
+        g_fn_cam_loc.x + cosPitch * cos(yaw) * 1000.0,
+        g_fn_cam_loc.y + cosPitch * sin(yaw) * 1000.0,
+        g_fn_cam_loc.z + sin(pitch) * 1000.0,
+        YES
+    };
+    EmberFnScreen2 center = { 0, 0 };
+    if (!fn_native_project_raw(forward, &center)) return;
+    CGFloat screenScale = [UIScreen mainScreen].scale;
+    if (screenScale < 1.f) screenScale = 1.f;
+    double errPts = fabs(center.x - width * 0.5) + fabs(center.y - height * 0.5);
+    double errPx  = fabs(center.x - width * screenScale * 0.5) +
+                    fabs(center.y - height * screenScale * 0.5);
+    g_fn_native_to_points = (errPx < errPts) ? (float)screenScale : 1.f;
+    g_fn_native_ok = YES;
+    g_fn_logged_native_projection = YES;
+    EmberFnLog(@"native W2S active: raw center %.2f,%.2f overlay %.1fx%.1f scale %.3f",
+               center.x, center.y, width, height, g_fn_native_to_points);
 }
 
 static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, float *out_y) {
     if (!g_fn_cam_loc.valid || width <= 1.f || height <= 1.f) return NO;
+    fn_learn_native_scale(width, height);
+    EmberFnScreen2 native = { 0, 0 };
+    if (g_fn_native_ok && fn_native_project_raw(wl, &native)) {
+        *out_x = (float)(native.x / g_fn_native_to_points);
+        *out_y = (float)(native.y / g_fn_native_to_points);
+        return isfinite(*out_x) && isfinite(*out_y);
+    }
     double x = 0, y = 0;
     BOOL visible = EmberFnProjectWorldPoint(
         (EmberFnProjectionVec3){wl.x, wl.y, wl.z},
@@ -475,7 +500,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         width, height, &x, &y);
     if (!visible) return NO;
     *out_x = (float)x;
-    *out_y = (float)(height - y);
+    *out_y = (float)y;
     return YES;
 }
 
@@ -507,8 +532,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
     if (!g_fn_dots_enabled || !g_fn_cam_loc.valid) return;
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
-    CGRect vp = EmberFnRenderViewportInView(self);
-    CGFloat W = vp.size.width, H = vp.size.height;
+    CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
     if (W<=0||H<=0) return;
     int n = g_fn_dot_count;
     EmberFnDot snap[EMBER_FN_MAX_PLAYERS];
@@ -524,12 +548,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         float bx=0, by=0, hx=0, hy=0;
         if (!fn_project(snap[i].feet, (float)W, (float)H, &bx, &by)) continue;
         if (!fn_project(snap[i].head, (float)W, (float)H, &hx, &hy)) continue;
-        bx += (float)vp.origin.x;
-        by += (float)vp.origin.y;
-        hx += (float)vp.origin.x;
-        hy += (float)vp.origin.y;
-        if (bx < -50 || bx > self.bounds.size.width+50 ||
-            by < -50 || by > self.bounds.size.height+50) continue;
+        if (bx < -50 || bx > W+50 || by < -50 || by > H+50) continue;
 
         CGFloat box_h = (CGFloat)fabs(by - hy);
         if (box_h < 8.f) box_h = 8.f;
@@ -551,7 +570,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         }
 
         if (g_fn_snapline_enabled) {
-            CGContextMoveToPoint(ctx, vp.origin.x + W * 0.5, vp.origin.y + H * 0.5);
+            CGContextMoveToPoint(ctx, W * 0.5, H * 0.5);
             CGContextAddLineToPoint(ctx, bx, by);
             CGContextStrokePath(ctx);
         }
@@ -716,7 +735,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         BOOL ready = g_fn_binary_verified;
         [panel addSection:@"ESP"];
         [panel addToggle:@"Enable ESP"
-                  detail:(ready ? @"Read-only overlay (Windows-style W2S)" : @"Waiting for Fortnite binary…")
+                  detail:(ready ? @"Fortnite native projector (no 2D flips)" : @"Waiting for Fortnite binary…")
                  enabled:g_fn_dots_enabled
                  handler:^(BOOL on) {
             if (!g_fn_binary_verified) { [panel setStatus:@"Binary not verified yet"]; return; }
@@ -761,8 +780,9 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
                   detail:@"" handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"%d player(s) in array", g_fn_dot_count]
                   detail:@"" handler:^{}];
-        [panel addAction:@"Manual W2S (width FOV)"
-                  detail:@"Native projector off; axis diagnostic only" handler:^{}];
+        [panel addAction:(g_fn_native_ok ? @"✓ Native W2S active" : @"⏳ Native W2S pending")
+                  detail:[NSString stringWithFormat:@"uniform scale %.3f (no X/Y warp)", g_fn_native_to_points]
+                 handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"Render FOV %.2f°", g_fn_fov]
                   detail:[NSString stringWithFormat:@"PC+0x364 %.5f | POV %.2f° | axis %u", g_fn_fov_scalar, g_fn_pov_fov, g_fn_aspect_axis]
                  handler:^{}];
