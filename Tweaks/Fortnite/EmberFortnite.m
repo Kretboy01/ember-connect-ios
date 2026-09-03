@@ -54,6 +54,9 @@ static const uint8_t EmberFnExpectedUUID[16] = {
 #define FN_OFF_ROOT_LOC_Y           0x208
 #define FN_OFF_ROOT_LOC_Z           0x210
 #define FN_OFF_PC_ACKNOWLEDGED_PAWN 0x308
+#define FN_OFF_POV_ASPECT           0x5c    // FMinimalViewInfo.AspectRatio (float)
+// ACharacter root is the capsule centre. Default mannequin half-height is 88 UU.
+#define FN_CAPSULE_HALF_HEIGHT      88.0
 
 #define EMBER_FN_MAX_PLAYERS        100
 #define EMBER_FN_DOT_RADIUS_PTS     7.0f
@@ -92,9 +95,11 @@ typedef struct { EmberFnVec3 loc; BOOL is_local; } EmberFnDot;
 static EmberFnDot  g_fn_dots[EMBER_FN_MAX_PLAYERS];
 static int         g_fn_dot_count  = 0;
 static EmberFnVec3 g_fn_cam_loc    = {0,0,0,NO};
-static double      g_fn_cam_pitch  = 0; // radians
+static double      g_fn_cam_pitch  = 0; // radians, Unreal: +pitch looks up
 static double      g_fn_cam_yaw    = 0;
-static float       g_fn_fov        = 90.0f;
+static double      g_fn_cam_roll   = 0;
+static float       g_fn_fov        = 80.0f;
+static float       g_fn_aspect     = 0; // 0 = use overlay bounds
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 static NSMutableString *g_fn_log     = nil;
@@ -267,14 +272,17 @@ static void fn_update_camera(uintptr_t world) {
     if (pcm < 0x100000000ULL) return;
     uintptr_t pov  = pcm + FN_OFF_PCM_CACHE_PRIVATE + FN_OFF_CACHE_POV;
     double cx = fn_f64(pov+0x00), cy = fn_f64(pov+0x08), cz = fn_f64(pov+0x10);
-    double pitch = fn_f64(pov+0x18), yaw = fn_f64(pov+0x20);
+    double pitch = fn_f64(pov+0x18), yaw = fn_f64(pov+0x20), roll = fn_f64(pov+0x28);
     float  fov   = fn_f32(pov+0x30);
-    if (isnan(cx)||isnan(cy)||isnan(cz)||isnan(pitch)||isnan(yaw)) return;
+    float  aspect = fn_f32(pov+FN_OFF_POV_ASPECT);
+    if (isnan(cx)||isnan(cy)||isnan(cz)||isnan(pitch)||isnan(yaw)||isnan(roll)) return;
     if (isnan(fov)||fov<5.f||fov>179.f) return;
     g_fn_cam_loc   = (EmberFnVec3){cx, cy, cz, YES};
     g_fn_cam_pitch = pitch * (M_PI/180.0);
     g_fn_cam_yaw   = yaw   * (M_PI/180.0);
+    g_fn_cam_roll  = isnan(roll) ? 0.0 : roll * (M_PI/180.0);
     g_fn_fov       = fov;
+    g_fn_aspect    = (!isnan(aspect) && aspect > 0.2f && aspect < 5.0f) ? aspect : 0.f;
 }
 
 static void fn_update_players(uintptr_t world) {
@@ -303,6 +311,8 @@ static void fn_update_players(uintptr_t world) {
         double py = fn_f64(root+FN_OFF_ROOT_LOC_Y);
         double pz = fn_f64(root+FN_OFF_ROOT_LOC_Z);
         if (isnan(px)||isnan(py)||isnan(pz)) continue;
+        // Root is the capsule centre; drop to the feet so the marker stays planted.
+        pz -= FN_CAPSULE_HALF_HEIGHT;
         g_fn_dots[count].loc = (EmberFnVec3){px,py,pz,YES};
         g_fn_dots[count].is_local = (pawn == local_pawn);
         count++;
@@ -319,24 +329,49 @@ static void fn_tick(void) {
 }
 
 // ── Projection ────────────────────────────────────────────────────────────────
-static BOOL fn_project(EmberFnVec3 wl, float aspect, float *sx, float *sy) {
-    if (!g_fn_cam_loc.valid) return NO;
+// World → camera using Unreal FRotationMatrix axes, then the same FOV rule
+// SceneView uses: wider-than-tall viewports treat FOV as horizontal.
+static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *sx, float *sy) {
+    if (!g_fn_cam_loc.valid || width <= 1.f || height <= 1.f) return NO;
     double dx = wl.x - g_fn_cam_loc.x;
     double dy = wl.y - g_fn_cam_loc.y;
     double dz = wl.z - g_fn_cam_loc.z;
-    // UE4: X=forward, Y=right, Z=up; yaw rotates XY, pitch tilts forward/up
-    double cy = cos(-g_fn_cam_yaw),   sy2 = sin(-g_fn_cam_yaw);
-    double cp = cos(-g_fn_cam_pitch), sp  = sin(-g_fn_cam_pitch);
-    double rx = dx*cy - dy*sy2;
-    double ry = dx*sy2 + dy*cy;
-    double rz = dz;
-    double fwd   =  rx*cp + rz*sp;
-    double right =  ry;
-    double up    = -rx*sp + rz*cp;
-    if (fwd <= 0.0) return NO;
-    double t = tan((g_fn_fov*0.5)*(M_PI/180.0));
-    *sx = (float)(0.5 + (right/(fwd*t)) * 0.5);
-    *sy = (float)(0.5 - (up   /(fwd*t*aspect)) * 0.5);
+
+    double SP = sin(g_fn_cam_pitch), CP = cos(g_fn_cam_pitch);
+    double SY = sin(g_fn_cam_yaw),   CY = cos(g_fn_cam_yaw);
+    double SR = sin(g_fn_cam_roll),  CR = cos(g_fn_cam_roll);
+
+    // Camera axes in world space (Unreal FRotationMatrix).
+    double fwd_x = CP * CY;
+    double fwd_y = CP * SY;
+    double fwd_z = SP;
+    double right_x = SR * SP * CY - CR * SY;
+    double right_y = SR * SP * SY + CR * CY;
+    double right_z = -SR * CP;
+    double up_x = -(CR * SP * CY + SR * SY);
+    double up_y = CY * SR - CR * SP * SY;
+    double up_z = CR * CP;
+
+    double fwd   = dx * fwd_x   + dy * fwd_y   + dz * fwd_z;
+    double right = dx * right_x + dy * right_y + dz * right_z;
+    double up    = dx * up_x    + dy * up_y    + dz * up_z;
+    if (fwd <= 1.0) return NO;
+
+    double half = tan((g_fn_fov * 0.5) * (M_PI / 180.0));
+    if (half < 1e-4) return NO;
+    double aspect = (double)width / (double)height;
+    if (g_fn_aspect > 0.2f && fabs(g_fn_aspect - aspect) < 0.35)
+        aspect = (double)g_fn_aspect;
+    double ndc_x, ndc_y;
+    if (aspect >= 1.0) {
+        ndc_x = right / (fwd * half);
+        ndc_y = (up * aspect) / (fwd * half);
+    } else {
+        ndc_x = (right / aspect) / (fwd * half);
+        ndc_y = up / (fwd * half);
+    }
+    *sx = (float)(0.5 + 0.5 * ndc_x);
+    *sy = (float)(0.5 - 0.5 * ndc_y); // UIKit origin is top-left
     return YES;
 }
 
@@ -352,6 +387,7 @@ static BOOL fn_project(EmberFnVec3 wl, float aspect, float *sx, float *sy) {
         self.backgroundColor = UIColor.clearColor;
         self.userInteractionEnabled = NO;
         self.opaque = NO;
+        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         _dl = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
         _dl.preferredFramesPerSecond = 60;
         [_dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
@@ -366,7 +402,6 @@ static BOOL fn_project(EmberFnVec3 wl, float aspect, float *sx, float *sy) {
     if (!ctx) return;
     CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
     if (W<=0||H<=0) return;
-    float asp = (float)(W/H);
     int n = g_fn_dot_count;
     EmberFnDot snap[EMBER_FN_MAX_PLAYERS];
     memcpy(snap, g_fn_dots, n * sizeof(EmberFnDot));
@@ -377,7 +412,7 @@ static BOOL fn_project(EmberFnVec3 wl, float aspect, float *sx, float *sy) {
         double dist = sqrt(ddx*ddx+ddy*ddy+ddz*ddz);
         if (dist > g_fn_max_distance) continue;
         float sx=0, sy=0;
-        if (!fn_project(snap[i].loc, asp, &sx, &sy)) continue;
+        if (!fn_project(snap[i].loc, (float)W, (float)H, &sx, &sy)) continue;
         if (sx<-0.05f||sx>1.05f||sy<-0.05f||sy>1.05f) continue;
         CGFloat px = sx*W, py = sy*H;
         CGFloat rad = MAX(3.0, EMBER_FN_DOT_RADIUS_PTS * (1000.0/(dist>1000?dist:1000)));
