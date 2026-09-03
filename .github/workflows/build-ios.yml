@@ -175,6 +175,26 @@ jobs:
           file BuiltTweaks/CloverPit.dylib
           xcrun otool -L BuiltTweaks/CloverPit.dylib
 
+          # EmberFortnite — read-only UE4 player-dot overlay for Fortnite 42.10.
+          # No IL2CPP, no function calls: pure pointer chain reads + UIKit draw.
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -fblocks \
+            -dynamiclib \
+            Tweaks/Fortnite/EmberFortnite.m \
+            -framework Foundation \
+            -framework UIKit \
+            -framework QuartzCore \
+            -framework CoreGraphics \
+            -framework CommonCrypto \
+            -install_name @rpath/EmberFortnite.dylib \
+            -o BuiltTweaks/EmberFortnite.dylib
+
+          file BuiltTweaks/EmberFortnite.dylib
+          xcrun otool -L BuiltTweaks/EmberFortnite.dylib
+
       - name: Assemble Ember container host
         run: |
           APP="DerivedDataContainer/Build/Products/Release-iphoneos/LiveContainer.app"
@@ -201,6 +221,7 @@ jobs:
           cp BuiltTweaks/GettingOverIt.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/Subnautica.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/CloverPit.dylib "$APP/EmberTweaks/"
+          cp BuiltTweaks/EmberFortnite.dylib "$APP/EmberTweaks/"
 
       - name: Verify container, branding, and App ID usage
         run: |
@@ -224,6 +245,7 @@ jobs:
           test -f "$APP/EmberTweaks/GettingOverIt.dylib"
           test -f "$APP/EmberTweaks/Subnautica.dylib"
           test -f "$APP/EmberTweaks/CloverPit.dylib"
+          test -f "$APP/EmberTweaks/EmberFortnite.dylib"
 
           echo "Verified Ember Connect host with one ReplayKit extension."
 
@@ -246,3 +268,4 @@ jobs:
             BuiltTweaks/GettingOverIt.dylib
             BuiltTweaks/Subnautica.dylib
             BuiltTweaks/CloverPit.dylib
+            BuiltTweaks/EmberFortnite.dylib
