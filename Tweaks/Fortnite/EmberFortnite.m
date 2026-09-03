@@ -456,9 +456,10 @@ static BOOL fn_project(EmberFnVec3 wl, float aspect, float *sx, float *sy) {
 
 - (void)buildPanel:(EmberMenuPanel *)panel {
     [panel setStatus:[self statusString]];
+    __weak EmberMenuPanel *wpanel = panel;
+    __weak typeof(self) wself = self;
     [panel setTabs:@[@"Dots", @"Info"] activeTab:0 handler:^(NSInteger idx) {
-        __weak EmberMenuPanel *wp = panel;
-        if (wp) { [wp clearRows]; [self fillTab:idx panel:wp]; }
+        if (wpanel) { [wpanel clearRows]; [wself fillTab:idx panel:wpanel]; }
     }];
     [self fillTab:0 panel:panel];
 }
@@ -469,7 +470,7 @@ static BOOL fn_project(EmberFnVec3 wl, float aspect, float *sx, float *sy) {
         BOOL ready = g_fn_binary_verified;
         [panel addSection:@"Player Dots"];
         [panel addToggle:@"Show dots"
-                  detail:ready ? @"Highlights other players" : @"Waiting for Fortnite binary…"
+                  detail:(ready ? @"Highlights other players" : @"Waiting for Fortnite binary…")
                  enabled:g_fn_dots_enabled
                  handler:^(BOOL on) {
             if (!g_fn_binary_verified) { [panel setStatus:@"Binary not verified yet"]; return; }
@@ -494,19 +495,20 @@ static BOOL fn_project(EmberFnVec3 wl, float aspect, float *sx, float *sy) {
         }];
     } else {
         // ── Info tab ──
+        BOOL ready = g_fn_binary_verified;
         [panel addSection:@"Build"];
-        [panel addAction:ready ? @"✓ Fortnite 42.10 verified" : @"⏳ Searching for binary…"
-                  detail:nil handler:nil];
+        [panel addAction:(ready ? @"✓ Fortnite 42.10 verified" : @"⏳ Searching for binary…")
+                  detail:@"" handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"Slide: 0x%lx", (unsigned long)g_fn_slide]
-                  detail:nil handler:nil];
+                  detail:@"" handler:^{}];
         [panel addSection:@"Chain status"];
-        uintptr_t w = g_fn_binary_verified ? fn_world() : 0;
-        [panel addAction:w ? @"✓ World found" : @"✗ World not found"
-                  detail:nil handler:nil];
-        [panel addAction:g_fn_cam_loc.valid ? @"✓ Camera valid" : @"✗ Camera not read yet"
-                  detail:nil handler:nil];
+        uintptr_t w = ready ? fn_world() : 0;
+        [panel addAction:(w ? @"✓ World found" : @"✗ World not found")
+                  detail:@"" handler:^{}];
+        [panel addAction:(g_fn_cam_loc.valid ? @"✓ Camera valid" : @"✗ Camera not read yet")
+                  detail:@"" handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"%d player(s) in array", g_fn_dot_count]
-                  detail:nil handler:nil];
+                  detail:@"" handler:^{}];
     }
 }
 
