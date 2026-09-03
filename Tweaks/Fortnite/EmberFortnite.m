@@ -4,12 +4,12 @@
 //  - Polls dyld images for FortniteClient-IOS-Shipping, verifies __text SHA-256.
 //  - Follows raw pointer chains for players/camera (no memory writes):
 //      GEngine@0x1147fe0b0 → viewport → world → GameState → PlayerArray → Pawns → Location
-//      world → GameInstance → LocalPlayers[0] → PC → PCM → CameraCachePrivate → POV
-//      PC+0x364 normalized render FOV (same source as Windows get_view_point)
-//  - Native APlayerController::ProjectWorldLocationToScreen at unslid
-//    0x1052eb430 (exec wrapper 0x105445a6c). ABI: x0 PC, x1 FVector*,
-//    x2 FVector2D*, w3 viewport-relative. Manual Unreal W2S is fallback only.
-//    No 2D X/Y flips and no Metal-rect remap — those made tracking worse.
+//  - Camera matches Windows get_view_point() structure, not Windows offsets:
+//      UWorld loc/rot pointers (discovered live on 42.10), CamRotation
+//      asin/atan2 decode, PlayerController+0x364 * 90 FOV.
+//      CameraCachePrivate POV is the seed/fallback only.
+//  - W2S is the shared Unreal helper (same math as sdk.hpp ProjectWorldToScreen).
+//    No native ProjectWorldToScreen, no 2D X/Y flips, no 16:9 fudge.
 //  - StoreKit prompt hooks stay on.
 //  - EmberMenuPanel (same style as GOI/Subnautica) always appears; shows status.
 //  - Dots drawn by EmberFortniteDotView (CADisplayLink, read-only, default OFF).
@@ -18,11 +18,11 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <math.h>
 #import <objc/runtime.h>
-#import <stdbool.h>
 #import <string.h>
 #import "../Shared/EmberMenu.h"
 #import "EmberFortniteProjection.h"
@@ -39,7 +39,6 @@ static const uint8_t EmberFnExpectedUUID[16] = {
 
 // ── Unslid addresses (base 0x100000000) ───────────────────────────────────────
 #define FN_GENGINE_GLOBAL_UNSLID    ((uintptr_t)0x1147fe0b0)
-#define FN_PROJECT_WORLD_TO_SCREEN  ((uintptr_t)0x1052eb430)
 
 #define FN_OFF_ENGINE_VIEWPORT      0xb70
 #define FN_OFF_VIEWPORT_WORLD       0x070
@@ -67,6 +66,8 @@ static const uint8_t EmberFnExpectedUUID[16] = {
 #define FN_OFF_ROOT_LOC_Z           0x210
 #define FN_OFF_PC_ACKNOWLEDGED_PAWN 0x308
 #define FN_OFF_POV_ASPECT           0x5c    // FMinimalViewInfo.AspectRatio (float)
+#define FN_OFF_CAMROT_Y             0x20    // Windows CamRotation.y
+#define FN_OFF_CAMROT_Z             0x1d0   // Windows CamRotation.z
 
 #define EMBER_FN_MAX_PLAYERS        100
 #define EMBER_FN_DOT_RADIUS_PTS     5.0f
@@ -104,8 +105,6 @@ static double    g_fn_max_distance    = EMBER_FN_MAX_DIST_DEFAULT;
 static BOOL      g_fn_show_labels     = YES;
 
 typedef struct { double x, y, z; BOOL valid; } EmberFnVec3;
-typedef struct { double x, y, z; } EmberFnWorld3;
-typedef struct { double x, y; } EmberFnScreen2;
 typedef struct {
     EmberFnVec3 feet;
     EmberFnVec3 head;
@@ -123,8 +122,10 @@ static float       g_fn_fov        = 80.0f;
 static float       g_fn_pov_fov    = 0.0f;
 static float       g_fn_fov_scalar = 0.0f;
 static BOOL        g_fn_logged_camera_source = NO;
-static uintptr_t   g_fn_player_controller = 0;
-static BOOL        g_fn_logged_native_projection = NO;
+static uintptr_t   g_fn_world_cam_loc_off = 0;
+static uintptr_t   g_fn_world_cam_rot_off = 0;
+static BOOL        g_fn_using_world_camera = NO;
+static int         g_fn_world_cam_scan_cooldown = 0;
 static uint8_t     g_fn_aspect_axis = 1; // diagnostic only; never used for focal
 static uint8_t     g_fn_storekit_suppression_mask = 0;
 
@@ -335,6 +336,102 @@ static BOOL fn_read_camera_cache(uintptr_t cache) {
     return NO;
 }
 
+static BOOL fn_safe_read(uintptr_t addr, void *dst, size_t n) {
+    if (!addr || !dst || n == 0) return NO;
+    vm_size_t got = n;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                         (vm_address_t)addr,
+                                         (vm_size_t)n,
+                                         (vm_address_t)dst,
+                                         &got);
+    return kr == KERN_SUCCESS && got == n;
+}
+
+// Windows CamRotation: x@0, y@+0x20, z@+0x1d0. Pitch/yaw via asin/atan2.
+static BOOL fn_camrot_decode(uintptr_t rot_ptr, double *pitch, double *yaw) {
+    double rx = 0, ry = 0, rz = 0;
+    if (!fn_safe_read(rot_ptr, &rx, sizeof(rx))) return NO;
+    if (!fn_safe_read(rot_ptr + FN_OFF_CAMROT_Y, &ry, sizeof(ry))) return NO;
+    if (!fn_safe_read(rot_ptr + FN_OFF_CAMROT_Z, &rz, sizeof(rz))) return NO;
+    if (!isfinite(rx) || !isfinite(ry) || !isfinite(rz)) return NO;
+    double n2 = rx * rx + ry * ry + rz * rz;
+    if (n2 < 0.70 || n2 > 1.30) return NO;
+    if (rz > 1.0) rz = 1.0;
+    if (rz < -1.0) rz = -1.0;
+    *pitch = asin(rz) * (180.0 / M_PI);
+    *yaw = atan2(-rx, ry) * (180.0 / M_PI);
+    return isfinite(*pitch) && isfinite(*yaw);
+}
+
+static BOOL fn_read_world_camera_at(uintptr_t world, uintptr_t loc_off,
+                                    double *lx, double *ly, double *lz,
+                                    double *pitch, double *yaw) {
+    uintptr_t locp = 0, rotp = 0;
+    if (!fn_safe_read(world + loc_off, &locp, sizeof(locp))) return NO;
+    if (!fn_safe_read(world + loc_off + 0x10, &rotp, sizeof(rotp))) return NO;
+    if (locp < 0x100000000ULL || rotp < 0x100000000ULL) return NO;
+    if ((locp & 7) || (rotp & 7) || locp == rotp) return NO;
+    double loc[3] = {0};
+    if (!fn_safe_read(locp, loc, sizeof(loc))) return NO;
+    if (!isfinite(loc[0]) || !isfinite(loc[1]) || !isfinite(loc[2])) return NO;
+    if (fabs(loc[0]) > 1e7 || fabs(loc[1]) > 1e7 || fabs(loc[2]) > 1e7) return NO;
+    if (!fn_camrot_decode(rotp, pitch, yaw)) return NO;
+    *lx = loc[0]; *ly = loc[1]; *lz = loc[2];
+    return YES;
+}
+
+static BOOL fn_apply_world_camera(uintptr_t world) {
+    double lx, ly, lz, pitch, yaw;
+    if (g_fn_world_cam_loc_off) {
+        if (fn_read_world_camera_at(world, g_fn_world_cam_loc_off,
+                                    &lx, &ly, &lz, &pitch, &yaw)) {
+            g_fn_cam_loc = (EmberFnVec3){ lx, ly, lz, YES };
+            g_fn_cam_pitch = pitch;
+            g_fn_cam_yaw = yaw;
+            g_fn_cam_roll = 0;
+            g_fn_using_world_camera = YES;
+            return YES;
+        }
+        g_fn_world_cam_loc_off = 0;
+        g_fn_world_cam_rot_off = 0;
+        g_fn_using_world_camera = NO;
+    }
+    if (!g_fn_cam_loc.valid) return NO;
+    if (g_fn_world_cam_scan_cooldown > 0) {
+        g_fn_world_cam_scan_cooldown--;
+        return NO;
+    }
+    g_fn_world_cam_scan_cooldown = 45;
+
+    uintptr_t best = 0;
+    double best_dist = 1e300;
+    for (uintptr_t off = 0x80; off <= 0x2e8; off += 8) {
+        if (off == FN_OFF_WORLD_GAMESTATE || off == FN_OFF_WORLD_GAMEINSTANCE) continue;
+        if (off + 0x10 == FN_OFF_WORLD_GAMESTATE) continue;
+        if (!fn_read_world_camera_at(world, off, &lx, &ly, &lz, &pitch, &yaw)) continue;
+        double dx = lx - g_fn_cam_loc.x, dy = ly - g_fn_cam_loc.y, dz = lz - g_fn_cam_loc.z;
+        double dist = dx * dx + dy * dy + dz * dz;
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = off;
+        }
+    }
+    // Same camera as the cache seed, not some other world vector.
+    if (!best || best_dist > 5000.0 * 5000.0) return NO;
+    if (!fn_read_world_camera_at(world, best, &lx, &ly, &lz, &pitch, &yaw)) return NO;
+    g_fn_world_cam_loc_off = best;
+    g_fn_world_cam_rot_off = best + 0x10;
+    g_fn_cam_loc = (EmberFnVec3){ lx, ly, lz, YES };
+    g_fn_cam_pitch = pitch;
+    g_fn_cam_yaw = yaw;
+    g_fn_cam_roll = 0;
+    g_fn_using_world_camera = YES;
+    EmberFnLog(@"world camera pointers: loc@+0x%lx rot@+0x%lx dist=%.1f pitch=%.2f yaw=%.2f",
+               (unsigned long)best, (unsigned long)(best + 0x10),
+               sqrt(best_dist), pitch, yaw);
+    return YES;
+}
+
 static BOOL fn_update_camera(uintptr_t world) {
     uintptr_t gi   = fn_ptr(world + FN_OFF_WORLD_GAMEINSTANCE);
     if (gi < 0x100000000ULL) return NO;
@@ -344,18 +441,16 @@ static BOOL fn_update_camera(uintptr_t world) {
     if (lp0 < 0x100000000ULL) return NO;
     uintptr_t pc   = fn_ptr(lp0 + FN_OFF_LP_CONTROLLER);
     if (pc  < 0x100000000ULL) return NO;
-    g_fn_player_controller = pc;
     uint8_t axis = *(volatile uint8_t *)(lp0 + FN_OFF_LP_ASPECT_AXIS);
     g_fn_aspect_axis = axis <= 2 ? axis : 1;
     uintptr_t pcm  = fn_ptr(pc  + FN_OFF_PC_CAMERA_MANAGER);
     if (pcm < 0x100000000ULL) return NO;
 
-    // Location/rotation come from the exact POV returned by Fortnite's PCM
-    // camera getters. The Windows source's get_view_point does NOT use POV.FOV:
-    // it reads a normalized render FOV from PlayerController and multiplies by
-    // 90. Static ARM64 evidence for 42.10 iOS does the same PC+0x364 load while
-    // constructing view data, so use that source here as well.
+    // Cache POV seeds discovery (location must match the live camera).
+    // Windows get_view_point then replaces loc/rot with UWorld pointers and
+    // asin/atan2; FOV is always PC normalized * 90.
     if (!fn_read_camera_cache(pcm + FN_OFF_PCM_CACHE_PRIVATE)) return NO;
+    fn_apply_world_camera(world);
     float scalar = fn_f32(pc + FN_OFF_PC_CAMERA_FOV);
     float renderFov = (float)EmberFnRenderFovDegrees(scalar, g_fn_pov_fov);
     if (!isnan(scalar) && fabsf(renderFov - scalar * 90.0f) < 0.001f) {
@@ -366,8 +461,10 @@ static BOOL fn_update_camera(uintptr_t world) {
     }
     if (!g_fn_logged_camera_source) {
         g_fn_logged_camera_source = YES;
-        EmberFnLog(@"camera source: PCM POV loc/rot; POV.FOV=%.3f PC+0x364=%.6f renderFOV=%.3f axis=%u pc=%p",
-                   g_fn_pov_fov, scalar, g_fn_fov, g_fn_aspect_axis, (void *)pc);
+        EmberFnLog(@"camera source: %@ loc/rot; POV.FOV=%.3f PC+0x364=%.6f renderFOV=%.3f axis=%u worldOff=0x%lx",
+                   g_fn_using_world_camera ? @"UWorld pointers" : @"PCM POV fallback",
+                   g_fn_pov_fov, scalar, g_fn_fov, g_fn_aspect_axis,
+                   (unsigned long)g_fn_world_cam_loc_off);
     }
     return YES;
 }
@@ -421,77 +518,20 @@ static void fn_update_players(uintptr_t world) {
 static void fn_tick(void) {
     if (!g_fn_binary_verified || !g_fn_dots_enabled) {
         g_fn_dot_count = 0;
-        g_fn_player_controller = 0;
         return;
     }
     uintptr_t w = fn_world();
-    if (!w) { g_fn_dot_count = 0; g_fn_player_controller = 0; return; }
+    if (!w) { g_fn_dot_count = 0; return; }
     if (!fn_update_camera(w)) {
         g_fn_cam_loc.valid = NO;
-        g_fn_player_controller = 0;
         g_fn_dot_count = 0;
         return;
     }
     fn_update_players(w);
 }
 
-typedef bool (*EmberFnNativeProjector)(uintptr_t playerController,
-                                       const EmberFnWorld3 *world,
-                                       EmberFnScreen2 *screen,
-                                       bool playerViewportRelative);
-
-static BOOL g_fn_native_ok = NO;
-static float g_fn_native_to_points = 1.f;
-
-static BOOL fn_native_project_raw(EmberFnVec3 world, EmberFnScreen2 *screen) {
-    if (!screen || !g_fn_binary_verified || !g_fn_player_controller || !g_fn_slide) return NO;
-    EmberFnNativeProjector project =
-        (EmberFnNativeProjector)(FN_PROJECT_WORLD_TO_SCREEN + g_fn_slide);
-    EmberFnWorld3 input = { world.x, world.y, world.z };
-    EmberFnScreen2 output = { 0, 0 };
-    bool visible = project(g_fn_player_controller, &input, &output, true);
-    if (!visible || !isfinite(output.x) || !isfinite(output.y)) return NO;
-    *screen = output;
-    return YES;
-}
-
-// One uniform pixel→point scale. Never independently rescale X vs Y to force
-// the overlay centre (115271b did that and can warp tracking).
-static void fn_learn_native_scale(float width, float height) {
-    if (g_fn_logged_native_projection || !g_fn_cam_loc.valid) return;
-    const double radians = M_PI / 180.0;
-    double pitch = g_fn_cam_pitch * radians;
-    double yaw = g_fn_cam_yaw * radians;
-    double cosPitch = cos(pitch);
-    EmberFnVec3 forward = {
-        g_fn_cam_loc.x + cosPitch * cos(yaw) * 1000.0,
-        g_fn_cam_loc.y + cosPitch * sin(yaw) * 1000.0,
-        g_fn_cam_loc.z + sin(pitch) * 1000.0,
-        YES
-    };
-    EmberFnScreen2 center = { 0, 0 };
-    if (!fn_native_project_raw(forward, &center)) return;
-    CGFloat screenScale = [UIScreen mainScreen].scale;
-    if (screenScale < 1.f) screenScale = 1.f;
-    double errPts = fabs(center.x - width * 0.5) + fabs(center.y - height * 0.5);
-    double errPx  = fabs(center.x - width * screenScale * 0.5) +
-                    fabs(center.y - height * screenScale * 0.5);
-    g_fn_native_to_points = (errPx < errPts) ? (float)screenScale : 1.f;
-    g_fn_native_ok = YES;
-    g_fn_logged_native_projection = YES;
-    EmberFnLog(@"native W2S active: raw center %.2f,%.2f overlay %.1fx%.1f scale %.3f",
-               center.x, center.y, width, height, g_fn_native_to_points);
-}
-
 static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, float *out_y) {
     if (!g_fn_cam_loc.valid || width <= 1.f || height <= 1.f) return NO;
-    fn_learn_native_scale(width, height);
-    EmberFnScreen2 native = { 0, 0 };
-    if (g_fn_native_ok && fn_native_project_raw(wl, &native)) {
-        *out_x = (float)(native.x / g_fn_native_to_points);
-        *out_y = (float)(native.y / g_fn_native_to_points);
-        return isfinite(*out_x) && isfinite(*out_y);
-    }
     double x = 0, y = 0;
     BOOL visible = EmberFnProjectWorldPoint(
         (EmberFnProjectionVec3){wl.x, wl.y, wl.z},
@@ -735,7 +775,7 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
         BOOL ready = g_fn_binary_verified;
         [panel addSection:@"ESP"];
         [panel addToggle:@"Enable ESP"
-                  detail:(ready ? @"Fortnite native projector (no 2D flips)" : @"Waiting for Fortnite binary…")
+                  detail:(ready ? @"Windows-style view point + Unreal W2S" : @"Waiting for Fortnite binary…")
                  enabled:g_fn_dots_enabled
                  handler:^(BOOL on) {
             if (!g_fn_binary_verified) { [panel setStatus:@"Binary not verified yet"]; return; }
@@ -780,8 +820,10 @@ static BOOL fn_project(EmberFnVec3 wl, float width, float height, float *out_x, 
                   detail:@"" handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"%d player(s) in array", g_fn_dot_count]
                   detail:@"" handler:^{}];
-        [panel addAction:(g_fn_native_ok ? @"✓ Native W2S active" : @"⏳ Native W2S pending")
-                  detail:[NSString stringWithFormat:@"uniform scale %.3f (no X/Y warp)", g_fn_native_to_points]
+        [panel addAction:(g_fn_using_world_camera ? @"✓ UWorld camera pointers" : @"⏳ Cache POV fallback")
+                  detail:[NSString stringWithFormat:@"loc +0x%lx  rot +0x%lx",
+                          (unsigned long)g_fn_world_cam_loc_off,
+                          (unsigned long)g_fn_world_cam_rot_off]
                  handler:^{}];
         [panel addAction:[NSString stringWithFormat:@"Render FOV %.2f°", g_fn_fov]
                   detail:[NSString stringWithFormat:@"PC+0x364 %.5f | POV %.2f° | axis %u", g_fn_fov_scalar, g_fn_pov_fov, g_fn_aspect_axis]
