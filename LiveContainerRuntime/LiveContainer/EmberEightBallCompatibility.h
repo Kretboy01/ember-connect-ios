@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #if defined(__arm64__) && !defined(__arm64e__)
@@ -50,48 +52,54 @@ static bool Ember8BShouldIgnore(const char *kind, int status, uintptr_t caller) 
     return false;
 }
 
+static void Ember8BAllowExit(int status) {
+    syscall(SYS_exit, status);
+}
+
 static void Ember8BHookExit(int status) {
     if (Ember8BShouldIgnore("exit", status, (uintptr_t)__builtin_return_address(0))) return;
-    if (Ember8BRealExit) Ember8BRealExit(status);
-    else _exit(status);
+    Ember8BAllowExit(status);
 }
 
 static void Ember8BHook_Exit(int status) {
     if (Ember8BShouldIgnore("_Exit", status, (uintptr_t)__builtin_return_address(0))) return;
-    if (Ember8BReal_Exit) Ember8BReal_Exit(status);
-    else _exit(status);
+    Ember8BAllowExit(status);
 }
 
 static void Ember8BHook_exit(int status) {
     if (Ember8BShouldIgnore("_exit", status, (uintptr_t)__builtin_return_address(0))) return;
-    if (Ember8BReal_exit) Ember8BReal_exit(status);
-    else _exit(status);
+    Ember8BAllowExit(status);
 }
 
 static void Ember8BHookAbort(void) {
     if (Ember8BShouldIgnore("abort", SIGABRT, (uintptr_t)__builtin_return_address(0))) return;
-    if (Ember8BRealAbort) Ember8BRealAbort();
-    else _exit(134);
+    Ember8BAllowExit(134);
 }
 
 static int Ember8BHookRaise(int sig) {
     if (Ember8BShouldIgnore("raise", sig, (uintptr_t)__builtin_return_address(0))) return 0;
-    if (Ember8BRealRaise) return Ember8BRealRaise(sig);
+    Ember8BAllowExit(128 + (sig & 0x7f));
     return -1;
 }
 
 static int Ember8BHookKill(pid_t pid, int sig) {
     if (pid == getpid() || pid == 0) {
         if (Ember8BShouldIgnore("kill-self", sig, (uintptr_t)__builtin_return_address(0))) return 0;
+        Ember8BAllowExit(128 + (sig & 0x7f));
     }
-    if (Ember8BRealKill) return Ember8BRealKill(pid, sig);
+    return (int)syscall(SYS_kill, pid, sig);
+}
+
+static int Ember8BHookPthreadKill(pthread_t thread, int sig) {
+    if (pthread_equal(thread, pthread_self())) {
+        if (Ember8BShouldIgnore("pthread_kill-self", sig, (uintptr_t)__builtin_return_address(0))) return 0;
+    }
     return -1;
 }
 
 static void Ember8BHookTerminate(void) {
     if (Ember8BShouldIgnore("std::terminate", 0, (uintptr_t)__builtin_return_address(0))) return;
-    if (Ember8BRealTerminate) Ember8BRealTerminate();
-    else _exit(134);
+    Ember8BAllowExit(134);
 }
 
 static void Ember8BRebindImage(const mach_header_u *mh) {
@@ -150,6 +158,19 @@ static void EmberEightBallCompatibilityGuestLoaded(void) {
     if (!Ember8BArmed) return;
     Ember8BRebindAllImages();
     Ember8BLog("terminate gate rebound after guest load");
+    // GOT rebind misses lazy binds. Overwrite the libc prologues so the
+    // first call cannot resolve past the gate.
+    Ember8BLogPtr("hook exit", litehook_hook_function(exit, Ember8BHookExit));
+    Ember8BLogPtr("hook _Exit", litehook_hook_function(_Exit, Ember8BHook_Exit));
+    Ember8BLogPtr("hook _exit", litehook_hook_function(_exit, Ember8BHook_exit));
+    Ember8BLogPtr("hook abort", litehook_hook_function(abort, Ember8BHookAbort));
+    Ember8BLogPtr("hook raise", litehook_hook_function(raise, Ember8BHookRaise));
+    Ember8BLogPtr("hook kill", litehook_hook_function(kill, Ember8BHookKill));
+    Ember8BLogPtr("hook pthread_kill", litehook_hook_function(pthread_kill, Ember8BHookPthreadKill));
+    if (Ember8BRealTerminate) {
+        Ember8BLogPtr("hook terminate", litehook_hook_function(Ember8BRealTerminate, Ember8BHookTerminate));
+    }
+    Ember8BLog("libc terminate prologues overwritten");
 }
 #else
 static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *settings, NSString *documents) {}
