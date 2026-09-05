@@ -1,19 +1,28 @@
 // Included only by LCBootstrap.m after litehook.h. Arms before the guest
-// is dlopened so Appdome constructors and main see hooked exit symbols.
+// is dlopened so Appdome constructors and main see hooked terminate symbols.
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #if defined(__arm64__) && !defined(__arm64e__)
 static int Ember8BLogFD = -1;
 static atomic_int Ember8BIgnored;
+static bool Ember8BArmed;
 static void (*Ember8BRealExit)(int);
 static void (*Ember8BReal_Exit)(int);
 static void (*Ember8BReal_exit)(int);
+static void (*Ember8BRealAbort)(void);
+static int (*Ember8BRealRaise)(int);
+static int (*Ember8BRealKill)(pid_t, int);
+static void (*Ember8BRealTerminate)(void);
 
 static void Ember8BLog(const char *message) {
     if (Ember8BLogFD >= 0) {
@@ -23,39 +32,92 @@ static void Ember8BLog(const char *message) {
 }
 
 static void Ember8BLogPtr(const char *prefix, uintptr_t value) {
-    char line[80];
+    char line[96];
     snprintf(line, sizeof(line), "%s 0x%llx", prefix, (unsigned long long)value);
     Ember8BLog(line);
 }
 
-static bool Ember8BShouldIgnore(int status, uintptr_t caller) {
+static bool Ember8BShouldIgnore(const char *kind, int status, uintptr_t caller) {
     int seen = atomic_fetch_add(&Ember8BIgnored, 1) + 1;
-    Ember8BLogPtr("exit status", (uintptr_t)(unsigned)status);
-    Ember8BLogPtr("exit caller", caller);
-    if (seen <= 8) {
-        Ember8BLog("ignoring startup exit");
+    Ember8BLog(kind);
+    Ember8BLogPtr("status", (uintptr_t)(unsigned)status);
+    Ember8BLogPtr("caller", caller);
+    if (seen <= 16) {
+        Ember8BLog("ignoring startup terminate");
         return true;
     }
-    Ember8BLog("allowing exit");
+    Ember8BLog("allowing terminate");
     return false;
 }
 
 static void Ember8BHookExit(int status) {
-    if (Ember8BShouldIgnore(status, (uintptr_t)__builtin_return_address(0))) return;
+    if (Ember8BShouldIgnore("exit", status, (uintptr_t)__builtin_return_address(0))) return;
     if (Ember8BRealExit) Ember8BRealExit(status);
     else _exit(status);
 }
 
 static void Ember8BHook_Exit(int status) {
-    if (Ember8BShouldIgnore(status, (uintptr_t)__builtin_return_address(0))) return;
+    if (Ember8BShouldIgnore("_Exit", status, (uintptr_t)__builtin_return_address(0))) return;
     if (Ember8BReal_Exit) Ember8BReal_Exit(status);
     else _exit(status);
 }
 
 static void Ember8BHook_exit(int status) {
-    if (Ember8BShouldIgnore(status, (uintptr_t)__builtin_return_address(0))) return;
+    if (Ember8BShouldIgnore("_exit", status, (uintptr_t)__builtin_return_address(0))) return;
     if (Ember8BReal_exit) Ember8BReal_exit(status);
     else _exit(status);
+}
+
+static void Ember8BHookAbort(void) {
+    if (Ember8BShouldIgnore("abort", SIGABRT, (uintptr_t)__builtin_return_address(0))) return;
+    if (Ember8BRealAbort) Ember8BRealAbort();
+    else _exit(134);
+}
+
+static int Ember8BHookRaise(int sig) {
+    if (Ember8BShouldIgnore("raise", sig, (uintptr_t)__builtin_return_address(0))) return 0;
+    if (Ember8BRealRaise) return Ember8BRealRaise(sig);
+    return -1;
+}
+
+static int Ember8BHookKill(pid_t pid, int sig) {
+    if (pid == getpid() || pid == 0) {
+        if (Ember8BShouldIgnore("kill-self", sig, (uintptr_t)__builtin_return_address(0))) return 0;
+    }
+    if (Ember8BRealKill) return Ember8BRealKill(pid, sig);
+    return -1;
+}
+
+static void Ember8BHookTerminate(void) {
+    if (Ember8BShouldIgnore("std::terminate", 0, (uintptr_t)__builtin_return_address(0))) return;
+    if (Ember8BRealTerminate) Ember8BRealTerminate();
+    else _exit(134);
+}
+
+static void Ember8BRebindImage(const mach_header_u *mh) {
+    if (!mh) return;
+    litehook_rebind_symbol(mh, exit, Ember8BHookExit, nil);
+    litehook_rebind_symbol(mh, _Exit, Ember8BHook_Exit, nil);
+    litehook_rebind_symbol(mh, _exit, Ember8BHook_exit, nil);
+    litehook_rebind_symbol(mh, abort, Ember8BHookAbort, nil);
+    litehook_rebind_symbol(mh, raise, Ember8BHookRaise, nil);
+    litehook_rebind_symbol(mh, kill, Ember8BHookKill, nil);
+    if (Ember8BRealTerminate) {
+        litehook_rebind_symbol(mh, Ember8BRealTerminate, Ember8BHookTerminate, nil);
+    }
+}
+
+static void Ember8BRebindAllImages(void) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        Ember8BRebindImage((const mach_header_u *)_dyld_get_image_header(i));
+    }
+}
+
+static void Ember8BImageAdded(const struct mach_header *header, intptr_t slide) {
+    (void)slide;
+    if (!Ember8BArmed) return;
+    Ember8BRebindImage((const mach_header_u *)header);
 }
 
 static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *settings, NSString *documents) {
@@ -66,11 +128,30 @@ static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *s
     Ember8BRealExit = exit;
     Ember8BReal_Exit = _Exit;
     Ember8BReal_exit = _exit;
+    Ember8BRealAbort = abort;
+    Ember8BRealRaise = raise;
+    Ember8BRealKill = kill;
+    Ember8BRealTerminate = dlsym(RTLD_DEFAULT, "_ZSt9terminatev");
+    Ember8BArmed = true;
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, exit, Ember8BHookExit, nil);
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _Exit, Ember8BHook_Exit, nil);
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _exit, Ember8BHook_exit, nil);
-    Ember8BLog("56.29.2 exit gate armed before guest load");
+    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, abort, Ember8BHookAbort, nil);
+    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, raise, Ember8BHookRaise, nil);
+    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, kill, Ember8BHookKill, nil);
+    if (Ember8BRealTerminate) {
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealTerminate, Ember8BHookTerminate, nil);
+    }
+    _dyld_register_func_for_add_image(Ember8BImageAdded);
+    Ember8BLog("56.29.2 terminate gate armed before guest load");
+}
+
+static void EmberEightBallCompatibilityGuestLoaded(void) {
+    if (!Ember8BArmed) return;
+    Ember8BRebindAllImages();
+    Ember8BLog("terminate gate rebound after guest load");
 }
 #else
 static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *settings, NSString *documents) {}
+static void EmberEightBallCompatibilityGuestLoaded(void) {}
 #endif
