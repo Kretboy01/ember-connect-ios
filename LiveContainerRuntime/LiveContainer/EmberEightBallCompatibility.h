@@ -252,32 +252,6 @@ static void Ember8BTapAcceptButtons(UIView *view, bool inPrivacy) {
     for (UIView *sub in view.subviews) Ember8BTapAcceptButtons(sub, here);
 }
 
-static bool Ember8BIsGameSurface(UIView *view) {
-    NSString *name = NSStringFromClass(view.class);
-    return [name containsString:@"EAGL"] || [name containsString:@"CCGL"] ||
-           [name containsString:@"CCDirector"] || [name containsString:@"MTK"] ||
-           [name containsString:@"Metal"] || [name containsString:@"GLK"];
-}
-
-static bool Ember8BViewTreeHasGameSurface(UIView *view) {
-    if (!view) return false;
-    if (Ember8BIsGameSurface(view)) return true;
-    for (UIView *sub in view.subviews) {
-        if (Ember8BViewTreeHasGameSurface(sub)) return true;
-    }
-    return false;
-}
-
-static UIView *Ember8BFindGameSurface(UIView *view) {
-    if (!view) return nil;
-    if (Ember8BIsGameSurface(view)) return view;
-    for (UIView *sub in view.subviews) {
-        UIView *found = Ember8BFindGameSurface(sub);
-        if (found) return found;
-    }
-    return nil;
-}
-
 static void Ember8BWalkCocos(id node, void (^visit)(id)) {
     if (!node) return;
     visit(node);
@@ -291,30 +265,6 @@ static void Ember8BWalkCocos(id node, void (^visit)(id)) {
         if (![kids respondsToSelector:@selector(objectAtIndex:)]) break;
         Ember8BWalkCocos([kids objectAtIndex:i], visit);
     }
-}
-
-static void Ember8BTapGameView(UIView *view, CGFloat nx, CGFloat ny) {
-    if (!view) return;
-    CGPoint pt = CGPointMake(CGRectGetWidth(view.bounds) * nx, CGRectGetHeight(view.bounds) * ny);
-    UITouch *touch = [[UITouch alloc] init];
-    @try {
-        [touch setValue:view.window ?: view forKey:@"window"];
-        [touch setValue:view forKey:@"view"];
-        [touch setValue:@1 forKey:@"tapCount"];
-        [touch setValue:@(UITouchPhaseBegan) forKey:@"phase"];
-    } @catch (NSException *e) {
-        Ember8BLog("touch kvc failed");
-    }
-    SEL setLoc = sel_registerName("_setLocationInWindow:resetPrevious:");
-    if ([touch respondsToSelector:setLoc]) {
-        CGPoint winPt = [view convertPoint:pt toView:nil];
-        ((void (*)(id, SEL, CGPoint, BOOL))objc_msgSend)(touch, setLoc, winPt, YES);
-    }
-    NSSet *set = [NSSet setWithObject:touch];
-    [view touchesBegan:set withEvent:nil];
-    @try { [touch setValue:@(UITouchPhaseEnded) forKey:@"phase"]; } @catch (NSException *e) {}
-    [view touchesEnded:set withEvent:nil];
-    Ember8BLog("injected cocos accept tap");
 }
 
 static void Ember8BTryAcceptPrivacy(void) {
@@ -337,7 +287,7 @@ static void Ember8BTryAcceptPrivacy(void) {
         Ember8BLog("found privacy node");
         Ember8BLog(NSStringFromClass([target class]).UTF8String);
     }
-    if (Ember8BAcceptTaps >= 5) return;
+    if (Ember8BAcceptTaps >= 1) return;
     Ember8BAcceptTaps += 1;
     if ([target respondsToSelector:@selector(acceptCallback)]) {
         Ember8BLog("calling acceptCallback");
@@ -355,15 +305,6 @@ static void Ember8BTryAcceptPrivacy(void) {
 static void Ember8BStripRaspUI(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return;
-    UIWindow *gameWindow = nil;
-    UIView *surface = nil;
-    for (UIWindow *window in app.windows) {
-        UIView *found = Ember8BFindGameSurface(window);
-        if (found) {
-            gameWindow = window;
-            surface = found;
-        }
-    }
     static int dumped;
     if (dumped < 1) {
         dumped = 1;
@@ -383,7 +324,6 @@ static void Ember8BStripRaspUI(void) {
             }
         }
     }
-    (void)gameWindow;
     for (UIWindow *window in app.windows) {
         NSString *wcls = NSStringFromClass(window.class);
         bool authWindow = [wcls containsString:@"Remote"] || [wcls containsString:@"Auth"] ||
@@ -411,11 +351,6 @@ static void Ember8BStripRaspUI(void) {
         }
     }
     Ember8BTryAcceptPrivacy();
-    static int sweeps;
-    sweeps++;
-    if (surface && sweeps >= 6 && sweeps <= 12) {
-        Ember8BTapGameView(surface, 0.50, 0.78);
-    }
 }
 
 static void Ember8BHookPresent(id self, SEL sel, UIViewController *controller, BOOL animated, id completion) {
