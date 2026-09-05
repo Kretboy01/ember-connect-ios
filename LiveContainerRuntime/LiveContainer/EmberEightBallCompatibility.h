@@ -301,7 +301,10 @@ static void Ember8BInstallUIHooks(void) {
         if (timer) return;
         timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
         dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 250ull * NSEC_PER_MSEC, 50ull * NSEC_PER_MSEC);
-        dispatch_source_set_event_handler(timer, ^{ Ember8BStripRaspUI(); });
+        dispatch_source_set_event_handler(timer, ^{
+            Ember8BStripRaspUI();
+            Ember8BRebindAllImages();
+        });
         dispatch_resume(timer);
         Ember8BLog("rasp ui sweeper armed");
     });
@@ -390,6 +393,14 @@ static void EmberEightBallCompatibilityGuestLoaded(const char *guestExec) {
     // Force the guest's remaining lazy binds so GOT slots hold real
     // syscall/exit, then patch those slots. Do not write libsystem TEXT.
     if (guestExec) dlopen(guestExec, RTLD_NOW | RTLD_NOLOAD);
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "libloader")) {
+            dlopen(name, RTLD_NOW | RTLD_NOLOAD);
+            Ember8BLog("libloader forced RTLD_NOW");
+        }
+    }
     Ember8BRebindAllImages();
     if (!Ember8BRealDlsym) {
         Ember8BRealDlsym = dlsym;
