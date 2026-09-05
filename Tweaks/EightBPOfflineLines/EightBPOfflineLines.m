@@ -695,6 +695,7 @@ static void ECSyncCocosMarker(id ball) {
     if ([sphere respondsToSelector:@selector(position)]) {
         pos = ((CGPoint (*)(id, SEL))objc_msgSend)(sphere, @selector(position));
     }
+    int slot = ECSlotForBall(ball);
     id marker = objc_getAssociatedObject(ball, kECMarkerKey);
     if (!ECLooksLikeObject(marker)) {
         id texture = ECCircleTexture();
@@ -719,7 +720,6 @@ static void ECSyncCocosMarker(id ball) {
             ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), marker);
         }
         objc_setAssociatedObject(ball, kECMarkerKey, marker, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        ECSlotForBall(ball);
         if (gECVisualLog < 4) {
             gECVisualLog++;
             CGSize size = CGSizeZero;
@@ -733,14 +733,31 @@ static void ECSyncCocosMarker(id ball) {
     if ([marker respondsToSelector:@selector(setPosition:)]) {
         ((void (*)(id, SEL, CGPoint))objc_msgSend)(marker, @selector(setPosition:), pos);
     }
-    if ([sphere respondsToSelector:@selector(contentSize)] && [marker respondsToSelector:@selector(contentSize)]) {
-        CGSize ballSize = ((CGSize (*)(id, SEL))objc_msgSend)(sphere, @selector(contentSize));
+    // ProjectedSphere is a 3D node, so its contentSize is 0x0 and cannot size
+    // the ring. updateVisualBall builds the sphere position as
+    //   visual = mVisualTableOrigin + physics * scale
+    // so the scale falls straight out of a position we already have, and the
+    // ball radius is cached from Ball setRadius:. Both come from the game.
+    if (slot >= 0 && [marker respondsToSelector:@selector(contentSize)]) {
         CGSize markSize = ((CGSize (*)(id, SEL))objc_msgSend)(marker, @selector(contentSize));
-        if (markSize.width > 1 && ballSize.width > 1 && [marker respondsToSelector:@selector(setScale:)]) {
-            // Ring a little wider than the ball so it reads as an outline
-            // instead of a disc sitting under the sphere.
-            float scale = (float)(ballSize.width * 1.35 / markSize.width);
-            ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:), scale);
+        ECDPoint phys = gECCachedSnaps[slot].pos;
+        double radius = gECCachedSnaps[slot].radius > 0.01 ? gECCachedSnaps[slot].radius : 3.6;
+        CGPoint origin = gECCachedVisualOrigin;
+        double vscale = 1.7007874015748;
+        if (isfinite(origin.x) && isfinite(origin.y) && ECPointValid(phys)) {
+            double candidate = 0;
+            if (fabs(phys.x) > 1.0) candidate = (pos.x - origin.x) / phys.x;
+            else if (fabs(phys.y) > 1.0) candidate = (pos.y - origin.y) / phys.y;
+            if (candidate > 0.2 && candidate < 20.0) vscale = candidate;
+        }
+        double diameter = radius * vscale * 2.0 * 1.3;
+        if (markSize.width > 1 && diameter > 1 && [marker respondsToSelector:@selector(setScale:)]) {
+            ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:), (float)(diameter / markSize.width));
+            if (gECVisualLog < 6) {
+                gECVisualLog++;
+                ECLogLine([NSString stringWithFormat:@"ring-size mark=%.1f r=%.2f vscale=%.4f diameter=%.1f",
+                           markSize.width, radius, vscale, diameter]);
+            }
         }
     }
     id markerParent = ECInvokeId(marker, @"parent");
