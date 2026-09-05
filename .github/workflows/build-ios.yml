@@ -122,6 +122,24 @@ jobs:
           file BuiltTweaks/EightBPOfflineLines.dylib
           xcrun otool -L BuiltTweaks/EightBPOfflineLines.dylib
 
+          # EightBallLaunch — swallow Appdome's 56.29.2 startup exit
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -fblocks \
+            -dynamiclib \
+            -I LiveContainerRuntime/litehook/src \
+            -I LiveContainerRuntime/litehook/external/include \
+            Tweaks/EightBallLaunch/EightBallLaunch.m \
+            LiveContainerRuntime/litehook/src/litehook.c \
+            -framework Foundation \
+            -install_name @rpath/EightBallLaunch.dylib \
+            -o BuiltTweaks/EightBallLaunch.dylib
+
+          file BuiltTweaks/EightBallLaunch.dylib
+          xcrun otool -L BuiltTweaks/EightBallLaunch.dylib
+
           # GettingOverIt — Unity/IL2CPP mod for Getting Over It with Bennett Foddy
           xcrun --sdk iphoneos clang \
             -arch arm64 \
@@ -224,6 +242,7 @@ jobs:
           mkdir -p "$APP/EmberTweaks"
           cp BuiltTweaks/FlappyPractice.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/EightBPOfflineLines.dylib "$APP/EmberTweaks/"
+          cp BuiltTweaks/EightBallLaunch.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/GettingOverIt.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/Subnautica.dylib "$APP/EmberTweaks/"
           cp BuiltTweaks/CloverPit.dylib "$APP/EmberTweaks/"
@@ -248,6 +267,7 @@ jobs:
           test -f "$APP/Frameworks/ZSign.dylib"
           test -f "$APP/EmberTweaks/FlappyPractice.dylib"
           test -f "$APP/EmberTweaks/EightBPOfflineLines.dylib"
+          test -f "$APP/EmberTweaks/EightBallLaunch.dylib"
           test -f "$APP/EmberTweaks/GettingOverIt.dylib"
           test -f "$APP/EmberTweaks/Subnautica.dylib"
           test -f "$APP/EmberTweaks/CloverPit.dylib"
@@ -271,6 +291,7 @@ jobs:
             EmberConnectMobile.ipa
             BuiltTweaks/FlappyPractice.dylib
             BuiltTweaks/EightBPOfflineLines.dylib
+            BuiltTweaks/EightBallLaunch.dylib
             BuiltTweaks/GettingOverIt.dylib
             BuiltTweaks/Subnautica.dylib
             BuiltTweaks/CloverPit.dylib

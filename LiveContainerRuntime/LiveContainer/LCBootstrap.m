@@ -20,6 +20,7 @@
 #import "Tweaks/Tweaks.h"
 #include <mach-o/ldsyms.h>
 #include "EmberFortniteCompatibility.h"
+#include "EmberEightBallCompatibility.h"
 
 static int (*appMain)(int, char**);
 NSUserDefaults *lcUserDefaults;
@@ -385,7 +386,10 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         return @"App not found";
     }
 
-    if (!isLiveProcess) EmberFortniteCompatibilityPrepare(appBundle, guestAppInfo, docPath);
+    if (!isLiveProcess) {
+        EmberFortniteCompatibilityPrepare(appBundle, guestAppInfo, docPath);
+        EmberEightBallCompatibilityPrepare(appBundle, guestAppInfo, docPath);
+    }
     
     // find container in Info.plist
     NSString* dataUUID = selectedContainer;
