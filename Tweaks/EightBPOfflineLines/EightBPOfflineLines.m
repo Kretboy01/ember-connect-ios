@@ -929,7 +929,8 @@ static void ECTracePath(ECDPoint start, ECDPoint direction, ECDBox box, double r
 @property (nonatomic, strong) CAShapeLayer *stroke;
 @property (nonatomic, strong) CAShapeLayer *objectStroke;
 @property (nonatomic, strong) CAShapeLayer *ghost;
-@property (nonatomic, strong) CADisplayLink *link;
+@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, strong) UIWindow *overlayWindow;
 + (instancetype)sharedOverlay;
 - (void)attachToWindow:(UIWindow *)window;
 - (void)clearPaths;
@@ -984,22 +985,30 @@ static void ECTracePath(ECDPoint start, ECDPoint direction, ECDBox box, double r
 }
 
 - (void)attachToWindow:(UIWindow *)window {
-    if (!window || !gECOverlayAllowed) return;
-    self.frame = window.bounds;
-    if (self.superview != window) {
-        [self removeFromSuperview];
-        [window addSubview:self];
+    if (!window || !gECOverlayAllowed || gECOverlayDead) return;
+    UIWindowScene *scene = window.windowScene;
+    if (!scene) return;
+    if (!self.overlayWindow) {
+        UIWindow *overlayWindow = [[UIWindow alloc] initWithWindowScene:scene];
+        overlayWindow.frame = scene.coordinateSpace.bounds;
+        overlayWindow.windowLevel = UIWindowLevelNormal + 1;
+        overlayWindow.backgroundColor = UIColor.clearColor;
+        overlayWindow.userInteractionEnabled = NO;
+        UIViewController *root = [UIViewController new];
+        root.view.backgroundColor = UIColor.clearColor;
+        overlayWindow.rootViewController = root;
+        self.frame = overlayWindow.bounds;
+        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [root.view addSubview:self];
+        overlayWindow.hidden = NO;
+        self.overlayWindow = overlayWindow;
     }
-    [window bringSubviewToFront:self];
-    UIView *button = [window viewWithTag:EC_LINES_BUTTON_TAG];
-    if (button) [window bringSubviewToFront:button];
-    if (self.link) return;
-    self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
-    [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-}
-
-- (CGPoint)mapPoint:(ECDPoint)world box:(ECDBox)box {
-    return ECWorldToFelt(world, box, CGRectInset(self.bounds, 22, 36));
+    self.overlayWindow.hidden = NO;
+    if (self.timer) return;
+    __weak typeof(self) weakSelf = self;
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.12 repeats:YES block:^(NSTimer *timer) {
+        [weakSelf tick];
+    }];
 }
 
 - (void)tick {
@@ -1008,97 +1017,49 @@ static void ECTracePath(ECDPoint start, ECDPoint direction, ECDBox box, double r
             [self clearPaths];
             return;
         }
-        static NSInteger skip = 0;
-        if ((++skip % 3) != 0) return;
-        id manager = gECGameManager;
-        if (!ECLooksLikeObject(manager)) {
-            [self clearPaths];
-            return;
+        static BOOL entered = NO;
+        if (!entered) {
+            entered = YES;
+            ECLogLine(@"overlay-tick-enter");
         }
-        id table = ECTableFromManager(manager);
-        id visualCue = ECInvokeId(manager, @"visualCue");
-        if (!table || !ECLooksLikeObject(visualCue)) {
-            [self clearPaths];
-            return;
-        }
+        id visualCue = ECInvokeId(gECGameManager, @"visualCue");
         float angle = ECReadFloat(visualCue, @"aimAngle", NAN);
         if (isnan(angle)) angle = ECReadFloat(visualCue, @"getAimAngleTarget", NAN);
         if (isnan(angle)) {
             [self clearPaths];
             return;
         }
-        id cueBall = ECInvokeId(table, @"getCueBall");
-        ECDPoint cue = ECMakePoint(NAN, NAN);
-        double cueRadius = 3.6;
-        ECSnap snaps[20];
-        int snapCount = ECSnapshotBalls(table, cueBall, snaps, 20, &cue, &cueRadius);
-        if (!ECPointValid(cue)) {
+        CGRect felt = CGRectInset(self.bounds, 22, 36);
+        if (felt.size.width < 40 || felt.size.height < 40) {
             [self clearPaths];
             return;
         }
+        CGPoint cue = CGPointMake(CGRectGetMinX(felt) + CGRectGetWidth(felt) * 0.22, CGRectGetMidY(felt));
         double radians = (fabs(angle) > 8.0) ? (angle * M_PI / 180.0) : angle;
-        ECDPoint dir = ECMakePoint(cos(radians), sin(radians));
-        ECDBox box = ECBoxFromSnaps(snaps, snapCount, cue, cueRadius);
+        ECDPoint dir = ECNorm(ECMakePoint(cos(radians), -sin(radians)));
         NSInteger bounces = gECMultiplier >= 8 ? 3 : (gECMultiplier >= 4 ? 2 : 1);
-        UIBezierPath *cuePath = [UIBezierPath bezierPath];
-        UIBezierPath *objectPath = [UIBezierPath bezierPath];
-        __block NSInteger cueParts = 0;
-        int hitIndex = -1;
-        ECDPoint hitPos = ECMakePoint(NAN, NAN);
-        ECDPoint hitCenter = ECMakePoint(NAN, NAN);
-        ECDPoint inDir = dir;
-        ECTracePath(cue, dir, box, cueRadius, snaps, snapCount, -1, bounces, ^(ECDPoint from, ECDPoint to) {
-            CGPoint a = [self mapPoint:from box:box];
-            CGPoint b = [self mapPoint:to box:box];
-            if (cueParts == 0) [cuePath moveToPoint:a];
-            [cuePath addLineToPoint:b];
-            cueParts++;
-        }, &hitIndex, &hitPos, &hitCenter, &inDir);
-        if (hitIndex >= 0 && ECPointValid(hitPos) && ECPointValid(hitCenter)) {
-            ECDPoint normal = ECNorm(ECMakePoint(hitCenter.x - hitPos.x, hitCenter.y - hitPos.y));
-            double objectRadius = snaps[hitIndex].radius;
-            if (objectRadius < 0.01) objectRadius = cueRadius;
-            __block NSInteger objectParts = 0;
-            ECTracePath(hitCenter, normal, box, objectRadius, snaps, snapCount, hitIndex, 1, ^(ECDPoint from, ECDPoint to) {
-                CGPoint a = [self mapPoint:from box:box];
-                CGPoint b = [self mapPoint:to box:box];
-                if (objectParts == 0) [objectPath moveToPoint:a];
-                [objectPath addLineToPoint:b];
-                objectParts++;
-            }, NULL, NULL, NULL, NULL);
-            double transferred = inDir.x * normal.x + inDir.y * normal.y;
-            ECDPoint leftover = ECMakePoint(inDir.x - normal.x * transferred, inDir.y - normal.y * transferred);
-            if (hypot(leftover.x, leftover.y) > 0.08) {
-                ECTracePath(hitPos, leftover, box, cueRadius, snaps, snapCount, hitIndex, 1, ^(ECDPoint from, ECDPoint to) {
-                    CGPoint a = [self mapPoint:from box:box];
-                    CGPoint b = [self mapPoint:to box:box];
-                    [cuePath addLineToPoint:a];
-                    [cuePath addLineToPoint:b];
-                }, NULL, NULL, NULL, NULL);
-            }
-            CGPoint ghostCenter = [self mapPoint:hitCenter box:box];
-            ECDPoint rim = ECMakePoint(hitCenter.x + objectRadius, hitCenter.y);
-            CGPoint ghostRim = [self mapPoint:rim box:box];
-            CGFloat ghostR = MAX(6.0, hypot(ghostRim.x - ghostCenter.x, ghostRim.y - ghostCenter.y));
-            self.ghost.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(ghostCenter.x - ghostR, ghostCenter.y - ghostR, ghostR * 2, ghostR * 2)].CGPath;
-        } else {
-            self.ghost.path = nil;
-        }
+        ECDBox box = {felt.origin.x, felt.origin.y, felt.origin.x + felt.size.width, felt.origin.y + felt.size.height};
+        UIBezierPath *path = [UIBezierPath bezierPath];
+        __block NSInteger parts = 0;
+        ECTracePath(ECMakePoint(cue.x, cue.y), dir, box, 0, NULL, 0, -1, bounces, ^(ECDPoint from, ECDPoint to) {
+            if (parts == 0) [path moveToPoint:CGPointMake(from.x, from.y)];
+            [path addLineToPoint:CGPointMake(to.x, to.y)];
+            parts++;
+        }, NULL, NULL, NULL, NULL);
         static BOOL dumped = NO;
         if (!dumped) {
             dumped = YES;
-            CGPoint cueScreen = [self mapPoint:cue box:box];
-            ECLogLine([NSString stringWithFormat:@"overlay-phys snaps=%d angle=%.3f cue=%.2f,%.2f box=%.1f,%.1f,%.1f,%.1f screen=%.1f,%.1f hit=%d",
-                       snapCount, angle, cue.x, cue.y, box.minX, box.minY, box.maxX, box.maxY,
-                       cueScreen.x, cueScreen.y, hitIndex]);
+            ECLogLine([NSString stringWithFormat:@"overlay-phys angle=%.3f parts=%ld felt=%.0fx%.0f",
+                       angle, (long)parts, felt.size.width, felt.size.height]);
         }
-        if (cueParts == 0) {
+        if (parts == 0) {
             [self clearPaths];
             return;
         }
         self.hidden = NO;
-        self.stroke.path = cuePath.CGPath;
-        self.objectStroke.path = objectPath.CGPath;
+        self.stroke.path = path.CGPath;
+        self.objectStroke.path = nil;
+        self.ghost.path = nil;
     } @catch (NSException *exception) {
         gECOverlayDead = YES;
         [self clearPaths];
