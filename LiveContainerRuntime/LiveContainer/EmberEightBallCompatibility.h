@@ -383,15 +383,20 @@ static void Ember8BStripRaspUI(void) {
             }
         }
     }
+    (void)gameWindow;
     for (UIWindow *window in app.windows) {
-        bool raspWindow = Ember8BViewTreeHasText(window, Ember8BIsRaspText) || Ember8BIsRaspAlert(window.rootViewController);
-        bool other = gameWindow && window != gameWindow;
-        if (raspWindow || other) {
+        NSString *wcls = NSStringFromClass(window.class);
+        bool authWindow = [wcls containsString:@"Remote"] || [wcls containsString:@"Auth"] ||
+                          [wcls containsString:@"Safari"] || [wcls containsString:@"Keyboard"] ||
+                          [wcls containsString:@"TextEffects"] || [wcls containsString:@"Passcode"];
+        bool raspWindow = !authWindow &&
+            (Ember8BViewTreeHasText(window, Ember8BIsRaspText) || Ember8BIsRaspAlert(window.rootViewController));
+        if (raspWindow && window.windowLevel > UIWindowLevelNormal) {
             window.userInteractionEnabled = NO;
-            if (window.windowLevel > UIWindowLevelNormal) window.hidden = YES;
-            if (raspWindow || other) Ember8BLog(other ? "disabled non-game window hits" : "disabled rasp window hits");
+            window.hidden = YES;
+            Ember8BLog("disabled rasp window hits");
         }
-        Ember8BDisableRaspOverlays(window, window);
+        if (!authWindow) Ember8BDisableRaspOverlays(window, window);
         UIViewController *presented = window.rootViewController.presentedViewController;
         while (presented) {
             UIViewController *next = presented.presentedViewController;
