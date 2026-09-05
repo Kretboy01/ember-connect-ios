@@ -2,7 +2,7 @@
 
 An Ember Connect tweak for 8 Ball Pool (`com.miniclip.8ballpoolmult`) that extends the game's native aiming guide in offline/practice games.
 
-The tweak writes the classic public span (`lowAimRatio=-900`, `highAimRatio=1300`) and keeps `hideGuidelinesMode` off. It does not draw a separate prediction overlay — that crashed Pass and Play load.
+56.x no longer uses the 2013/2017 ObjC aim-ratio hooks for line length. The current path scales the `u_guidelineLength` shader uniform and, after the table is up, draws a longer overlay line from `VisualCue`.
 
 ## Local-match guard
 

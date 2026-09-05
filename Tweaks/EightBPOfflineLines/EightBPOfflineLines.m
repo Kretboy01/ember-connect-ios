@@ -4,9 +4,14 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <OpenGLES/ES2/gl.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
 #import <math.h>
+#import <stdlib.h>
+#import <string.h>
+#include "../../LiveContainerRuntime/litehook/src/litehook.h"
 
 #define EC_LINES_BUTTON_TAG 0x8B901
 #define EC_LINE_OVERLAY_TAG 0x8B902
@@ -38,6 +43,14 @@ static BOOL (*ECOriginalHideGuidelinesMode)(id, SEL) = NULL;
 static void (*ECOriginalSetHideGuidelinesMode)(id, SEL, BOOL) = NULL;
 static BOOL (*ECOriginalNoGuidelinesOffline)(id, SEL) = NULL;
 static BOOL (*ECOriginalFixedGuidelines)(id, SEL) = NULL;
+static GLint gECGuidelineUniform = -1;
+static GLint (*ECOriginalGetUniformLocation)(GLuint, const GLchar *) = NULL;
+static void (*ECOriginalUniform1f)(GLint, GLfloat) = NULL;
+static void (*ECOriginalUniform1fv)(GLint, GLsizei, const GLfloat *) = NULL;
+static int gECScaledUniformCount = 0;
+static BOOL gECOverlayScheduled = NO;
+
+static void ECScheduleOverlay(void);
 
 static BOOL ECInvokeBool(id object, NSString *selectorName, BOOL fallback) {
     if (!object) return fallback;
@@ -278,11 +291,12 @@ static void ECCaptureGameManager(id object) {
 
 static void ECGameManagerOnEnter(id self, SEL selector) {
     ECCaptureGameManager(self);
-    gECInMatch = YES;
     if (ECOriginalGameManagerOnEnter) ECOriginalGameManagerOnEnter(self, selector);
+    gECInMatch = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
         ECRefreshNativeGuide();
         ECWriteStatus(@"game-entered");
+        ECScheduleOverlay();
     });
 }
 
@@ -290,16 +304,18 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     if (ECOriginalGameManagerOnExit) ECOriginalGameManagerOnExit(self, selector);
     if (gECGameManager == self) gECGameManager = nil;
     gECInMatch = NO;
+    gECOverlayScheduled = NO;
     dispatch_async(dispatch_get_main_queue(), ^{ ECWriteStatus(@"game-exited"); });
 }
 
 static void ECStartHotSeatGame(id self, SEL selector) {
     ECCaptureGameManager(self);
-    gECInMatch = YES;
     if (ECOriginalStartHotSeatGame) ECOriginalStartHotSeatGame(self, selector);
+    gECInMatch = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
         ECRefreshNativeGuide();
         ECWriteStatus(@"hotseat-started");
+        ECScheduleOverlay();
     });
 }
 
@@ -423,6 +439,101 @@ static BOOL ECHookBoolSetter(Class cls, SEL selector, IMP replacement, IMP *orig
     return *original != NULL;
 }
 
+static float ECScaleGuidelineLength(float value) {
+    if (!ECExtensionIsActive() || gECMultiplier <= 1) return value;
+    if (value <= 0) return value;
+    return value * (float)gECMultiplier;
+}
+
+static GLint ECGetUniformLocation(GLuint program, const GLchar *name) {
+    GLint location = ECOriginalGetUniformLocation ? ECOriginalGetUniformLocation(program, name) : -1;
+    if (name && strstr(name, "guidelineLength") && location >= 0) {
+        gECGuidelineUniform = location;
+        static BOOL logged = NO;
+        if (!logged) {
+            logged = YES;
+            ECLogLine([NSString stringWithFormat:@"gl uniform %s loc=%d", name, location]);
+        }
+    }
+    return location;
+}
+
+static void ECUniform1f(GLint location, GLfloat value) {
+    if (location >= 0 && location == gECGuidelineUniform) {
+        float scaled = ECScaleGuidelineLength(value);
+        if (gECScaledUniformCount < 8) {
+            ECLogLine([NSString stringWithFormat:@"glUniform1f guideline %.3f -> %.3f", value, scaled]);
+        }
+        gECScaledUniformCount++;
+        value = scaled;
+    }
+    if (ECOriginalUniform1f) ECOriginalUniform1f(location, value);
+}
+
+static void ECUniform1fv(GLint location, GLsizei count, const GLfloat *value) {
+    if (location >= 0 && location == gECGuidelineUniform && count >= 1 && value) {
+        GLfloat scaled = ECScaleGuidelineLength(value[0]);
+        if (ECOriginalUniform1fv) ECOriginalUniform1fv(location, 1, &scaled);
+        return;
+    }
+    if (ECOriginalUniform1fv) ECOriginalUniform1fv(location, count, value);
+}
+
+static void ECInstallGLHooks(void) {
+    void *getLocation = dlsym(RTLD_DEFAULT, "glGetUniformLocation");
+    void *uniform1f = dlsym(RTLD_DEFAULT, "glUniform1f");
+    void *uniform1fv = dlsym(RTLD_DEFAULT, "glUniform1fv");
+    ECOriginalGetUniformLocation = getLocation;
+    ECOriginalUniform1f = uniform1f;
+    ECOriginalUniform1fv = uniform1fv;
+    if (getLocation) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getLocation, ECGetUniformLocation, NULL);
+    if (uniform1f) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, uniform1f, ECUniform1f, NULL);
+    if (uniform1fv) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, uniform1fv, ECUniform1fv, NULL);
+    ECLogLine([NSString stringWithFormat:@"gl hook loc=%d u1f=%d u1fv=%d",
+               getLocation != NULL, uniform1f != NULL, uniform1fv != NULL]);
+}
+
+static void ECHookSetUniformClasses(void) {
+    SEL selector = NSSelectorFromString(@"setUniform:value:");
+    int classCount = objc_getClassList(NULL, 0);
+    if (classCount <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned)classCount);
+    classCount = objc_getClassList(classes, classCount);
+    int hooked = 0;
+    for (int i = 0; i < classCount; i++) {
+        Method method = class_getInstanceMethod(classes[i], selector);
+        if (!method || method_getNumberOfArguments(method) != 4) continue;
+        char *encoding = method_getTypeEncoding(method) ? strdup(method_getTypeEncoding(method)) : NULL;
+        IMP original = method_getImplementation(method);
+        if (!original) {
+            if (encoding) free(encoding);
+            continue;
+        }
+        const char *types = encoding ?: "";
+        if (strstr(types, "@") && strchr(types + 1, '@')) {
+            IMP replacement = imp_implementationWithBlock(^(id self, id name, id value) {
+                if (ECExtensionIsActive() && [name isKindOfClass:NSString.class] &&
+                    [[(NSString *)name lowercaseString] containsString:@"guideline"] &&
+                    [value respondsToSelector:@selector(floatValue)]) {
+                    value = @(ECScaleGuidelineLength([(NSNumber *)value floatValue]));
+                    if (gECScaledUniformCount < 8) {
+                        ECLogLine([NSString stringWithFormat:@"setUniform %@ -> %@", name, value]);
+                    }
+                    gECScaledUniformCount++;
+                }
+                ((void (*)(id, SEL, id, id))original)(self, selector, name, value);
+            });
+            method_setImplementation(method, replacement);
+            hooked++;
+            ECLogLine([NSString stringWithFormat:@"setUniform class=%@ enc=%s", classes[i], types]);
+        }
+        if (encoding) free(encoding);
+        if (hooked >= 8) break;
+    }
+    free(classes);
+    ECLogLine([NSString stringWithFormat:@"setUniform hooked=%d", hooked]);
+}
+
 static void ECDumpClassSelectors(Class cls, NSString *label) {
     if (!cls) {
         ECLogLine([NSString stringWithFormat:@"%@ missing", label]);
@@ -473,6 +584,9 @@ static void ECInstallHooks(void) {
         ECDumpClassSelectors(visualCue, @"visualCue");
         ECDumpClassSelectors(NSClassFromString(@"VisualCueWide"), @"visualCueWide");
         ECDumpClassSelectors(userInfo, @"userInfoClass");
+        ECDumpClassSelectors(gameManager, @"gameManagerClass");
+        ECInstallGLHooks();
+        ECHookSetUniformClasses();
 
         ECHookBoolGetter(settings, NSSelectorFromString(@"showCueBallTrajectory"),
                          (IMP)ECShowCueBallTrajectory, (IMP *)&ECOriginalShowCueBallTrajectory);
@@ -694,6 +808,7 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 @property (nonatomic, strong) CAShapeLayer *stroke;
 @property (nonatomic, strong) CADisplayLink *link;
 @property (nonatomic, assign) BOOL aiming;
+@property (nonatomic, assign) CGPoint lastDirection;
 @property (nonatomic, assign) NSTimeInterval lastAimLog;
 + (instancetype)sharedOverlay;
 - (void)attachToWindow:(UIWindow *)window;
@@ -727,8 +842,6 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 - (void)attachToWindow:(UIWindow *)window {
-    (void)window;
-    return;
     if (!window) return;
     self.frame = window.bounds;
     if (self.superview != window) {
@@ -747,6 +860,10 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 - (void)aimingPan:(UIPanGestureRecognizer *)gesture {
+    CGPoint translation = [gesture translationInView:self];
+    if (hypot(translation.x, translation.y) > 2) {
+        self.lastDirection = CGPointMake(translation.x, translation.y);
+    }
     self.aiming = gesture.state == UIGestureRecognizerStateBegan ||
                   gesture.state == UIGestureRecognizerStateChanged;
     if (gesture.state == UIGestureRecognizerStateEnded ||
@@ -760,7 +877,6 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 - (void)tick {
-    return;
     @try {
         if (!gECInMatch || !ECExtensionIsActive() || gECMultiplier <= 1) {
             self.hidden = YES;
@@ -768,40 +884,40 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
             return;
         }
         id manager = gECGameManager;
-        if (!manager) {
-            self.hidden = YES;
-            self.stroke.path = nil;
-            return;
-        }
         id visualCue = nil;
-        if ([manager respondsToSelector:NSSelectorFromString(@"visualCue")]) {
+        if (manager && [manager respondsToSelector:NSSelectorFromString(@"visualCue")]) {
             visualCue = ECInvokeId(manager, @"visualCue");
         }
-        if (!visualCue) visualCue = ECIvarObject(manager, "mVisualCue");
-        id host = visualCue ?: manager;
-        float angle = ECReadFloat(host, @"aimAngle", NAN);
-        if (isnan(angle)) angle = ECReadFloat(host, @"getAimAngleTarget", NAN);
-        if (isnan(angle)) angle = ECReadIvarAngle(host);
-        CGPoint cue = ECCueBallScreenPoint(manager, self);
+        float angle = NAN;
+        if (visualCue) {
+            angle = ECReadFloat(visualCue, @"aimAngle", NAN);
+            if (isnan(angle)) angle = ECReadFloat(visualCue, @"getAimAngleTarget", NAN);
+        }
+        CGPoint cue = CGPointZero;
+        if (manager) cue = ECCueBallScreenPoint(manager, self);
         if (cue.x == 0 && cue.y == 0) {
             CGRect table = CGRectInset(self.bounds, 70, 48);
             cue = CGPointMake(CGRectGetMinX(table) + CGRectGetWidth(table) * 0.22,
                               CGRectGetMidY(table));
         }
-        static BOOL dumped = NO;
-        if (!dumped) {
-            dumped = YES;
-            ECLogLine([NSString stringWithFormat:@"overlay safe host=%@ visual=%@ angle=%.3f cue=%.1f,%.1f",
-                       [host class], [visualCue class], angle, cue.x, cue.y]);
-        }
-        if (isnan(angle)) {
+        CGPoint dir = CGPointZero;
+        if (!isnan(angle)) {
+            CGFloat radians = (fabs(angle) > 8.0) ? (angle * (float)M_PI / 180.0f) : angle;
+            dir = CGPointMake(cos(radians), -sin(radians));
+        } else if (hypot(self.lastDirection.x, self.lastDirection.y) > 1) {
+            dir = self.lastDirection;
+        } else {
             self.hidden = YES;
             self.stroke.path = nil;
             return;
         }
+        static BOOL dumped = NO;
+        if (!dumped) {
+            dumped = YES;
+            ECLogLine([NSString stringWithFormat:@"overlay visual=%@ angle=%.3f cue=%.1f,%.1f dir=%.2f,%.2f",
+                       [visualCue class], angle, cue.x, cue.y, dir.x, dir.y]);
+        }
         self.hidden = NO;
-        CGFloat radians = (fabs(angle) > 8.0) ? (angle * (float)M_PI / 180.0f) : angle;
-        CGPoint dir = CGPointMake(cos(radians), -sin(radians));
         CGRect table = CGRectInset(self.bounds, 18, 28);
         NSInteger bounces = gECMultiplier >= 8 ? 3 : (gECMultiplier >= 4 ? 2 : 1);
         UIBezierPath *path = [UIBezierPath bezierPath];
@@ -826,6 +942,7 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 @property (nonatomic, weak) UIWindow *hostWindow;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 + (instancetype)sharedController;
+- (UIWindow *)guestWindow;
 @end
 
 @implementation EmberEightBPOfflineLinesController
@@ -1008,6 +1125,21 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 @end
+
+static void ECScheduleOverlay(void) {
+    if (gECOverlayScheduled) return;
+    gECOverlayScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!gECInMatch || !ECExtensionIsActive()) {
+            gECOverlayScheduled = NO;
+            return;
+        }
+        UIWindow *window = [[EmberEightBPOfflineLinesController sharedController] guestWindow];
+        [EmberEightBPLineOverlay.sharedOverlay attachToWindow:window];
+        ECLogLine([NSString stringWithFormat:@"overlay-attached window=%@", window]);
+    });
+}
 
 static void EmberEightBPOfflineLinesBoot(void) {
     NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier ?: @"";
