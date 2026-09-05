@@ -243,31 +243,17 @@ static void ECDumpAimIvars(id object, NSString *label) {
     ECLogLine([NSString stringWithFormat:@"%@ %@ %@", label, [object class], [parts componentsJoinedByString:@" "]]);
 }
 
+// UserInfo lowAimRatio / highAimRatio are the selected cue's real aim stat
+// (observed 8 / 14). The 2017 iOSGods span (-900 / 1300) freezes cue rotation
+// on 56.29.2 — the player can still shoot and place ball-in-hand, but the cue
+// will not turn. Guide length comes from CueStats.aim instead, so leave the
+// aim stats completely alone.
 static void ECApplyAimValues(void) {
-    if (!ECExtensionIsActive()) return;
-    int low = 0, high = 0;
-    ECTargetAimSpan(&low, &high);
-    id user = ECFindUserInfo();
-    id manager = ECFindGameManager();
     static BOOL dumped = NO;
-    if (!dumped) {
-        dumped = YES;
-        ECDumpAimIvars(user, @"userInfo");
-        ECDumpAimIvars(manager, @"gameManager");
-    }
-    ECInvokeIntSetter(user, @"setLowAimRatio:", low);
-    ECInvokeIntSetter(user, @"setHighAimRatio:", high);
-    BOOL wroteLow = ECSetIntIvar(user, "mLowAimRatio", low) || ECSetIntIvar(user, "_lowAimRatio", low);
-    BOOL wroteHigh = ECSetIntIvar(user, "mHighAimRatio", high) || ECSetIntIvar(user, "_highAimRatio", high);
-    ECSetIntIvar(manager, "mLowAimRatio", low);
-    ECSetIntIvar(manager, "mHighAimRatio", high);
-    static int lastLow = 1, lastHigh = 1;
-    if (lastLow != low || lastHigh != high || !user) {
-        lastLow = low;
-        lastHigh = high;
-        ECLogLine([NSString stringWithFormat:@"apply span low=%d high=%d user=%@ wroteLow=%d wroteHigh=%d",
-                   low, high, user, wroteLow, wroteHigh]);
-    }
+    if (dumped || !ECExtensionIsActive()) return;
+    dumped = YES;
+    ECDumpAimIvars(ECFindUserInfo(), @"userInfo");
+    ECDumpAimIvars(ECFindGameManager(), @"gameManager");
 }
 
 // Network matches stay locked. Pass and Play is isOnLocalGame / hotseat, not
@@ -295,7 +281,6 @@ static BOOL ECExtensionIsActive(void) {
 }
 
 static void ECRefreshNativeGuide(void) {
-    ECApplyAimValues();
     id manager = ECFindGameManager();
     if (!manager || !ECIsLocalMatch()) return;
     SEL selector = NSSelectorFromString(@"updateCueStatsAndVisualGuide");
@@ -597,20 +582,21 @@ static id ECCircleTexture(void) {
     if (gECRingTexture) return gECRingTexture;
     Class texCls = NSClassFromString(@"CCTexture2D");
     if (!texCls) return nil;
-    const int n = 64;
+    const int n = 128;
     uint32_t *pixels = calloc((size_t)n * n, sizeof(uint32_t));
     if (!pixels) return nil;
     float cx = (n - 1) * 0.5f;
-    float outer = n * 0.5f - 1.0f;
-    float inner = outer - 5.0f;
+    float outer = n * 0.5f - 2.0f;
+    float inner = outer - 9.0f;
+    float mid = (outer + inner) * 0.5f;
+    float half = (outer - inner) * 0.5f;
     for (int y = 0; y < n; y++) {
         for (int x = 0; x < n; x++) {
             float d = hypotf((float)x - cx, (float)y - cx);
-            if (d <= outer && d >= inner) {
-                float edge = fminf(d - inner, outer - d);
-                uint8_t a = edge < 1.0f ? (uint8_t)(edge * 255.0f) : 255;
-                pixels[y * n + x] = ((uint32_t)a << 24) | 0x00FFFFFF;
-            }
+            float edge = half - fabsf(d - mid);
+            if (edge <= 0) continue;
+            float a = edge < 1.5f ? edge / 1.5f : 1.0f;
+            pixels[y * n + x] = ((uint32_t)(a * 255.0f) << 24) | 0x00FFFFFF;
         }
     }
     id tex = ((id (*)(id, SEL))objc_msgSend)(texCls, @selector(alloc));
@@ -705,7 +691,10 @@ static void ECSyncCocosMarker(id ball) {
         CGSize ballSize = ((CGSize (*)(id, SEL))objc_msgSend)(sphere, @selector(contentSize));
         CGSize markSize = ((CGSize (*)(id, SEL))objc_msgSend)(marker, @selector(contentSize));
         if (markSize.width > 1 && ballSize.width > 1 && [marker respondsToSelector:@selector(setScale:)]) {
-            ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:), (float)(ballSize.width / markSize.width));
+            // Ring a little wider than the ball so it reads as an outline
+            // instead of a disc sitting under the sphere.
+            float scale = (float)(ballSize.width * 1.35 / markSize.width);
+            ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:), scale);
         }
     }
     id markerParent = ECInvokeId(marker, @"parent");
@@ -850,18 +839,10 @@ static void ECInstallHooks(void) {
                                        (IMP)ECGameManagerOnExit, (IMP *)&ECOriginalGameManagerOnExit);
         ECHookVoidMethod(gameManager, NSSelectorFromString(@"startHotSeatGame"),
                          (IMP)ECStartHotSeatGame, (IMP *)&ECOriginalStartHotSeatGame);
-        ECHookVoidMethod(gameManager, NSSelectorFromString(@"updateCueStatsAndVisualGuide"),
-                         (IMP)ECUpdateVisualGuide, (IMP *)&ECOriginalUpdateVisualGuide);
-        BOOL lowOK = ECHookIntGetter(userInfo, NSSelectorFromString(@"lowAimRatio"),
-                                     (IMP)ECLowAimRatio, (IMP *)&ECOriginalLowAimRatio);
-        BOOL highOK = ECHookIntGetter(userInfo, NSSelectorFromString(@"highAimRatio"),
-                                      (IMP)ECHighAimRatio, (IMP *)&ECOriginalHighAimRatio);
-        ECHookIntGetter(userInfo, NSSelectorFromString(@"guidelineRange"),
-                        (IMP)ECGuidelineRange, (IMP *)&ECOriginalGuidelineRange);
-        BOOL setLowOK = ECHookIntSetter(userInfo, NSSelectorFromString(@"setLowAimRatio:"),
-                                        (IMP)ECSetLowAimRatio, (IMP *)&ECOriginalSetLowAimRatio);
-        BOOL setHighOK = ECHookIntSetter(userInfo, NSSelectorFromString(@"setHighAimRatio:"),
-                                         (IMP)ECSetHighAimRatio, (IMP *)&ECOriginalSetHighAimRatio);
+        // No hooks on lowAimRatio / highAimRatio / guidelineRange / setAimAngle: /
+        // updateCueStatsAndVisualGuide. Touching the aim stats or the guide
+        // rebuild locks the cue so it cannot be rotated by dragging.
+        BOOL lowOK = YES, highOK = YES, setLowOK = YES, setHighOK = YES;
         BOOL statsOK = ECHookCueStatsGetter(userInfo, NSSelectorFromString(@"getCueStats:"),
                                             (IMP)ECGetCueStats, (IMP *)&ECOriginalGetCueStats);
         BOOL bonusOK = ECHookCueStatsGetter(userInfo, NSSelectorFromString(@"getCueStatsWithBonus:"),
@@ -872,8 +853,7 @@ static void ECInstallHooks(void) {
         Class visualCue = NSClassFromString(@"VisualCue");
         Class table = NSClassFromString(@"Table");
         Class ball = NSClassFromString(@"Ball");
-        BOOL aimOK = ECHookIMP(visualCue, NSSelectorFromString(@"setAimAngle:"),
-                               (IMP)ECSetAimAngle, (IMP *)&ECOriginalSetAimAngle);
+        BOOL aimOK = NO;
         BOOL cueBallOK = ECHookIMP(table, NSSelectorFromString(@"getCueBall"),
                                   (IMP)ECGetCueBallHook, (IMP *)&ECOriginalGetCueBall);
         BOOL posOK = ECHookIMP(ball, NSSelectorFromString(@"setPosition:"),
@@ -895,10 +875,8 @@ static void ECInstallHooks(void) {
         ECDumpClassSelectors(userInfo, @"userInfoClass");
         ECDumpClassSelectors(gameManager, @"gameManagerClass");
 
-        ECHookBoolGetter(settings, NSSelectorFromString(@"showCueBallTrajectory"),
-                         (IMP)ECShowCueBallTrajectory, (IMP *)&ECOriginalShowCueBallTrajectory);
-        ECHookBoolGetter(settings, NSSelectorFromString(@"wideGuideline"),
-                         (IMP)ECWideGuideline, (IMP *)&ECOriginalWideGuideline);
+        // wideGuideline / showCueBallTrajectory swap in a different guide widget
+        // mid-aim, which is another way the cue stops responding to drags.
         if (!ECHookBoolGetter(visualCue, NSSelectorFromString(@"hideGuidelinesMode"),
                               (IMP)ECHideGuidelinesMode, (IMP *)&ECOriginalHideGuidelinesMode) &&
             !ECHookBoolGetter(settings, NSSelectorFromString(@"hideGuidelinesMode"),
@@ -1607,7 +1585,6 @@ static void ECRequestOverlayRedraw(void) {
     [self.keepAliveTimer invalidate];
     __weak typeof(self) weakSelf = self;
     self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
-        ECApplyAimValues();
         [weakSelf install];
     }];
 }
