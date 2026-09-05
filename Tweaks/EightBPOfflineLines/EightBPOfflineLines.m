@@ -66,6 +66,8 @@ static void ECLogLine(NSString *line) {
     [handle closeFile];
 }
 
+static BOOL ECExtensionIsActive(void);
+
 static id ECFindGameManager(void) {
     if (gECGameManager) return gECGameManager;
     Class cls = NSClassFromString(@"GameManager");
