@@ -157,20 +157,13 @@ static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *s
 static void EmberEightBallCompatibilityGuestLoaded(void) {
     if (!Ember8BArmed) return;
     Ember8BRebindAllImages();
-    Ember8BLog("terminate gate rebound after guest load");
-    // GOT rebind misses lazy binds. Overwrite the libc prologues so the
-    // first call cannot resolve past the gate.
-    Ember8BLogPtr("hook exit", litehook_hook_function(exit, Ember8BHookExit));
-    Ember8BLogPtr("hook _Exit", litehook_hook_function(_Exit, Ember8BHook_Exit));
-    Ember8BLogPtr("hook _exit", litehook_hook_function(_exit, Ember8BHook_exit));
-    Ember8BLogPtr("hook abort", litehook_hook_function(abort, Ember8BHookAbort));
-    Ember8BLogPtr("hook raise", litehook_hook_function(raise, Ember8BHookRaise));
-    Ember8BLogPtr("hook kill", litehook_hook_function(kill, Ember8BHookKill));
-    Ember8BLogPtr("hook pthread_kill", litehook_hook_function(pthread_kill, Ember8BHookPthreadKill));
-    if (Ember8BRealTerminate) {
-        Ember8BLogPtr("hook terminate", litehook_hook_function(Ember8BRealTerminate, Ember8BHookTerminate));
+    // Force remaining lazy libc binds so GOT slots hold real exit/abort/kill,
+    // then patch those slots. Writing libsystem TEXT gets this process killed.
+    if (NSBundle.mainBundle.executablePath) {
+        dlopen(NSBundle.mainBundle.executablePath.fileSystemRepresentation, RTLD_NOW | RTLD_NOLOAD);
     }
-    Ember8BLog("libc terminate prologues overwritten");
+    Ember8BRebindAllImages();
+    Ember8BLog("terminate gate rebound after guest load");
 }
 #else
 static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *settings, NSString *documents) {}
