@@ -17,6 +17,7 @@ static NSString *const ECButtonXKey = @"EmberEightBPOfflineLines.buttonX";
 static NSString *const ECButtonYKey = @"EmberEightBPOfflineLines.buttonY";
 
 static id gECGameManager = nil;
+static BOOL gECInMatch = NO;
 static NSInteger gECMultiplier = 8;
 static BOOL gECHooksInstalled = NO;
 static int gECObservedLowAimRatio = 0;
@@ -254,6 +255,7 @@ static void ECCaptureGameManager(id object) {
 
 static void ECGameManagerOnEnter(id self, SEL selector) {
     ECCaptureGameManager(self);
+    gECInMatch = YES;
     if (ECOriginalGameManagerOnEnter) ECOriginalGameManagerOnEnter(self, selector);
     dispatch_async(dispatch_get_main_queue(), ^{
         ECRefreshNativeGuide();
@@ -264,11 +266,13 @@ static void ECGameManagerOnEnter(id self, SEL selector) {
 static void ECGameManagerOnExit(id self, SEL selector) {
     if (ECOriginalGameManagerOnExit) ECOriginalGameManagerOnExit(self, selector);
     if (gECGameManager == self) gECGameManager = nil;
+    gECInMatch = NO;
     dispatch_async(dispatch_get_main_queue(), ^{ ECWriteStatus(@"game-exited"); });
 }
 
 static void ECStartHotSeatGame(id self, SEL selector) {
     ECCaptureGameManager(self);
+    gECInMatch = YES;
     if (ECOriginalStartHotSeatGame) ECOriginalStartHotSeatGame(self, selector);
     dispatch_async(dispatch_get_main_queue(), ^{
         ECRefreshNativeGuide();
@@ -546,28 +550,20 @@ static UIView *ECRenderView(UIWindow *window) {
 }
 
 static CGPoint ECCueBallScreenPoint(id host, UIView *space) {
+    if (!host || !space) return CGPointZero;
     id sprite = ECIvarObject(host, "mCueBallSprite");
-    if (!sprite) sprite = ECInvokeId(host, @"getCueBall");
+    if (sprite && ![sprite isKindOfClass:NSObject.class]) sprite = nil;
     CGPoint point = CGPointZero;
-    if (sprite) {
+    if (sprite && [sprite respondsToSelector:@selector(position)]) {
         point = ECReadPoint(sprite, @"position");
-        SEL convert = NSSelectorFromString(@"convertToWorldSpace:");
-        if ([sprite respondsToSelector:convert]) {
-            point = ((CGPoint (*)(id, SEL, CGPoint))objc_msgSend)(sprite, convert, CGPointZero);
-        }
     }
-    if (CGPointEqualToPoint(point, CGPointZero)) {
+    if (CGPointEqualToPoint(point, CGPointZero) &&
+        [host respondsToSelector:NSSelectorFromString(@"getCueBallPositionTarget")]) {
         point = ECReadPoint(host, @"getCueBallPositionTarget");
     }
-    UIView *render = ECRenderView(space.window ?: (UIWindow *)space);
-    CGRect bounds = render.bounds;
-    CGPoint mapped = point;
-    if (point.y > 1 && point.y < bounds.size.height * 3) {
-        if (point.y <= bounds.size.height && point.x <= bounds.size.width * 1.5) {
-            mapped = CGPointMake(point.x, bounds.size.height - point.y);
-        }
-    }
-    return [render convertPoint:mapped toView:space];
+    if (CGPointEqualToPoint(point, CGPointZero)) return CGPointZero;
+    UIView *render = ECRenderView(space.window ?: (UIWindow *)space) ?: space;
+    return [render convertPoint:point toView:space];
 }
 
 static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSInteger bounces,
@@ -673,73 +669,61 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 - (void)tick {
-    if (!ECExtensionIsActive() || gECMultiplier <= 1) {
-        self.hidden = YES;
-        self.stroke.path = nil;
-        return;
-    }
-    id manager = ECFindGameManager();
-    id host = ECFindResponder(manager, @"aimAngle", 0);
-    if (!host) host = ECFindResponder(manager, @"getAimAngleTarget", 0);
-    id cueHost = ECFindResponder(manager, @"getCueBallPositionTarget", 0);
-    if (!cueHost) cueHost = ECFindResponder(manager, @"getCueBall", 0);
-    if (!cueHost) cueHost = ECFindResponder(manager, @"mCueBallSprite", 0);
-    if (!host) host = cueHost ?: manager;
-    if (!cueHost) cueHost = host;
-    float angle = ECReadFloat(host, @"aimAngle", NAN);
-    if (isnan(angle)) angle = ECReadFloat(host, @"getAimAngleTarget", NAN);
-    if (isnan(angle)) angle = ECReadIvarAngle(host);
-    CGPoint cue = ECCueBallScreenPoint(cueHost, self);
-    if (cue.x == 0 && cue.y == 0) cue = ECCueBallScreenPoint(host, self);
-    id visualCue = host;
-    if (![NSStringFromClass([visualCue class]) isEqualToString:@"VisualCue"]) {
-        visualCue = ECInvokeId(host, @"visualCue") ?: ECIvarObject(host, "mVisualCue") ?: ECIvarObject(manager, "mVisualCue");
-    }
-    static BOOL dumped = NO;
-    if (!dumped && (host || visualCue)) {
-        dumped = YES;
-        ECDumpAimIvars(host, @"aimHost");
-        ECDumpAimIvars(visualCue, @"visualCue");
-        ECDumpAimIvars(cueHost, @"cueHost");
-        Ivar guideIvar = visualCue ? class_getInstanceVariable([visualCue class], "mVisualGuide") : NULL;
-        if (guideIvar) {
-            void *guide = *(void **)((uintptr_t)visualCue + ivar_getOffset(guideIvar));
-            if (guide) {
-                float *words = (float *)((uintptr_t)guide + 16);
-                NSMutableString *dump = [NSMutableString stringWithString:@"guide+16"];
-                for (int i = 0; i < 20; i++) [dump appendFormat:@" %d=%.3f", i, words[i]];
-                ECLogLine(dump);
-            }
+    @try {
+        if (!gECInMatch || !ECExtensionIsActive() || gECMultiplier <= 1) {
+            self.hidden = YES;
+            self.stroke.path = nil;
+            return;
         }
-        ECLogLine([NSString stringWithFormat:@"overlay host=%@ cueHost=%@ angle=%.3f cue=%.1f,%.1f ivarAngle=%.3f",
-                   [host class], [cueHost class], angle, cue.x, cue.y, ECReadIvarAngle(host)]);
-        ECInvokeIntSetter(visualCue, @"setMaxLineLength:", 9999);
-        ECSetIntIvar(visualCue, "_maxLineLength", 9999);
-        ECSetIntIvar(visualCue, "mMaxLineLength", 9999);
-    }
-    if (isnan(angle) || (cue.x == 0 && cue.y == 0)) {
+        id manager = gECGameManager;
+        if (!manager) {
+            self.hidden = YES;
+            self.stroke.path = nil;
+            return;
+        }
+        id visualCue = nil;
+        if ([manager respondsToSelector:NSSelectorFromString(@"visualCue")]) {
+            visualCue = ECInvokeId(manager, @"visualCue");
+        }
+        if (!visualCue) visualCue = ECIvarObject(manager, "mVisualCue");
+        id host = visualCue ?: manager;
+        float angle = ECReadFloat(host, @"aimAngle", NAN);
+        if (isnan(angle)) angle = ECReadFloat(host, @"getAimAngleTarget", NAN);
+        if (isnan(angle)) angle = ECReadIvarAngle(host);
+        CGPoint cue = ECCueBallScreenPoint(manager, self);
+        if (cue.x == 0 && cue.y == 0) {
+            CGRect table = CGRectInset(self.bounds, 70, 48);
+            cue = CGPointMake(CGRectGetMinX(table) + CGRectGetWidth(table) * 0.22,
+                              CGRectGetMidY(table));
+        }
+        static BOOL dumped = NO;
+        if (!dumped) {
+            dumped = YES;
+            ECLogLine([NSString stringWithFormat:@"overlay safe host=%@ visual=%@ angle=%.3f cue=%.1f,%.1f",
+                       [host class], [visualCue class], angle, cue.x, cue.y]);
+        }
+        if (isnan(angle)) {
+            self.hidden = YES;
+            self.stroke.path = nil;
+            return;
+        }
+        self.hidden = NO;
+        CGFloat radians = (fabs(angle) > 8.0) ? (angle * (float)M_PI / 180.0f) : angle;
+        CGPoint dir = CGPointMake(cos(radians), -sin(radians));
+        CGRect table = CGRectInset(self.bounds, 18, 28);
+        NSInteger bounces = gECMultiplier >= 8 ? 3 : (gECMultiplier >= 4 ? 2 : 1);
+        UIBezierPath *path = [UIBezierPath bezierPath];
+        __block NSInteger parts = 0;
+        ECBounceRay(cue, dir, table, bounces, ^(CGPoint from, CGPoint to) {
+            if (parts == 0) [path moveToPoint:from];
+            [path addLineToPoint:to];
+            parts++;
+        });
+        self.stroke.path = path.CGPath;
+    } @catch (NSException *exception) {
         self.hidden = YES;
         self.stroke.path = nil;
-        return;
-    }
-    self.hidden = NO;
-    CGFloat radians = (fabs(angle) > 8.0) ? (angle * (float)M_PI / 180.0f) : angle;
-    CGPoint dir = CGPointMake(cos(radians), -sin(radians));
-    CGRect table = CGRectInset(self.bounds, 18, 28);
-    NSInteger bounces = gECMultiplier >= 8 ? 3 : (gECMultiplier >= 4 ? 2 : 1);
-    UIBezierPath *path = [UIBezierPath bezierPath];
-    __block NSInteger parts = 0;
-    ECBounceRay(cue, dir, table, bounces, ^(CGPoint from, CGPoint to) {
-        if (parts == 0) [path moveToPoint:from];
-        [path addLineToPoint:to];
-        parts++;
-    });
-    self.stroke.path = path.CGPath;
-    NSTimeInterval now = CACurrentMediaTime();
-    if (now - self.lastAimLog > 1.5) {
-        self.lastAimLog = now;
-        ECLogLine([NSString stringWithFormat:@"draw angle=%.3f cue=%.1f,%.1f parts=%ld x%ld",
-                   angle, cue.x, cue.y, (long)parts, (long)gECMultiplier]);
+        ECLogLine([NSString stringWithFormat:@"overlay tick %@", exception]);
     }
 }
 
