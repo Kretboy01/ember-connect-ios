@@ -18,8 +18,13 @@ static NSString *const ECButtonYKey = @"EmberEightBPOfflineLines.buttonY";
 
 static id gECGameManager = nil;
 static BOOL gECInMatch = NO;
+static BOOL gECOverlayAllowed = NO;
 static NSInteger gECMultiplier = 8;
 static BOOL gECHooksInstalled = NO;
+
+@class EmberEightBPLineOverlay;
+@class EmberEightBPOfflineLinesController;
+static void ECScheduleOverlay(void);
 static int gECObservedLowAimRatio = 0;
 static int gECObservedHighAimRatio = 0;
 
@@ -294,6 +299,7 @@ static void ECGameManagerOnEnter(id self, SEL selector) {
     dispatch_async(dispatch_get_main_queue(), ^{
         ECRefreshNativeGuide();
         ECWriteStatus(@"game-entered");
+        ECScheduleOverlay();
     });
 }
 
@@ -301,6 +307,7 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     if (ECOriginalGameManagerOnExit) ECOriginalGameManagerOnExit(self, selector);
     if (gECGameManager == self) gECGameManager = nil;
     gECInMatch = NO;
+    gECOverlayAllowed = NO;
     dispatch_async(dispatch_get_main_queue(), ^{ ECWriteStatus(@"game-exited"); });
 }
 
@@ -311,6 +318,7 @@ static void ECStartHotSeatGame(id self, SEL selector) {
     dispatch_async(dispatch_get_main_queue(), ^{
         ECRefreshNativeGuide();
         ECWriteStatus(@"hotseat-started");
+        ECScheduleOverlay();
     });
 }
 
@@ -722,52 +730,266 @@ static UIView *ECRenderView(UIWindow *window) {
     return best ?: window;
 }
 
-static CGPoint ECCueBallScreenPoint(id host, UIView *space) {
-    if (!host || !space) return CGPointZero;
-    id sprite = ECIvarObject(host, "mCueBallSprite");
-    if (sprite && ![sprite isKindOfClass:NSObject.class]) sprite = nil;
-    CGPoint point = CGPointZero;
-    if (sprite && [sprite respondsToSelector:@selector(position)]) {
-        point = ECReadPoint(sprite, @"position");
-    }
-    if (CGPointEqualToPoint(point, CGPointZero) &&
-        [host respondsToSelector:NSSelectorFromString(@"getCueBallPositionTarget")]) {
-        point = ECReadPoint(host, @"getCueBallPositionTarget");
-    }
-    if (CGPointEqualToPoint(point, CGPointZero)) return CGPointZero;
-    UIView *render = ECRenderView(space.window ?: (UIWindow *)space) ?: space;
-    return [render convertPoint:point toView:space];
+typedef struct { double x, y; } ECDPoint;
+typedef struct { double minX, minY, maxX, maxY; } ECDBox;
+typedef struct {
+    BOOL valid;
+    BOOL windowSpace;
+    CGPoint deviceA;
+    ECDPoint tableA;
+    double m00, m01, m10, m11;
+} ECWorldMap;
+
+static ECDPoint ECMakePoint(double x, double y) {
+    return (ECDPoint){x, y};
 }
 
-static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSInteger bounces,
-                        void (^emit)(CGPoint, CGPoint)) {
-    CGFloat length = (CGRectGetWidth(table) + CGRectGetHeight(table)) * 2.0;
-    CGPoint origin = start;
-    CGPoint dir = direction;
-    CGFloat mag = hypot(dir.x, dir.y);
-    if (mag < 0.001) return;
-    dir = CGPointMake(dir.x / mag, dir.y / mag);
-    for (NSInteger i = 0; i <= bounces; i++) {
-        CGFloat tHit = length;
-        CGPoint normal = CGPointZero;
-        CGFloat left = CGRectGetMinX(table), right = CGRectGetMaxX(table);
-        CGFloat top = CGRectGetMinY(table), bottom = CGRectGetMaxY(table);
-        if (dir.x > 0.0001) {
-            CGFloat t = (right - origin.x) / dir.x;
-            if (t > 0.001 && t < tHit) { tHit = t; normal = CGPointMake(-1, 0); }
-        } else if (dir.x < -0.0001) {
-            CGFloat t = (left - origin.x) / dir.x;
-            if (t > 0.001 && t < tHit) { tHit = t; normal = CGPointMake(1, 0); }
+static ECDPoint ECNorm(ECDPoint v) {
+    double mag = hypot(v.x, v.y);
+    if (mag < 1e-9) return ECMakePoint(0, 0);
+    return ECMakePoint(v.x / mag, v.y / mag);
+}
+
+static BOOL ECPointValid(ECDPoint p) {
+    return !isnan(p.x) && !isnan(p.y) && isfinite(p.x) && isfinite(p.y);
+}
+
+static ECDPoint ECReadDPoint(id object, NSString *name) {
+    ECDPoint invalid = {NAN, NAN};
+    if (!object) return invalid;
+    SEL selector = NSSelectorFromString(name);
+    if (![object respondsToSelector:selector]) return invalid;
+    NSMethodSignature *signature = [object methodSignatureForSelector:selector];
+    if (!signature) return invalid;
+    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+    invocation.selector = selector;
+    invocation.target = object;
+    [invocation invoke];
+    ECDPoint point = invalid;
+    [invocation getReturnValue:&point];
+    return point;
+}
+
+static ECDBox ECReadTableBox(id table, ECDPoint cue) {
+    ECDBox invalid = {NAN, NAN, NAN, NAN};
+    SEL selector = NSSelectorFromString(@"tableBounds");
+    if (!table || ![table respondsToSelector:selector]) return invalid;
+    NSMethodSignature *signature = [table methodSignatureForSelector:selector];
+    if (!signature) return invalid;
+    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+    invocation.selector = selector;
+    invocation.target = table;
+    [invocation invoke];
+    double raw[4] = {0, 0, 0, 0};
+    [invocation getReturnValue:raw];
+    ECDBox originSize = {raw[0], raw[1], raw[0] + raw[2], raw[1] + raw[3]};
+    ECDBox minMax = {MIN(raw[0], raw[2]), MIN(raw[1], raw[3]), MAX(raw[0], raw[2]), MAX(raw[1], raw[3])};
+    BOOL originLooksWide = (originSize.maxX - originSize.minX) > 1 && (originSize.maxY - originSize.minY) > 1;
+    BOOL cueInOrigin = ECPointValid(cue) &&
+        cue.x >= originSize.minX - 4 && cue.x <= originSize.maxX + 4 &&
+        cue.y >= originSize.minY - 4 && cue.y <= originSize.maxY + 4;
+    BOOL cueInMinMax = ECPointValid(cue) &&
+        cue.x >= minMax.minX - 4 && cue.x <= minMax.maxX + 4 &&
+        cue.y >= minMax.minY - 4 && cue.y <= minMax.maxY + 4;
+    if (cueInOrigin || (originLooksWide && !cueInMinMax)) return originSize;
+    if (cueInMinMax) return minMax;
+    return originLooksWide ? originSize : minMax;
+}
+
+static id ECTableFromManager(id manager) {
+    id table = ECInvokeId(manager, @"table");
+    return table ?: ECInvokeId(manager, @"getTable");
+}
+
+static NSArray *ECBallsOnTable(id table, id cueBall) {
+    NSMutableArray *balls = [NSMutableArray array];
+    id listed = ECInvokeId(table, @"balls");
+    if ([listed isKindOfClass:NSArray.class] || [listed isKindOfClass:NSSet.class]) {
+        for (id ball in listed) {
+            if (![ball respondsToSelector:NSSelectorFromString(@"position")]) continue;
+            if (!ECInvokeBool(ball, @"onTable", YES)) continue;
+            [balls addObject:ball];
         }
-        if (dir.y > 0.0001) {
-            CGFloat t = (bottom - origin.y) / dir.y;
-            if (t > 0.001 && t < tHit) { tHit = t; normal = CGPointMake(0, -1); }
-        } else if (dir.y < -0.0001) {
-            CGFloat t = (top - origin.y) / dir.y;
-            if (t > 0.001 && t < tHit) { tHit = t; normal = CGPointMake(0, 1); }
+    }
+    if (balls.count >= 1) return balls;
+    unsigned count = 16;
+    SEL countSel = NSSelectorFromString(@"getNumBallsOnTable");
+    if (table && [table respondsToSelector:countSel]) {
+        count = ((unsigned (*)(id, SEL))objc_msgSend)(table, countSel);
+        if (count < 1 || count > 22) count = 16;
+    }
+    SEL byNumber = NSSelectorFromString(@"getBallByNumber:");
+    if (table && [table respondsToSelector:byNumber]) {
+        for (unsigned i = 0; i <= count + 3; i++) {
+            id ball = ((id (*)(id, SEL, unsigned))objc_msgSend)(table, byNumber, i);
+            if (!ball || ![ball respondsToSelector:NSSelectorFromString(@"position")]) continue;
+            if (!ECInvokeBool(ball, @"onTable", YES)) continue;
+            [balls addObject:ball];
         }
-        CGPoint dest = CGPointMake(origin.x + dir.x * tHit, origin.y + dir.y * tHit);
-        emit(origin, dest);
+    }
+    if (cueBall && ![balls containsObject:cueBall] && ECInvokeBool(cueBall, @"onTable", YES)) {
+        [balls addObject:cueBall];
+    }
+    return balls;
+}
+
+static ECDPoint ECConvertDeviceToTable(id visualCue, ECDPoint device) {
+    ECDPoint invalid = {NAN, NAN};
+    SEL selector = NSSelectorFromString(@"convertDeviceToTableCoordinates:");
+    if (!visualCue || ![visualCue respondsToSelector:selector]) return invalid;
+    NSMethodSignature *signature = [visualCue methodSignatureForSelector:selector];
+    if (!signature || signature.numberOfArguments != 3) return invalid;
+    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+    invocation.selector = selector;
+    invocation.target = visualCue;
+    [invocation setArgument:&device atIndex:2];
+    [invocation invoke];
+    ECDPoint table = invalid;
+    [invocation getReturnValue:&table];
+    return table;
+}
+
+static ECWorldMap ECMapFromSamples(id visualCue, CGPoint a, CGPoint b, CGPoint c, BOOL windowSpace) {
+    ECWorldMap map = {0};
+    ECDPoint tA = ECConvertDeviceToTable(visualCue, ECMakePoint(a.x, a.y));
+    ECDPoint tB = ECConvertDeviceToTable(visualCue, ECMakePoint(b.x, b.y));
+    ECDPoint tC = ECConvertDeviceToTable(visualCue, ECMakePoint(c.x, c.y));
+    if (!ECPointValid(tA) || !ECPointValid(tB) || !ECPointValid(tC)) return map;
+    double dx = (b.x - a.x);
+    double dy = (c.y - a.y);
+    if (fabs(dx) < 1 || fabs(dy) < 1) return map;
+    double col0x = (tB.x - tA.x) / dx;
+    double col0y = (tB.y - tA.y) / dx;
+    double col1x = (tC.x - tA.x) / dy;
+    double col1y = (tC.y - tA.y) / dy;
+    double det = col0x * col1y - col0y * col1x;
+    if (fabs(det) < 1e-12) return map;
+    map.valid = YES;
+    map.windowSpace = windowSpace;
+    map.deviceA = a;
+    map.tableA = tA;
+    map.m00 = col1y / det;
+    map.m01 = -col1x / det;
+    map.m10 = -col0y / det;
+    map.m11 = col0x / det;
+    return map;
+}
+
+static CGPoint ECWorldToOverlay(ECWorldMap map, ECDPoint world, UIView *overlay) {
+    double tx = world.x - map.tableA.x;
+    double ty = world.y - map.tableA.y;
+    CGPoint device = CGPointMake(map.deviceA.x + map.m00 * tx + map.m01 * ty,
+                                 map.deviceA.y + map.m10 * tx + map.m11 * ty);
+    if (map.windowSpace) return [overlay convertPoint:device fromView:nil];
+    return device;
+}
+
+static BOOL ECOverlayContains(CGPoint point, UIView *overlay, CGFloat pad) {
+    return CGRectContainsPoint(CGRectInset(overlay.bounds, -pad, -pad), point);
+}
+
+static ECWorldMap ECBuildWorldMap(id visualCue, ECDPoint cue, UIView *overlay) {
+    ECWorldMap map = {0};
+    if (!visualCue || !overlay) return map;
+    CGPoint mid = CGPointMake(CGRectGetMidX(overlay.bounds), CGRectGetMidY(overlay.bounds));
+    ECWorldMap local = ECMapFromSamples(visualCue,
+                                        mid,
+                                        CGPointMake(mid.x + 80, mid.y),
+                                        CGPointMake(mid.x, mid.y + 80),
+                                        NO);
+    if (local.valid && ECOverlayContains(ECWorldToOverlay(local, cue, overlay), overlay, 80)) return local;
+    CGPoint win = [overlay convertPoint:mid toView:nil];
+    ECWorldMap windowMap = ECMapFromSamples(visualCue,
+                                            win,
+                                            CGPointMake(win.x + 80, win.y),
+                                            CGPointMake(win.x, win.y + 80),
+                                            YES);
+    if (windowMap.valid && ECOverlayContains(ECWorldToOverlay(windowMap, cue, overlay), overlay, 80)) return windowMap;
+    return local.valid ? local : windowMap;
+}
+
+static CGPoint ECWorldToFelt(ECDPoint world, ECDBox box, CGRect felt) {
+    double width = box.maxX - box.minX;
+    double height = box.maxY - box.minY;
+    if (width < 1e-4 || height < 1e-4) return CGPointZero;
+    double nx = (world.x - box.minX) / width;
+    double ny = (world.y - box.minY) / height;
+    return CGPointMake(felt.origin.x + nx * felt.size.width,
+                       felt.origin.y + (1.0 - ny) * felt.size.height);
+}
+
+static double ECRayCircle(ECDPoint origin, ECDPoint dir, ECDPoint center, double radius) {
+    double ox = origin.x - center.x;
+    double oy = origin.y - center.y;
+    double b = ox * dir.x + oy * dir.y;
+    double c = ox * ox + oy * oy - radius * radius;
+    double disc = b * b - c;
+    if (disc < 0) return -1;
+    return -b - sqrt(disc);
+}
+
+static void ECTracePath(ECDPoint start, ECDPoint direction, ECDBox box, double radius,
+                        NSArray *balls, id ignoreA, id ignoreB, NSInteger maxBounces,
+                        void (^emit)(ECDPoint, ECDPoint),
+                        id *hitBallOut, ECDPoint *hitPosOut, ECDPoint *hitCenterOut, ECDPoint *inDirOut) {
+    ECDPoint dir = ECNorm(direction);
+    if (dir.x == 0 && dir.y == 0) return;
+    ECDPoint origin = start;
+    double left = box.minX + radius;
+    double right = box.maxX - radius;
+    double bottom = box.minY + radius;
+    double top = box.maxY - radius;
+    if (right - left < 1 || top - bottom < 1) {
+        left = box.minX;
+        right = box.maxX;
+        bottom = box.minY;
+        top = box.maxY;
+    }
+    double travel = hypot(box.maxX - box.minX, box.maxY - box.minY) * 3.0;
+    for (NSInteger bounce = 0; bounce <= maxBounces; bounce++) {
+        double tHit = travel;
+        int kind = 0;
+        ECDPoint normal = ECMakePoint(0, 0);
+        id bestBall = nil;
+        ECDPoint bestCenter = ECMakePoint(0, 0);
+        if (dir.x > 1e-9) {
+            double t = (right - origin.x) / dir.x;
+            if (t > 1e-4 && t < tHit) { tHit = t; kind = 1; normal = ECMakePoint(-1, 0); }
+        } else if (dir.x < -1e-9) {
+            double t = (left - origin.x) / dir.x;
+            if (t > 1e-4 && t < tHit) { tHit = t; kind = 1; normal = ECMakePoint(1, 0); }
+        }
+        if (dir.y > 1e-9) {
+            double t = (top - origin.y) / dir.y;
+            if (t > 1e-4 && t < tHit) { tHit = t; kind = 1; normal = ECMakePoint(0, -1); }
+        } else if (dir.y < -1e-9) {
+            double t = (bottom - origin.y) / dir.y;
+            if (t > 1e-4 && t < tHit) { tHit = t; kind = 1; normal = ECMakePoint(0, 1); }
+        }
+        for (id ball in balls) {
+            if (ball == ignoreA || ball == ignoreB) continue;
+            ECDPoint center = ECReadDPoint(ball, @"position");
+            if (!ECPointValid(center)) continue;
+            double ballRadius = ECReadFloat(ball, @"radius", (float)radius);
+            if (ballRadius < 0.01) ballRadius = radius;
+            double t = ECRayCircle(origin, dir, center, radius + ballRadius);
+            if (t > 1e-3 && t < tHit) {
+                tHit = t;
+                kind = 2;
+                bestBall = ball;
+                bestCenter = center;
+            }
+        }
+        ECDPoint dest = ECMakePoint(origin.x + dir.x * tHit, origin.y + dir.y * tHit);
+        if (emit) emit(origin, dest);
+        if (kind == 2) {
+            if (hitBallOut) *hitBallOut = bestBall;
+            if (hitPosOut) *hitPosOut = dest;
+            if (hitCenterOut) *hitCenterOut = bestCenter;
+            if (inDirOut) *inDirOut = dir;
+            return;
+        }
+        if (kind != 1) return;
         if (normal.x != 0) dir.x = -dir.x;
         if (normal.y != 0) dir.y = -dir.y;
         origin = dest;
@@ -776,12 +998,12 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 
 @interface EmberEightBPLineOverlay : UIView
 @property (nonatomic, strong) CAShapeLayer *stroke;
+@property (nonatomic, strong) CAShapeLayer *objectStroke;
+@property (nonatomic, strong) CAShapeLayer *ghost;
 @property (nonatomic, strong) CADisplayLink *link;
-@property (nonatomic, assign) BOOL aiming;
-@property (nonatomic, assign) CGPoint lastDirection;
-@property (nonatomic, assign) NSTimeInterval lastAimLog;
 + (instancetype)sharedOverlay;
 - (void)attachToWindow:(UIWindow *)window;
+- (void)clearPaths;
 @end
 
 @implementation EmberEightBPLineOverlay
@@ -798,111 +1020,170 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
         overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         CAShapeLayer *stroke = [CAShapeLayer layer];
         stroke.fillColor = UIColor.clearColor.CGColor;
-        stroke.strokeColor = [UIColor colorWithWhite:1 alpha:0.92].CGColor;
-        stroke.lineWidth = 2.2;
+        stroke.strokeColor = [UIColor colorWithWhite:1 alpha:0.94].CGColor;
+        stroke.lineWidth = 2.4;
         stroke.lineCap = kCALineCapRound;
         stroke.lineJoin = kCALineJoinRound;
         stroke.shadowColor = [UIColor colorWithRed:0.55 green:0.85 blue:1 alpha:1].CGColor;
         stroke.shadowRadius = 4;
-        stroke.shadowOpacity = 0.8;
+        stroke.shadowOpacity = 0.75;
         [overlay.layer addSublayer:stroke];
         overlay.stroke = stroke;
+        CAShapeLayer *objectStroke = [CAShapeLayer layer];
+        objectStroke.fillColor = UIColor.clearColor.CGColor;
+        objectStroke.strokeColor = [UIColor colorWithRed:1 green:0.82 blue:0.28 alpha:0.92].CGColor;
+        objectStroke.lineWidth = 2.0;
+        objectStroke.lineCap = kCALineCapRound;
+        objectStroke.lineJoin = kCALineJoinRound;
+        [overlay.layer addSublayer:objectStroke];
+        overlay.objectStroke = objectStroke;
+        CAShapeLayer *ghost = [CAShapeLayer layer];
+        ghost.fillColor = [UIColor colorWithWhite:1 alpha:0.12].CGColor;
+        ghost.strokeColor = [UIColor colorWithWhite:1 alpha:0.85].CGColor;
+        ghost.lineWidth = 1.6;
+        [overlay.layer addSublayer:ghost];
+        overlay.ghost = ghost;
     });
     return overlay;
 }
 
+- (void)clearPaths {
+    self.hidden = YES;
+    self.stroke.path = nil;
+    self.objectStroke.path = nil;
+    self.ghost.path = nil;
+}
+
 - (void)attachToWindow:(UIWindow *)window {
-    (void)window;
-    return;
-    if (!window) return;
+    if (!window || !gECOverlayAllowed) return;
     self.frame = window.bounds;
     if (self.superview != window) {
         [self removeFromSuperview];
         [window addSubview:self];
     }
     [window bringSubviewToFront:self];
+    UIView *button = [window viewWithTag:EC_LINES_BUTTON_TAG];
+    if (button) [window bringSubviewToFront:button];
     if (self.link) return;
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(aimingPan:)];
-    pan.cancelsTouchesInView = NO;
-    pan.delaysTouchesBegan = NO;
-    pan.delaysTouchesEnded = NO;
-    [window addGestureRecognizer:pan];
 }
 
-- (void)aimingPan:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self];
-    if (hypot(translation.x, translation.y) > 2) {
-        self.lastDirection = CGPointMake(translation.x, translation.y);
-    }
-    self.aiming = gesture.state == UIGestureRecognizerStateBegan ||
-                  gesture.state == UIGestureRecognizerStateChanged;
-    if (gesture.state == UIGestureRecognizerStateEnded ||
-        gesture.state == UIGestureRecognizerStateCancelled) {
-        self.aiming = YES;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (gesture.state != UIGestureRecognizerStateChanged) self.aiming = NO;
-        });
-    }
+- (CGPoint)mapPoint:(ECDPoint)world map:(ECWorldMap)map box:(ECDBox)box {
+    if (map.valid) return ECWorldToOverlay(map, world, self);
+    return ECWorldToFelt(world, box, CGRectInset(self.bounds, 22, 36));
 }
 
 - (void)tick {
     @try {
-        if (!gECInMatch || !ECExtensionIsActive() || gECMultiplier <= 1) {
-            self.hidden = YES;
-            self.stroke.path = nil;
+        if (!gECOverlayAllowed || !gECInMatch || !ECExtensionIsActive() || gECMultiplier <= 1) {
+            [self clearPaths];
             return;
         }
-        id manager = gECGameManager;
-        id visualCue = nil;
-        if (manager && [manager respondsToSelector:NSSelectorFromString(@"visualCue")]) {
-            visualCue = ECInvokeId(manager, @"visualCue");
+        id manager = gECGameManager ?: ECFindGameManager();
+        id table = ECTableFromManager(manager);
+        id visualCue = ECInvokeId(manager, @"visualCue");
+        if (!table || !visualCue) {
+            [self clearPaths];
+            return;
         }
-        float angle = NAN;
-        if (visualCue) {
-            angle = ECReadFloat(visualCue, @"aimAngle", NAN);
-            if (isnan(angle)) angle = ECReadFloat(visualCue, @"getAimAngleTarget", NAN);
+        if ([visualCue respondsToSelector:NSSelectorFromString(@"enabled")] &&
+            !ECInvokeBool(visualCue, @"enabled", YES)) {
+            [self clearPaths];
+            return;
         }
-        CGPoint cue = CGPointZero;
-        if (manager) cue = ECCueBallScreenPoint(manager, self);
-        if (cue.x == 0 && cue.y == 0) {
-            CGRect table = CGRectInset(self.bounds, 70, 48);
-            cue = CGPointMake(CGRectGetMinX(table) + CGRectGetWidth(table) * 0.22,
-                              CGRectGetMidY(table));
+        id cueBall = ECInvokeId(table, @"getCueBall");
+        ECDPoint cue = ECReadDPoint(cueBall, @"position");
+        if (!ECPointValid(cue)) {
+            [self clearPaths];
+            return;
         }
-        CGPoint dir = CGPointZero;
-        if (!isnan(angle)) {
-            CGFloat radians = (fabs(angle) > 8.0) ? (angle * (float)M_PI / 180.0f) : angle;
-            dir = CGPointMake(cos(radians), -sin(radians));
-        } else if (hypot(self.lastDirection.x, self.lastDirection.y) > 1) {
-            dir = self.lastDirection;
+        float angle = ECReadFloat(visualCue, @"aimAngle", NAN);
+        if (isnan(angle)) angle = ECReadFloat(visualCue, @"getAimAngleTarget", NAN);
+        if (isnan(angle)) {
+            [self clearPaths];
+            return;
+        }
+        double radians = (fabs(angle) > 8.0) ? (angle * M_PI / 180.0) : angle;
+        ECDPoint dir = ECMakePoint(cos(radians), sin(radians));
+        double cueRadius = ECReadFloat(cueBall, @"radius", NAN);
+        if (isnan(cueRadius) || cueRadius < 0.01) cueRadius = 3.6;
+        ECDBox box = ECReadTableBox(table, cue);
+        if (isnan(box.minX) || (box.maxX - box.minX) < 1 || (box.maxY - box.minY) < 1) {
+            [self clearPaths];
+            return;
+        }
+        NSArray *balls = ECBallsOnTable(table, cueBall);
+        ECWorldMap map = ECBuildWorldMap(visualCue, cue, self);
+        NSInteger bounces = gECMultiplier >= 8 ? 3 : (gECMultiplier >= 4 ? 2 : 1);
+        UIBezierPath *cuePath = [UIBezierPath bezierPath];
+        UIBezierPath *objectPath = [UIBezierPath bezierPath];
+        __block NSInteger cueParts = 0;
+        __weak typeof(self) weakSelf = self;
+        id hitBall = nil;
+        ECDPoint hitPos = ECMakePoint(NAN, NAN);
+        ECDPoint hitCenter = ECMakePoint(NAN, NAN);
+        ECDPoint inDir = dir;
+        ECTracePath(cue, dir, box, cueRadius, balls, cueBall, nil, bounces, ^(ECDPoint from, ECDPoint to) {
+            EmberEightBPLineOverlay *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            CGPoint a = [strongSelf mapPoint:from map:map box:box];
+            CGPoint b = [strongSelf mapPoint:to map:map box:box];
+            if (cueParts == 0) [cuePath moveToPoint:a];
+            [cuePath addLineToPoint:b];
+            cueParts++;
+        }, &hitBall, &hitPos, &hitCenter, &inDir);
+        if (hitBall && ECPointValid(hitPos) && ECPointValid(hitCenter)) {
+            ECDPoint normal = ECNorm(ECMakePoint(hitCenter.x - hitPos.x, hitCenter.y - hitPos.y));
+            double objectRadius = ECReadFloat(hitBall, @"radius", (float)cueRadius);
+            if (objectRadius < 0.01) objectRadius = cueRadius;
+            __block NSInteger objectParts = 0;
+            ECTracePath(hitCenter, normal, box, objectRadius, balls, cueBall, hitBall, 1, ^(ECDPoint from, ECDPoint to) {
+                EmberEightBPLineOverlay *strongSelf = weakSelf;
+                if (!strongSelf) return;
+                CGPoint a = [strongSelf mapPoint:from map:map box:box];
+                CGPoint b = [strongSelf mapPoint:to map:map box:box];
+                if (objectParts == 0) [objectPath moveToPoint:a];
+                [objectPath addLineToPoint:b];
+                objectParts++;
+            }, NULL, NULL, NULL, NULL);
+            double transferred = inDir.x * normal.x + inDir.y * normal.y;
+            ECDPoint leftover = ECMakePoint(inDir.x - normal.x * transferred, inDir.y - normal.y * transferred);
+            if (hypot(leftover.x, leftover.y) > 0.08) {
+                ECTracePath(hitPos, leftover, box, cueRadius, balls, cueBall, hitBall, 1, ^(ECDPoint from, ECDPoint to) {
+                    EmberEightBPLineOverlay *strongSelf = weakSelf;
+                    if (!strongSelf) return;
+                    CGPoint a = [strongSelf mapPoint:from map:map box:box];
+                    CGPoint b = [strongSelf mapPoint:to map:map box:box];
+                    [cuePath addLineToPoint:a];
+                    [cuePath addLineToPoint:b];
+                }, NULL, NULL, NULL, NULL);
+            }
+            CGPoint ghostCenter = [self mapPoint:hitCenter map:map box:box];
+            ECDPoint rim = ECMakePoint(hitCenter.x + objectRadius, hitCenter.y);
+            CGPoint ghostRim = [self mapPoint:rim map:map box:box];
+            CGFloat ghostR = MAX(6.0, hypot(ghostRim.x - ghostCenter.x, ghostRim.y - ghostCenter.y));
+            self.ghost.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(ghostCenter.x - ghostR, ghostCenter.y - ghostR, ghostR * 2, ghostR * 2)].CGPath;
         } else {
-            self.hidden = YES;
-            self.stroke.path = nil;
-            return;
+            self.ghost.path = nil;
         }
         static BOOL dumped = NO;
         if (!dumped) {
             dumped = YES;
-            ECLogLine([NSString stringWithFormat:@"overlay visual=%@ angle=%.3f cue=%.1f,%.1f dir=%.2f,%.2f",
-                       [visualCue class], angle, cue.x, cue.y, dir.x, dir.y]);
+            CGPoint cueScreen = [self mapPoint:cue map:map box:box];
+            ECLogLine([NSString stringWithFormat:@"overlay-phys balls=%lu angle=%.3f cue=%.2f,%.2f box=%.1f,%.1f,%.1f,%.1f map=%d screen=%.1f,%.1f hits=%d",
+                       (unsigned long)balls.count, angle, cue.x, cue.y, box.minX, box.minY, box.maxX, box.maxY,
+                       map.valid, cueScreen.x, cueScreen.y, hitBall != nil]);
+        }
+        if (cueParts == 0) {
+            [self clearPaths];
+            return;
         }
         self.hidden = NO;
-        CGRect table = CGRectInset(self.bounds, 18, 28);
-        NSInteger bounces = gECMultiplier >= 8 ? 3 : (gECMultiplier >= 4 ? 2 : 1);
-        UIBezierPath *path = [UIBezierPath bezierPath];
-        __block NSInteger parts = 0;
-        ECBounceRay(cue, dir, table, bounces, ^(CGPoint from, CGPoint to) {
-            if (parts == 0) [path moveToPoint:from];
-            [path addLineToPoint:to];
-            parts++;
-        });
-        self.stroke.path = path.CGPath;
+        self.stroke.path = cuePath.CGPath;
+        self.objectStroke.path = objectPath.CGPath;
     } @catch (NSException *exception) {
-        self.hidden = YES;
-        self.stroke.path = nil;
+        [self clearPaths];
         ECLogLine([NSString stringWithFormat:@"overlay tick %@", exception]);
     }
 }
@@ -1097,6 +1378,17 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 @end
+
+static void ECScheduleOverlay(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!gECInMatch) return;
+        gECOverlayAllowed = YES;
+        UIWindow *window = [[EmberEightBPOfflineLinesController sharedController] guestWindow];
+        if (!window) return;
+        [[EmberEightBPLineOverlay sharedOverlay] attachToWindow:window];
+        ECLogLine(@"overlay-attached");
+    });
+}
 
 static void EmberEightBPOfflineLinesBoot(void) {
     NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier ?: @"";

@@ -2,7 +2,7 @@
 
 An Ember Connect tweak for 8 Ball Pool (`com.miniclip.8ballpoolmult`) that extends the game's native aiming guide in offline/practice games.
 
-56.29.2 builds guideline length from `CueStats.aim` (`getCueStats:` / `applyCueStatsForShot:aim:spin:`). The 2013 VisualGuide selector and 2017 UserInfo ratio hooks do not control draw length. Shader `setUniform` is a C++ struct and must not be hooked as objects.
+56.29.2 builds guideline length from `CueStats.aim` (`getCueStats:` / `applyCueStatsForShot:aim:spin:`). After a local match is up, an overlay traces cushion rebounds and first-ball contact from `Table` / `Ball` positions. The 2013 VisualGuide selector and 2017 UserInfo ratio hooks do not control draw length. Shader `setUniform` is a C++ struct and must not be hooked as objects.
 
 ## Local-match guard
 
