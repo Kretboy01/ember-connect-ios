@@ -435,16 +435,70 @@ static id ECFindResponder(id root, NSString *selectorName, int depth) {
     return nil;
 }
 
+static float ECReadFloat(id object, NSString *selectorName, float fallback);
+
+static float ECReadMCNumber(id number) {
+    if (!number) return NAN;
+    float value = ECReadFloat(number, @"value", NAN);
+    if (!isnan(value)) return value;
+    value = ECReadFloat(number, @"doubleValue", NAN);
+    if (!isnan(value)) return value;
+    Ivar ivar = class_getInstanceVariable([number class], "mValue");
+    if (!ivar) ivar = class_getInstanceVariable([number class], "_value");
+    if (!ivar) return NAN;
+    const char *type = ivar_getTypeEncoding(ivar) ?: "";
+    uintptr_t addr = (uintptr_t)number + ivar_getOffset(ivar);
+    if (type[0] == 'd') return (float)*(double *)addr;
+    if (type[0] == 'f') return *(float *)addr;
+    return NAN;
+}
+
 static float ECReadFloat(id object, NSString *selectorName, float fallback) {
     if (!object) return fallback;
     SEL selector = NSSelectorFromString(selectorName);
     if (![object respondsToSelector:selector]) return fallback;
     NSMethodSignature *signature = [object methodSignatureForSelector:selector];
     if (!signature || signature.numberOfArguments != 2) return fallback;
-    const char *type = signature.methodReturnType;
-    if (type && type[0] == 'f') return ((float (*)(id, SEL))objc_msgSend)(object, selector);
-    if (type && type[0] == 'd') return (float)((double (*)(id, SEL))objc_msgSend)(object, selector);
+    const char *type = signature.methodReturnType ?: "";
+    if (type[0] == 'f') return ((float (*)(id, SEL))objc_msgSend)(object, selector);
+    if (type[0] == 'd') return (float)((double (*)(id, SEL))objc_msgSend)(object, selector);
+    if (type[0] == '@') {
+        id boxed = ((id (*)(id, SEL))objc_msgSend)(object, selector);
+        float boxedValue = ECReadMCNumber(boxed);
+        return isnan(boxedValue) ? fallback : boxedValue;
+    }
+    if (type[0] == '{') {
+        NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+        invocation.selector = selector;
+        invocation.target = object;
+        [invocation invoke];
+        double value = 0;
+        [invocation getReturnValue:&value];
+        return (float)value;
+    }
     return fallback;
+}
+
+static float ECReadIvarAngle(id object) {
+    if (!object) return NAN;
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList([object class], &count);
+    float found = NAN;
+    for (unsigned int i = 0; i < count && ivars; i++) {
+        const char *name = ivar_getName(ivars[i]) ?: "";
+        NSString *nsName = @(name);
+        if (!([nsName.lowercaseString containsString:@"aimangle"] ||
+              [nsName isEqualToString:@"_aimAngleBackup"])) continue;
+        const char *type = ivar_getTypeEncoding(ivars[i]) ?: "";
+        uintptr_t addr = (uintptr_t)object + ivar_getOffset(ivars[i]);
+        if (type[0] == 'd') found = (float)*(double *)addr;
+        else if (type[0] == 'f') found = *(float *)addr;
+        else if (strstr(type, "MCNumber") && type[0] == '{') found = (float)*(double *)addr;
+        else if (type[0] == '@') found = ECReadMCNumber(*(__unsafe_unretained id *)addr);
+        if (!isnan(found)) break;
+    }
+    if (ivars) free(ivars);
+    return found;
 }
 
 static CGPoint ECReadPoint(id object, NSString *selectorName) {
@@ -627,19 +681,38 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
     id manager = ECFindGameManager();
     id host = ECFindResponder(manager, @"aimAngle", 0);
     if (!host) host = ECFindResponder(manager, @"getAimAngleTarget", 0);
-    if (!host) host = ECFindResponder(manager, @"getCueBall", 0);
-    if (!host) host = manager;
+    id cueHost = ECFindResponder(manager, @"getCueBallPositionTarget", 0);
+    if (!cueHost) cueHost = ECFindResponder(manager, @"getCueBall", 0);
+    if (!cueHost) cueHost = ECFindResponder(manager, @"mCueBallSprite", 0);
+    if (!host) host = cueHost ?: manager;
+    if (!cueHost) cueHost = host;
     float angle = ECReadFloat(host, @"aimAngle", NAN);
     if (isnan(angle)) angle = ECReadFloat(host, @"getAimAngleTarget", NAN);
-    CGPoint cue = ECCueBallScreenPoint(host, self);
-    id visualCue = ECInvokeId(host, @"visualCue") ?: ECIvarObject(host, "mVisualCue") ?: ECIvarObject(manager, "mVisualCue");
+    if (isnan(angle)) angle = ECReadIvarAngle(host);
+    CGPoint cue = ECCueBallScreenPoint(cueHost, self);
+    if (cue.x == 0 && cue.y == 0) cue = ECCueBallScreenPoint(host, self);
+    id visualCue = host;
+    if (![NSStringFromClass([visualCue class]) isEqualToString:@"VisualCue"]) {
+        visualCue = ECInvokeId(host, @"visualCue") ?: ECIvarObject(host, "mVisualCue") ?: ECIvarObject(manager, "mVisualCue");
+    }
     static BOOL dumped = NO;
     if (!dumped && (host || visualCue)) {
         dumped = YES;
         ECDumpAimIvars(host, @"aimHost");
         ECDumpAimIvars(visualCue, @"visualCue");
-        ECLogLine([NSString stringWithFormat:@"overlay host=%@ angle=%.3f cue=%.1f,%.1f visual=%@",
-                   [host class], angle, cue.x, cue.y, [visualCue class]]);
+        ECDumpAimIvars(cueHost, @"cueHost");
+        Ivar guideIvar = visualCue ? class_getInstanceVariable([visualCue class], "mVisualGuide") : NULL;
+        if (guideIvar) {
+            void *guide = *(void **)((uintptr_t)visualCue + ivar_getOffset(guideIvar));
+            if (guide) {
+                float *words = (float *)((uintptr_t)guide + 16);
+                NSMutableString *dump = [NSMutableString stringWithString:@"guide+16"];
+                for (int i = 0; i < 20; i++) [dump appendFormat:@" %d=%.3f", i, words[i]];
+                ECLogLine(dump);
+            }
+        }
+        ECLogLine([NSString stringWithFormat:@"overlay host=%@ cueHost=%@ angle=%.3f cue=%.1f,%.1f ivarAngle=%.3f",
+                   [host class], [cueHost class], angle, cue.x, cue.y, ECReadIvarAngle(host)]);
         ECInvokeIntSetter(visualCue, @"setMaxLineLength:", 9999);
         ECSetIntIvar(visualCue, "_maxLineLength", 9999);
         ECSetIntIvar(visualCue, "mMaxLineLength", 9999);
