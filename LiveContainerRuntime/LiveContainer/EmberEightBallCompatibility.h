@@ -240,19 +240,27 @@ static void Ember8BHookPresent(id self, SEL sel, UIViewController *controller, B
 
 static void *Ember8BHookDlsym(void *handle, const char *symbol) {
     if (Ember8BArmed && symbol) {
-        if (!strcmp(symbol, "exit") || !strcmp(symbol, "_exit") || !strcmp(symbol, "_Exit")) return Ember8BHookExit;
-        if (!strcmp(symbol, "abort") || !strcmp(symbol, "abort_with_payload") || !strcmp(symbol, "__abort_with_payload")) return Ember8BHookAbort;
-        if (!strcmp(symbol, "kill")) return Ember8BHookKill;
-        if (!strcmp(symbol, "raise")) return Ember8BHookRaise;
-        if (!strcmp(symbol, "pthread_kill")) return Ember8BHookPthreadKill;
-        if (!strcmp(symbol, "__pthread_kill")) return Ember8BHookPthreadKillNP;
-        if (!strcmp(symbol, "syscall")) return Ember8BHookSyscall;
-        if (!strcmp(symbol, "task_terminate") && Ember8BRealTaskTerminate) return Ember8BHookTaskTerminate;
-        if (!strcmp(symbol, "_Z37sleep_then_exit_critical_flow_handlerv")) return _Z37sleep_then_exit_critical_flow_handlerv;
-        if (!strcmp(symbol, "_Z40validate_critical_flow_fork_util_handlerv")) return _Z40validate_critical_flow_fork_util_handlerv;
+        if (strstr(symbol, "sleep_then_exit")) return _Z37sleep_then_exit_critical_flow_handlerv;
+        if (strstr(symbol, "validate_critical_flow")) return _Z40validate_critical_flow_fork_util_handlerv;
+        if (strstr(symbol, "kill_debugger")) {
+            Ember8BLog("dlsym kill_debugger nop");
+            return Ember8BHookAbort;
+        }
     }
-    if (Ember8BRealDlsym) return Ember8BRealDlsym(handle, symbol);
-    return NULL;
+    void *ans = Ember8BRealDlsym ? Ember8BRealDlsym(handle, symbol) : NULL;
+    if (!Ember8BArmed || !ans) return ans;
+    if (ans == (void *)exit || ans == (void *)Ember8BRealExit ||
+        ans == (void *)_exit || ans == (void *)Ember8BReal_exit ||
+        ans == (void *)_Exit || ans == (void *)Ember8BReal_Exit) return Ember8BHookExit;
+    if (ans == (void *)abort || ans == (void *)Ember8BRealAbort) return Ember8BHookAbort;
+    if (ans == (void *)kill || ans == (void *)Ember8BRealKill) return Ember8BHookKill;
+    if (ans == (void *)raise || ans == (void *)Ember8BRealRaise) return Ember8BHookRaise;
+    if (ans == (void *)pthread_kill || ans == (void *)Ember8BRealPthreadKill) return Ember8BHookPthreadKill;
+    if (Ember8BRealPthreadKillNP && ans == (void *)Ember8BRealPthreadKillNP) return Ember8BHookPthreadKillNP;
+    if (Ember8BRealSyscall && ans == (void *)Ember8BRealSyscall) return Ember8BHookSyscall;
+    if (Ember8BRealTaskTerminate && ans == (void *)Ember8BRealTaskTerminate) return Ember8BHookTaskTerminate;
+    if (Ember8BAbortPayload && ans == Ember8BAbortPayload) return Ember8BHookAbort;
+    return ans;
 }
 
 static int Ember8BHookNanosleep(const struct timespec *req, struct timespec *rem) {
@@ -367,6 +375,15 @@ static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *s
     Ember8BLogPtr("sleep_then_exit", (uintptr_t)_Z37sleep_then_exit_critical_flow_handlerv);
 }
 
+static void EmberEightBallCompatibilityBeforeDlopen(void) {
+    if (!Ember8BArmed) return;
+    // DyldHooksInit already replaced dlsym. Wrap it now, before libloader
+    // constructors cache real exit/kill pointers.
+    Ember8BRealDlsym = dlsym;
+    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlsym, Ember8BHookDlsym, nil);
+    Ember8BLog("dlsym hooked before guest dlopen");
+}
+
 static void EmberEightBallCompatibilityGuestLoaded(const char *guestExec) {
     if (!Ember8BArmed) return;
     Ember8BRebindAllImages();
@@ -374,12 +391,15 @@ static void EmberEightBallCompatibilityGuestLoaded(const char *guestExec) {
     // syscall/exit, then patch those slots. Do not write libsystem TEXT.
     if (guestExec) dlopen(guestExec, RTLD_NOW | RTLD_NOLOAD);
     Ember8BRebindAllImages();
-    Ember8BRealDlsym = dlsym;
-    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlsym, Ember8BHookDlsym, nil);
+    if (!Ember8BRealDlsym) {
+        Ember8BRealDlsym = dlsym;
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlsym, Ember8BHookDlsym, nil);
+    }
     Ember8BInstallUIHooks();
     Ember8BLog("terminate gate rebound after guest load");
 }
 #else
 static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *settings, NSString *documents) {}
+static void EmberEightBallCompatibilityBeforeDlopen(void) {}
 static void EmberEightBallCompatibilityGuestLoaded(const char *guestExec) { (void)guestExec; }
 #endif

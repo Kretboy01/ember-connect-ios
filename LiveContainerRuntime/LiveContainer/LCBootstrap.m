@@ -635,6 +635,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // This index is a first guess only; it is corrected against dyld's real
     // image list once the guest is loaded. See findGuestImageIndex.
     appMainImageIndex = _dyld_image_count();
+    EmberEightBallCompatibilityBeforeDlopen();
     __block void *appHandle = 0;
     void (^dlopenBlock)(void) = ^{
         appHandle = dlopen_nolock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|RTLD_FIRST);
