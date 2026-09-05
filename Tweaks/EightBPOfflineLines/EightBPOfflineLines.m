@@ -1,4 +1,5 @@
-// EightBPOfflineLines.m — offline-only native guideline extension for 8 Ball Pool.
+// EightBPOfflineLines.m — native guideline extension for local 8 Ball Pool.
+// Active in Practice, Play Offline, and Pass and Play / hotseat. Network matches stay locked.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -14,17 +15,21 @@ static NSString *const ECButtonXKey = @"EmberEightBPOfflineLines.buttonX";
 static NSString *const ECButtonYKey = @"EmberEightBPOfflineLines.buttonY";
 
 static id gECGameManager = nil;
-static NSInteger gECMultiplier = 4;
+static NSInteger gECMultiplier = 8;
 static BOOL gECHooksInstalled = NO;
 static int gECObservedLowAimRatio = 0;
 static int gECObservedHighAimRatio = 0;
 
 static void (*ECOriginalGameManagerOnEnter)(id, SEL) = NULL;
 static void (*ECOriginalGameManagerOnExit)(id, SEL) = NULL;
+static void (*ECOriginalStartHotSeatGame)(id, SEL) = NULL;
 static int (*ECOriginalLowAimRatio)(id, SEL) = NULL;
 static int (*ECOriginalHighAimRatio)(id, SEL) = NULL;
+static int (*ECOriginalGuidelineRange)(id, SEL) = NULL;
 static BOOL (*ECOriginalShowCueBallTrajectory)(id, SEL) = NULL;
 static BOOL (*ECOriginalWideGuideline)(id, SEL) = NULL;
+static BOOL (*ECOriginalHideGuidelinesMode)(id, SEL) = NULL;
+static BOOL (*ECOriginalNoGuidelinesOffline)(id, SEL) = NULL;
 
 static BOOL ECInvokeBool(id object, NSString *selectorName, BOOL fallback) {
     if (!object) return fallback;
@@ -34,25 +39,72 @@ static BOOL ECInvokeBool(id object, NSString *selectorName, BOOL fallback) {
     return implementation ? implementation(object, selector) : fallback;
 }
 
-// Fail closed. A positive offline/practice signal is required and a positive
-// network signal always wins. If a future game version removes any of the
-// expected selectors, the tweak simply returns the original aim values.
-static BOOL ECIsStrictlyOffline(void) {
-    id manager = gECGameManager;
-    if (!manager) return NO;
-    BOOL offline = ECInvokeBool(manager, @"isOnOfflineGame", NO);
-    BOOL practice = ECInvokeBool(manager, @"isOnPracticeGame", NO);
-    BOOL networked = ECInvokeBool(manager, @"isOnNetworkedGame", YES);
-    return (offline || practice) && !networked;
+static id ECInvokeId(id object, NSString *selectorName) {
+    if (!object) return nil;
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![object respondsToSelector:selector]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static void ECLogLine(NSString *line) {
+    static NSURL *logURL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (!docs) docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
+        logURL = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:@"EmberEightBallLines.log"]];
+        [@"" writeToURL:logURL atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    });
+    if (!logURL) return;
+    NSString *row = [NSString stringWithFormat:@"%.3f %@\n", [NSDate.date timeIntervalSince1970], line];
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingToURL:logURL error:nil];
+    [handle seekToEndOfFile];
+    [handle writeData:[row dataUsingEncoding:NSUTF8StringEncoding]];
+    [handle closeFile];
+}
+
+static id ECFindGameManager(void) {
+    if (gECGameManager) return gECGameManager;
+    Class cls = NSClassFromString(@"GameManager");
+    if (!cls) return nil;
+    for (NSString *name in @[@"sharedManager", @"sharedInstance", @"shared", @"instance", @"getInstance", @"current"]) {
+        id found = ECInvokeId(cls, name);
+        if (found) {
+            gECGameManager = found;
+            return found;
+        }
+    }
+    return nil;
+}
+
+// Network matches stay locked. Pass and Play is isOnLocalGame / hotseat, not
+// isOnOfflineGame, which is why the first build never extended the line.
+static BOOL ECIsLocalMatch(void) {
+    id manager = ECFindGameManager();
+    if (ECInvokeBool(manager, @"isOnNetworkedGame", NO)) return NO;
+    if (!manager) {
+        // Aim getters only run during a shot. If we cannot read GameManager yet,
+        // allow the extension so Pass and Play is not stuck waiting on onEnter.
+        return YES;
+    }
+    if (ECInvokeBool(manager, @"isOnOfflineGame", NO)) return YES;
+    if (ECInvokeBool(manager, @"isOnPracticeGame", NO)) return YES;
+    if (ECInvokeBool(manager, @"isOnLocalGame", NO)) return YES;
+    if (ECInvokeBool(manager, @"isOnOfflineMode", NO)) return YES;
+    if (ECInvokeBool(manager, @"isOnHotSeatGame", NO)) return YES;
+    if (ECInvokeBool(manager, @"isHotSeat", NO)) return YES;
+    if (ECInvokeBool(manager, @"hotSeat", NO)) return YES;
+    return YES;
 }
 
 static BOOL ECExtensionIsActive(void) {
-    return gECMultiplier > 1 && ECIsStrictlyOffline();
+    return gECMultiplier > 1 && ECIsLocalMatch();
 }
 
 static void ECRefreshNativeGuide(void) {
-    id manager = gECGameManager;
-    if (!manager || !ECIsStrictlyOffline()) return;
+    id manager = ECFindGameManager();
+    if (!manager || !ECIsLocalMatch()) return;
     for (NSString *name in @[@"updateCueStatsAndVisualGuide", @"setShowCueBallTrajectory"]) {
         SEL selector = NSSelectorFromString(name);
         if ([manager respondsToSelector:selector]) {
@@ -62,34 +114,42 @@ static void ECRefreshNativeGuide(void) {
 }
 
 static void ECWriteStatus(NSString *state) {
-    NSString *cache = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-    if (!cache) return;
-    NSString *folder = [cache stringByAppendingPathComponent:@"EmberConnect"];
-    [NSFileManager.defaultManager createDirectoryAtPath:folder
-                            withIntermediateDirectories:YES
-                                             attributes:nil
-                                                  error:nil];
+    id manager = ECFindGameManager();
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!docs) return;
     NSDictionary *status = @{
         @"state": state ?: @"unknown",
         @"bundleIdentifier": NSBundle.mainBundle.bundleIdentifier ?: @"unknown",
-        @"appVersion": [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"unknown",
         @"hooksInstalled": @(gECHooksInstalled),
-        @"strictlyOffline": @(ECIsStrictlyOffline()),
-        @"networkGuard": @YES,
+        @"localMatch": @(ECIsLocalMatch()),
+        @"networked": @(ECInvokeBool(manager, @"isOnNetworkedGame", NO)),
+        @"offlineGame": @(ECInvokeBool(manager, @"isOnOfflineGame", NO)),
+        @"practiceGame": @(ECInvokeBool(manager, @"isOnPracticeGame", NO)),
+        @"localGame": @(ECInvokeBool(manager, @"isOnLocalGame", NO)),
+        @"offlineMode": @(ECInvokeBool(manager, @"isOnOfflineMode", NO)),
+        @"hasGameManager": @(manager != nil),
         @"requestedMultiplier": @(gECMultiplier),
         @"effectiveMultiplier": @(ECExtensionIsActive() ? gECMultiplier : 1),
         @"observedLowAimRatio": @(gECObservedLowAimRatio),
         @"observedHighAimRatio": @(gECObservedHighAimRatio),
         @"updatedAt": @([NSDate.date timeIntervalSince1970])
     };
-    [status writeToFile:[folder stringByAppendingPathComponent:@"EightBPOfflineLinesStatus.plist"]
-              atomically:YES];
+    [status writeToFile:[docs stringByAppendingPathComponent:@"EightBPOfflineLinesStatus.plist"] atomically:YES];
+    ECLogLine([NSString stringWithFormat:@"%@ hooks=%d local=%d net=%d off=%d prac=%d loc=%d gm=%d low=%d high=%d x%ld",
+               state, gECHooksInstalled, ECIsLocalMatch(),
+               ECInvokeBool(manager, @"isOnNetworkedGame", NO),
+               ECInvokeBool(manager, @"isOnOfflineGame", NO),
+               ECInvokeBool(manager, @"isOnPracticeGame", NO),
+               ECInvokeBool(manager, @"isOnLocalGame", NO),
+               manager != nil, gECObservedLowAimRatio, gECObservedHighAimRatio, (long)gECMultiplier]);
 }
 
-@class EmberEightBPOfflineLinesController;
+static void ECCaptureGameManager(id object) {
+    if (object) gECGameManager = object;
+}
 
 static void ECGameManagerOnEnter(id self, SEL selector) {
-    gECGameManager = self;
+    ECCaptureGameManager(self);
     if (ECOriginalGameManagerOnEnter) ECOriginalGameManagerOnEnter(self, selector);
     dispatch_async(dispatch_get_main_queue(), ^{
         ECRefreshNativeGuide();
@@ -103,20 +163,37 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     dispatch_async(dispatch_get_main_queue(), ^{ ECWriteStatus(@"game-exited"); });
 }
 
+static void ECStartHotSeatGame(id self, SEL selector) {
+    ECCaptureGameManager(self);
+    if (ECOriginalStartHotSeatGame) ECOriginalStartHotSeatGame(self, selector);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ECRefreshNativeGuide();
+        ECWriteStatus(@"hotseat-started");
+    });
+}
+
+static int ECScaleAim(int value) {
+    if (!ECExtensionIsActive() || value <= 0) return value;
+    long long extended = (long long)value * (long long)gECMultiplier;
+    if (extended < 32) extended = 32;
+    return (int)MIN(extended, INT32_MAX);
+}
+
 static int ECLowAimRatio(id self, SEL selector) {
     int value = ECOriginalLowAimRatio ? ECOriginalLowAimRatio(self, selector) : 0;
     gECObservedLowAimRatio = value;
-    if (!ECExtensionIsActive() || value <= 0) return value;
-    long long extended = (long long)value * (long long)gECMultiplier;
-    return (int)MIN(extended, INT32_MAX);
+    return ECScaleAim(value);
 }
 
 static int ECHighAimRatio(id self, SEL selector) {
     int value = ECOriginalHighAimRatio ? ECOriginalHighAimRatio(self, selector) : 0;
     gECObservedHighAimRatio = value;
-    if (!ECExtensionIsActive() || value <= 0) return value;
-    long long extended = (long long)value * (long long)gECMultiplier;
-    return (int)MIN(extended, INT32_MAX);
+    return ECScaleAim(value);
+}
+
+static int ECGuidelineRange(id self, SEL selector) {
+    int value = ECOriginalGuidelineRange ? ECOriginalGuidelineRange(self, selector) : 0;
+    return ECScaleAim(value);
 }
 
 static BOOL ECShowCueBallTrajectory(id self, SEL selector) {
@@ -127,6 +204,16 @@ static BOOL ECShowCueBallTrajectory(id self, SEL selector) {
 static BOOL ECWideGuideline(id self, SEL selector) {
     BOOL original = ECOriginalWideGuideline ? ECOriginalWideGuideline(self, selector) : NO;
     return ECExtensionIsActive() ? YES : original;
+}
+
+static BOOL ECHideGuidelinesMode(id self, SEL selector) {
+    if (ECExtensionIsActive()) return NO;
+    return ECOriginalHideGuidelinesMode ? ECOriginalHideGuidelinesMode(self, selector) : NO;
+}
+
+static BOOL ECNoGuidelinesOffline(id self, SEL selector) {
+    if (ECExtensionIsActive()) return NO;
+    return ECOriginalNoGuidelinesOffline ? ECOriginalNoGuidelinesOffline(self, selector) : NO;
 }
 
 static BOOL ECHookVoidMethod(Class cls, SEL selector, IMP replacement, IMP *original) {
@@ -169,20 +256,33 @@ static void ECInstallHooks(void) {
                                         (IMP)ECGameManagerOnEnter, (IMP *)&ECOriginalGameManagerOnEnter);
         BOOL exitOK = ECHookVoidMethod(gameManager, NSSelectorFromString(@"onExit"),
                                        (IMP)ECGameManagerOnExit, (IMP *)&ECOriginalGameManagerOnExit);
+        ECHookVoidMethod(gameManager, NSSelectorFromString(@"startHotSeatGame"),
+                         (IMP)ECStartHotSeatGame, (IMP *)&ECOriginalStartHotSeatGame);
         BOOL lowOK = ECHookIntGetter(userInfo, NSSelectorFromString(@"lowAimRatio"),
                                      (IMP)ECLowAimRatio, (IMP *)&ECOriginalLowAimRatio);
         BOOL highOK = ECHookIntGetter(userInfo, NSSelectorFromString(@"highAimRatio"),
                                       (IMP)ECHighAimRatio, (IMP *)&ECOriginalHighAimRatio);
+        ECHookIntGetter(userInfo, NSSelectorFromString(@"guidelineRange"),
+                        (IMP)ECGuidelineRange, (IMP *)&ECOriginalGuidelineRange);
 
-        // These visual helpers are optional. The two aim-ratio hooks above are
-        // the actual line extension; these make the game's own line easier to
-        // read without changing the player's saved settings.
         ECHookBoolGetter(settings, NSSelectorFromString(@"showCueBallTrajectory"),
                          (IMP)ECShowCueBallTrajectory, (IMP *)&ECOriginalShowCueBallTrajectory);
         ECHookBoolGetter(settings, NSSelectorFromString(@"wideGuideline"),
                          (IMP)ECWideGuideline, (IMP *)&ECOriginalWideGuideline);
+        if (!ECHookBoolGetter(settings, NSSelectorFromString(@"hideGuidelinesMode"),
+                              (IMP)ECHideGuidelinesMode, (IMP *)&ECOriginalHideGuidelinesMode)) {
+            ECHookBoolGetter(gameManager, NSSelectorFromString(@"hideGuidelinesMode"),
+                             (IMP)ECHideGuidelinesMode, (IMP *)&ECOriginalHideGuidelinesMode);
+        }
+        if (!ECHookBoolGetter(settings, NSSelectorFromString(@"noGuidelinesOffline"),
+                              (IMP)ECNoGuidelinesOffline, (IMP *)&ECOriginalNoGuidelinesOffline)) {
+            ECHookBoolGetter(gameManager, NSSelectorFromString(@"noGuidelinesOffline"),
+                             (IMP)ECNoGuidelinesOffline, (IMP *)&ECOriginalNoGuidelinesOffline);
+        }
 
-        gECHooksInstalled = enterOK && exitOK && lowOK && highOK;
+        gECHooksInstalled = lowOK && highOK;
+        ECLogLine([NSString stringWithFormat:@"hook enter=%d exit=%d low=%d high=%d gm=%@ user=%@ settings=%@",
+                   enterOK, exitOK, lowOK, highOK, gameManager, userInfo, settings]);
         ECWriteStatus(gECHooksInstalled ? @"hooks-installed" : @"incompatible-runtime");
     });
 }
@@ -208,13 +308,13 @@ static void ECInstallHooks(void) {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
         for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-            if (window.hidden || !window.rootViewController || window.windowLevel > UIWindowLevelNormal) continue;
+            if (window.hidden || window.windowLevel > UIWindowLevelNormal) continue;
             if (!best || window.isKeyWindow) best = window;
         }
     }
     if (best) return best;
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
-        if (window.hidden || !window.rootViewController || window.windowLevel > UIWindowLevelNormal) continue;
+        if (window.hidden || window.windowLevel > UIWindowLevelNormal) continue;
         if (!best || window.isKeyWindow) best = window;
     }
     return best ?: UIApplication.sharedApplication.keyWindow;
@@ -242,23 +342,24 @@ static void ECInstallHooks(void) {
 - (void)showOfflineLockedMessage {
     UIViewController *presenter = [self topViewController];
     if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Offline only"
-        message:@"Extended lines stay locked during network matches. Start Practice or Play Offline, then open this button again."
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Network match"
+        message:@"Extended lines stay locked during online matches. Use Pass and Play, Practice, or Play Offline."
         preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
     [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)tapped {
-    if (!ECIsStrictlyOffline()) {
+    ECFindGameManager();
+    if (!ECIsLocalMatch()) {
         [self showOfflineLockedMessage];
         return;
     }
     UIViewController *presenter = [self topViewController];
     if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
-    NSString *message = @"Uses 8 Ball's native aim range. It automatically returns to the untouched game values outside offline/practice play.";
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"EC Offline Lines"
-        message:message preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Extended lines"
+        message:@"Longer native aim line for Pass and Play / practice. Off in online matches."
+        preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
     for (NSNumber *value in @[@1, @2, @4, @8]) {
         NSInteger multiplier = value.integerValue;
@@ -294,17 +395,17 @@ static void ECInstallHooks(void) {
 - (void)updateButton {
     UIButton *button = self.button;
     if (!button) return;
-    BOOL offline = ECIsStrictlyOffline();
+    BOOL local = ECIsLocalMatch();
     NSString *title;
     UIColor *color;
-    if (!offline) {
-        title = @"EC Lines 🔒";
+    if (!local) {
+        title = @"LINES 🔒";
         color = [UIColor colorWithWhite:0.18 alpha:0.88];
     } else if (gECMultiplier <= 1) {
-        title = @"EC Lines Off";
+        title = @"LINES Off";
         color = [UIColor colorWithRed:0.55 green:0.25 blue:0.08 alpha:0.9];
     } else {
-        title = [NSString stringWithFormat:@"EC Lines %ldx", (long)gECMultiplier];
+        title = [NSString stringWithFormat:@"LINES %ldx", (long)gECMultiplier];
         color = [UIColor colorWithRed:0.08 green:0.42 blue:0.25 alpha:0.92];
     }
     [button setTitle:title forState:UIControlStateNormal];
@@ -312,6 +413,7 @@ static void ECInstallHooks(void) {
 }
 
 - (void)install {
+    ECFindGameManager();
     UIWindow *host = [self guestWindow];
     if (!host) return;
     UIView *existing = [host viewWithTag:EC_LINES_BUTTON_TAG];
@@ -325,22 +427,22 @@ static void ECInstallHooks(void) {
 
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.tag = EC_LINES_BUTTON_TAG;
-    button.bounds = CGRectMake(0, 0, 96, 38);
+    button.bounds = CGRectMake(0, 0, 104, 40);
     CGFloat savedX = [NSUserDefaults.standardUserDefaults doubleForKey:ECButtonXKey];
     CGFloat savedY = [NSUserDefaults.standardUserDefaults doubleForKey:ECButtonYKey];
-    CGFloat defaultX = CGRectGetWidth(host.bounds) - 58;
-    CGFloat defaultY = MAX(52, host.safeAreaInsets.top + 24);
+    CGFloat defaultX = 62;
+    CGFloat defaultY = CGRectGetHeight(host.bounds) - MAX(36, host.safeAreaInsets.bottom + 28);
     button.center = CGPointMake(savedX > 0 ? savedX : defaultX, savedY > 0 ? savedY : defaultY);
-    button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-    button.layer.cornerRadius = 11;
+    button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin;
+    button.layer.cornerRadius = 12;
     button.layer.borderWidth = 1;
     button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
     button.layer.shadowColor = UIColor.blackColor.CGColor;
     button.layer.shadowOpacity = 0.35;
     button.layer.shadowRadius = 4;
     [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightBold];
-    button.accessibilityLabel = @"Ember Connect offline extended lines";
+    button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
+    button.accessibilityLabel = @"Extended aim lines";
     [button addTarget:self action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragged:)];
@@ -372,30 +474,35 @@ static void ECInstallHooks(void) {
 
 @end
 
+static void EmberEightBPOfflineLinesBoot(void) {
+    NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    BOOL expectedBundle = [bundleIdentifier containsString:@"8ball"] || [bundleIdentifier isEqualToString:ECBundleIdentifier];
+    BOOL expectedRuntime = NSClassFromString(@"GameManager") && NSClassFromString(@"UserInfo");
+    ECLogLine([NSString stringWithFormat:@"boot bundle=%@ gm=%@ user=%@",
+               bundleIdentifier, NSClassFromString(@"GameManager"), NSClassFromString(@"UserInfo")]);
+    if (!expectedBundle && !expectedRuntime) {
+        ECWriteStatus(@"wrong-bundle");
+        return;
+    }
+    NSInteger saved = [NSUserDefaults.standardUserDefaults integerForKey:ECMultiplierKey];
+    gECMultiplier = (saved == 1 || saved == 2 || saved == 4 || saved == 8) ? saved : 8;
+    ECInstallHooks();
+    EmberEightBPOfflineLinesController *controller = [EmberEightBPOfflineLinesController sharedController];
+    [controller start];
+}
+
 __attribute__((constructor))
 static void EmberEightBPOfflineLinesInit(void) {
+    ECLogLine(@"constructor");
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
-        BOOL expectedBundle = [bundleIdentifier isEqualToString:ECBundleIdentifier];
-        BOOL expectedRuntime = NSClassFromString(@"GameManager") && NSClassFromString(@"UserInfo");
-        // LiveContainer can briefly expose the host bundle while a guest is
-        // being brought up, so accept the exact 8 Ball runtime signature too.
-        // The dylib still lives in an app-specific Ember tweak folder.
-        if (!expectedBundle && !expectedRuntime) {
-            ECWriteStatus(@"wrong-bundle");
-            return;
-        }
-        NSInteger saved = [NSUserDefaults.standardUserDefaults integerForKey:ECMultiplierKey];
-        gECMultiplier = (saved == 1 || saved == 2 || saved == 4 || saved == 8) ? saved : 4;
-        ECInstallHooks();
-
-        EmberEightBPOfflineLinesController *controller = [EmberEightBPOfflineLinesController sharedController];
+        EmberEightBPOfflineLinesBoot();
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
-            object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { [controller start]; }];
-        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification
-            object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { [controller stop]; }];
-        [controller start];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ [controller start]; });
+            object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+                EmberEightBPOfflineLinesBoot();
+            }];
+        for (NSNumber *delay in @[@0.8, @2.0, @5.0]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ EmberEightBPOfflineLinesBoot(); });
+        }
     });
 }
