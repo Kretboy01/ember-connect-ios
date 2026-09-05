@@ -1,11 +1,12 @@
-// Included only by LCBootstrap.m. Arms before the guest is dlopened so
-// Appdome's libloader constructors and main see hooked exit symbols.
+// Included only by LCBootstrap.m after litehook.h. Arms before the guest
+// is dlopened so Appdome constructors and main see hooked exit symbols.
 #include <fcntl.h>
 #include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include "../litehook/src/litehook.h"
 
 #if defined(__arm64__) && !defined(__arm64e__)
 static int Ember8BLogFD = -1;
