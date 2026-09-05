@@ -8,6 +8,8 @@
 #import <objc/runtime.h>
 #import <math.h>
 #import <string.h>
+#import <stdint.h>
+#import <stdlib.h>
 
 #define EC_LINES_BUTTON_TAG 0x8B901
 #define EC_LINE_OVERLAY_TAG 0x8B902
@@ -28,6 +30,10 @@ static BOOL gECHooksInstalled = NO;
 @class EmberEightBPOfflineLinesController;
 static void ECScheduleOverlay(void);
 static void ECRequestOverlayRedraw(void);
+static void ECStripUIKitOverlay(void);
+static void ECRemoveBallMarkers(void);
+static void ECSyncCocosMarker(id ball);
+static int ECSlotForBall(id ball);
 static BOOL ECLooksLikeObject(id object);
 static id ECIvarObject(id object, const char *name);
 
@@ -82,6 +88,9 @@ static CGFloat gECWindowRadius[20];
 static BOOL gECHasWindow[20];
 static int gECWindowHits = 0;
 static __weak UIView *gECGLView = nil;
+static id gECRingTexture = nil;
+static int gECVisualLog = 0;
+static const void *kECMarkerKey = &kECMarkerKey;
 
 typedef struct {
     unsigned int force;
@@ -361,7 +370,10 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECMapScale = 0;
     gECGLView = nil;
     gECWindowHits = 0;
+    gECVisualLog = 0;
     memset(gECHasWindow, 0, sizeof(gECHasWindow));
+    ECRemoveBallMarkers();
+    ECStripUIKitOverlay();
     dispatch_async(dispatch_get_main_queue(), ^{ ECWriteStatus(@"game-exited"); });
 }
 
@@ -537,6 +549,10 @@ static id ECGetCueBallHook(id self, SEL selector) {
 static void ECBallSetPosition(id self, SEL selector, ECDPoint pos) {
     if (ECOriginalBallSetPosition) ECOriginalBallSetPosition(self, selector, pos);
     ECCacheBallPosition(self, pos);
+    if (gECInMatch) {
+        @try { ECSyncCocosMarker(self); }
+        @catch (NSException *exception) { }
+    }
 }
 
 static void ECBallSpotAt(id self, SEL selector, ECDPoint pos) {
@@ -573,9 +589,139 @@ static UIView *ECDirectorGLView(void) {
     return gECGLView;
 }
 
-static CGPoint ECMsgPoint(id object, SEL selector, CGPoint point) {
-    if (!object || ![object respondsToSelector:selector]) return CGPointMake(NAN, NAN);
-    return ((CGPoint (*)(id, SEL, CGPoint))objc_msgSend)(object, selector, point);
+static id ECVisualSphere(id ball) {
+    id sphere = ECIvarObject(ball, "visualBall");
+    if (ECLooksLikeObject(sphere)) return sphere;
+    uintptr_t bits = (uintptr_t)ball;
+    if (bits > 0x10000 && (bits & 1) == 0) {
+        sphere = *(id *)(bits + 24);
+        if (ECLooksLikeObject(sphere)) return sphere;
+    }
+    return nil;
+}
+
+static id ECCircleTexture(void) {
+    if (gECRingTexture) return gECRingTexture;
+    Class texCls = NSClassFromString(@"CCTexture2D");
+    if (!texCls) return nil;
+    const int n = 64;
+    uint32_t *pixels = calloc((size_t)n * n, sizeof(uint32_t));
+    if (!pixels) return nil;
+    float cx = (n - 1) * 0.5f;
+    float outer = n * 0.5f - 1.0f;
+    float inner = outer - 5.0f;
+    for (int y = 0; y < n; y++) {
+        for (int x = 0; x < n; x++) {
+            float d = hypotf((float)x - cx, (float)y - cx);
+            if (d <= outer && d >= inner) {
+                float edge = fminf(d - inner, outer - d);
+                uint8_t a = edge < 1.0f ? (uint8_t)(edge * 255.0f) : 255;
+                pixels[y * n + x] = ((uint32_t)a << 24) | 0x00FFFFFF;
+            }
+        }
+    }
+    id tex = ((id (*)(id, SEL))objc_msgSend)(texCls, @selector(alloc));
+    SEL initSel = @selector(initWithData:pixelFormat:pixelsWide:pixelsHigh:contentSize:);
+    if ([tex respondsToSelector:initSel]) {
+        tex = ((id (*)(id, SEL, const void *, int, unsigned long, unsigned long, CGSize))objc_msgSend)(
+            tex, initSel, pixels, 1, (unsigned long)n, (unsigned long)n, CGSizeMake(n, n));
+    } else {
+        tex = nil;
+    }
+    free(pixels);
+    if (ECLooksLikeObject(tex)) gECRingTexture = tex;
+    return gECRingTexture;
+}
+
+static void ECRemoveBallMarkers(void) {
+    for (int i = 0; i < 20; i++) {
+        id ball = gECCachedBalls[i];
+        if (!ball) continue;
+        id marker = objc_getAssociatedObject(ball, kECMarkerKey);
+        if (marker && [marker respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
+        }
+        objc_setAssociatedObject(ball, kECMarkerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        gECCachedBalls[i] = nil;
+    }
+    gECCachedSnapCount = 0;
+}
+
+static void ECStripUIKitOverlay(void) {
+    UIView *gl = ECDirectorGLView();
+    UIView *found = [gl viewWithTag:EC_LINE_OVERLAY_TAG];
+    if (found) [found removeFromSuperview];
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            UIView *overlay = [window viewWithTag:EC_LINE_OVERLAY_TAG];
+            if (overlay) [overlay removeFromSuperview];
+        }
+    }
+}
+
+static void ECSyncCocosMarker(id ball) {
+    if (!ECLooksLikeObject(ball)) return;
+    id sphere = ECVisualSphere(ball);
+    if (!ECLooksLikeObject(sphere)) return;
+    id parent = ECInvokeId(sphere, @"parent");
+    if (!ECLooksLikeObject(parent)) return;
+    CGPoint pos = CGPointZero;
+    if ([sphere respondsToSelector:@selector(position)]) {
+        pos = ((CGPoint (*)(id, SEL))objc_msgSend)(sphere, @selector(position));
+    }
+    id marker = objc_getAssociatedObject(ball, kECMarkerKey);
+    if (!ECLooksLikeObject(marker)) {
+        id texture = ECCircleTexture();
+        Class spriteCls = NSClassFromString(@"CCSprite");
+        if (!texture || !spriteCls) return;
+        marker = ((id (*)(id, SEL))objc_msgSend)(spriteCls, @selector(alloc));
+        marker = ((id (*)(id, SEL, id))objc_msgSend)(marker, @selector(initWithTexture:), texture);
+        if (!ECLooksLikeObject(marker)) return;
+        if ([marker respondsToSelector:@selector(setOpacity:)]) {
+            ((void (*)(id, SEL, unsigned char))objc_msgSend)(marker, @selector(setOpacity:), 230);
+        }
+        typedef struct { uint8_t r, g, b; } ECccColor3B;
+        ECccColor3B color = (ball == gECCachedCueBall)
+            ? (ECccColor3B){255, 255, 255}
+            : (ECccColor3B){255, 210, 40};
+        if ([marker respondsToSelector:@selector(setColor:)]) {
+            ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(marker, @selector(setColor:), color);
+        }
+        if ([parent respondsToSelector:@selector(addChild:z:)]) {
+            ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, 800);
+        } else if ([parent respondsToSelector:@selector(addChild:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), marker);
+        }
+        objc_setAssociatedObject(ball, kECMarkerKey, marker, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ECSlotForBall(ball);
+        if (gECVisualLog < 4) {
+            gECVisualLog++;
+            CGSize size = CGSizeZero;
+            if ([sphere respondsToSelector:@selector(contentSize)]) {
+                size = ((CGSize (*)(id, SEL))objc_msgSend)(sphere, @selector(contentSize));
+            }
+            ECLogLine([NSString stringWithFormat:@"cocos-marker pos=%.1f,%.1f size=%.1fx%.1f parent=%@ cue=%d",
+                       pos.x, pos.y, size.width, size.height, [parent class], ball == gECCachedCueBall]);
+        }
+    }
+    if ([marker respondsToSelector:@selector(setPosition:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(marker, @selector(setPosition:), pos);
+    }
+    if ([sphere respondsToSelector:@selector(contentSize)] && [marker respondsToSelector:@selector(contentSize)]) {
+        CGSize ballSize = ((CGSize (*)(id, SEL))objc_msgSend)(sphere, @selector(contentSize));
+        CGSize markSize = ((CGSize (*)(id, SEL))objc_msgSend)(marker, @selector(contentSize));
+        if (markSize.width > 1 && ballSize.width > 1 && [marker respondsToSelector:@selector(setScale:)]) {
+            ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:), (float)(ballSize.width / markSize.width));
+        }
+    }
+    id markerParent = ECInvokeId(marker, @"parent");
+    if (markerParent != parent && [parent respondsToSelector:@selector(addChild:z:)]) {
+        if ([marker respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
+        }
+        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, 800);
+    }
 }
 
 static int ECSlotForBall(id ball) {
@@ -592,49 +738,14 @@ static int ECSlotForBall(id ball) {
     return i;
 }
 
-// After the game writes ProjectedSphere.position in updateVisualBall, ask
-// Cocos for the exact window point it uses: world-space of the anchor, then
-// CCDirector convertToUI:. Cache numbers only — do not keep the sphere.
-static void ECCacheWindowFromBall(id ball) {
-    if (!ECLooksLikeObject(ball)) return;
-    id sphere = ECIvarObject(ball, "visualBall");
-    if (!ECLooksLikeObject(sphere)) return;
-    CGPoint world = ECMsgPoint(sphere, @selector(convertToWorldSpaceAR:), CGPointZero);
-    if (!isfinite(world.x) || !isfinite(world.y)) return;
-    id director = ECSharedDirector();
-    CGPoint ui = world;
-    if (director && [director respondsToSelector:@selector(convertToUI:)]) {
-        ui = ECMsgPoint(director, @selector(convertToUI:), world);
-    } else {
-        ui = ECMsgPoint(sphere, @selector(convertToWindowSpace:), CGPointZero);
-    }
-    if (!isfinite(ui.x) || !isfinite(ui.y)) return;
-    CGFloat radius = 8;
-    if ([sphere respondsToSelector:@selector(contentSize)]) {
-        CGSize size = ((CGSize (*)(id, SEL))objc_msgSend)(sphere, @selector(contentSize));
-        CGPoint rimWorld = ECMsgPoint(sphere, @selector(convertToWorldSpaceAR:), CGPointMake(size.width * 0.5, 0));
-        CGPoint rimUI = director ? ECMsgPoint(director, @selector(convertToUI:), rimWorld) : rimWorld;
-        CGFloat measured = hypot(rimUI.x - ui.x, rimUI.y - ui.y);
-        if (measured > 2 && measured < 80) radius = measured;
-    }
-    int slot = ECSlotForBall(ball);
-    if (slot < 0) return;
-    gECWindowPos[slot] = ui;
-    gECWindowRadius[slot] = radius;
-    gECHasWindow[slot] = YES;
-    gECWindowHits++;
-}
-
 static void ECUpdateVisualBall(id self, SEL selector) {
     if (ECOriginalUpdateVisualBall) ECOriginalUpdateVisualBall(self, selector);
     if (!gECInMatch) return;
     @try {
-        ECCacheWindowFromBall(self);
+        ECSyncCocosMarker(self);
     } @catch (NSException *exception) {
-        ECLogLine([NSString stringWithFormat:@"visual-window %@", exception]);
-        return;
+        ECLogLine([NSString stringWithFormat:@"cocos-marker %@", exception]);
     }
-    if (gECOverlayAllowed) ECRequestOverlayRedraw();
 }
 
 static void ECUpdateVisualGuide(id self, SEL selector) {
@@ -1272,18 +1383,9 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 }
 
 - (void)attachToGameView {
-    if (gECOverlayDead) return;
     self.userInteractionEnabled = NO;
-    UIView *gl = ECDirectorGLView();
-    if (!gl) return;
-    if (self.superview == gl) {
-        if (!CGSizeEqualToSize(self.bounds.size, gl.bounds.size)) self.frame = gl.bounds;
-        return;
-    }
-    [self removeFromSuperview];
-    self.frame = gl.bounds;
-    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [gl addSubview:self];
+    if (self.superview) [self removeFromSuperview];
+    ECStripUIKitOverlay();
 }
 
 - (CGPoint)mapPoint:(ECDPoint)world box:(ECDBox)box {
@@ -1323,51 +1425,8 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 }
 
 - (void)updateFromCache {
-    @try {
-        if (gECOverlayDead || !gECOverlayAllowed || !gECInMatch || !ECIsLocalMatch()) {
-            [self clearPaths];
-            return;
-        }
-        if (!self.superview) [self attachToGameView];
-        if (!self.superview) return;
-        UIBezierPath *cueCircles = [UIBezierPath bezierPath];
-        UIBezierPath *ballCircles = [UIBezierPath bezierPath];
-        int drawn = 0;
-        CGPoint first = CGPointMake(NAN, NAN);
-        for (int i = 0; i < gECCachedSnapCount; i++) {
-            if (!gECHasWindow[i]) continue;
-            CGPoint center = [self overlayPointFromWindow:gECWindowPos[i]];
-            if (!isfinite(center.x) || !isfinite(center.y)) continue;
-            CGFloat r = gECWindowRadius[i] > 2 ? gECWindowRadius[i] : 8;
-            UIBezierPath *ring = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(center.x - r, center.y - r, r * 2, r * 2)];
-            if (gECCachedBalls[i] == gECCachedCueBall) [cueCircles appendPath:ring];
-            else [ballCircles appendPath:ring];
-            if (drawn == 0) first = center;
-            drawn++;
-        }
-        static BOOL dumped = NO;
-        if (!dumped && drawn > 0) {
-            dumped = YES;
-            ECLogLine([NSString stringWithFormat:@"overlay-window drawn=%d hits=%d first=%.1f,%.1f parent=%@ %.0fx%.0f overlay=%.0fx%.0f",
-                       drawn, gECWindowHits, first.x, first.y,
-                       NSStringFromClass(self.superview.class),
-                       self.superview.bounds.size.width, self.superview.bounds.size.height,
-                       self.bounds.size.width, self.bounds.size.height]);
-        }
-        if (drawn == 0) return;
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        self.hidden = NO;
-        self.stroke.path = cueCircles.CGPath;
-        self.objectStroke.path = ballCircles.CGPath;
-        self.comboStroke.path = nil;
-        self.ghost.path = nil;
-        [CATransaction commit];
-    } @catch (NSException *exception) {
-        gECOverlayDead = YES;
-        [self clearPaths];
-        ECLogLine([NSString stringWithFormat:@"overlay cache %@", exception]);
-    }
+    [self attachToGameView];
+    [self clearPaths];
 }
 
 @end
@@ -1381,19 +1440,7 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 @end
 
 static void ECRequestOverlayRedraw(void) {
-    static BOOL pending = NO;
-    static CFTimeInterval lastDraw = 0;
-    if (pending) return;
-    CFTimeInterval now = CACurrentMediaTime();
-    if ((now - lastDraw) < (1.0 / 30.0)) return;
-    pending = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        pending = NO;
-        lastDraw = CACurrentMediaTime();
-        EmberEightBPLineOverlay *overlay = [EmberEightBPLineOverlay sharedOverlay];
-        if (!overlay.superview) [overlay attachToGameView];
-        [overlay updateFromCache];
-    });
+    ECStripUIKitOverlay();
 }
 
 @implementation EmberEightBPOfflineLinesController
@@ -1523,7 +1570,7 @@ static void ECRequestOverlayRedraw(void) {
         self.button = (UIButton *)existing;
         self.hostWindow = host;
         [host bringSubviewToFront:existing];
-        [[EmberEightBPLineOverlay sharedOverlay] attachToGameView];
+        ECStripUIKitOverlay();
         [self updateButton];
         return;
     }
@@ -1557,7 +1604,7 @@ static void ECRequestOverlayRedraw(void) {
     [host bringSubviewToFront:button];
     self.button = button;
     self.hostWindow = host;
-    [[EmberEightBPLineOverlay sharedOverlay] attachToGameView];
+    ECStripUIKitOverlay();
     [self updateButton];
     ECWriteStatus(@"menu-installed");
 }
@@ -1581,7 +1628,7 @@ static void ECRequestOverlayRedraw(void) {
 
 static void ECScheduleOverlay(void) {
     gECOverlayAllowed = YES;
-    [[EmberEightBPLineOverlay sharedOverlay] attachToGameView];
+    ECStripUIKitOverlay();
     ECLogLine(@"overlay-ready");
 }
 
