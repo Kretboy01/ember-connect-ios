@@ -590,14 +590,7 @@ static UIView *ECDirectorGLView(void) {
 }
 
 static id ECVisualSphere(id ball) {
-    id sphere = ECIvarObject(ball, "visualBall");
-    if (ECLooksLikeObject(sphere)) return sphere;
-    uintptr_t bits = (uintptr_t)ball;
-    if (bits > 0x10000 && (bits & 1) == 0) {
-        sphere = *(id *)(bits + 24);
-        if (ECLooksLikeObject(sphere)) return sphere;
-    }
-    return nil;
+    return ECIvarObject(ball, "visualBall");
 }
 
 static id ECCircleTexture(void) {
