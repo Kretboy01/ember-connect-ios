@@ -34,7 +34,6 @@ static void ECStripUIKitOverlay(void);
 static void ECRemoveBallMarkers(void);
 static void ECSyncCocosMarker(id ball, BOOL visualFresh);
 static void ECDropBallMarker(id ball);
-static BOOL ECBallInPlay(id ball);
 static int ECSlotForBall(id ball);
 static BOOL ECLooksLikeObject(id object);
 static id ECIvarObject(id object, const char *name);
@@ -91,7 +90,6 @@ static void (*ECOriginalBallSetRadius)(id, SEL, double) = NULL;
 static void (*ECOriginalBallSetVisualOrigin)(id, SEL, CGPoint) = NULL;
 static void (*ECOriginalBallSetVisualScale)(id, SEL, float) = NULL;
 static void (*ECOriginalUpdateVisualBall)(id, SEL) = NULL;
-static void (*ECOriginalBallSetState)(id, SEL, int) = NULL;
 static void (*ECOriginalRemoveVisualBall)(id, SEL) = NULL;
 static CGPoint gECWindowPos[20];
 static CGFloat gECWindowRadius[20];
@@ -566,16 +564,6 @@ static void ECBallSpotAt(id self, SEL selector, ECDPoint pos) {
     ECCacheBallPosition(self, pos);
 }
 
-// Potting runs through setState:, so drop the ring the moment the ball leaves
-// play instead of waiting for the next visual update.
-static void ECBallSetState(id self, SEL selector, int state) {
-    if (ECOriginalBallSetState) ECOriginalBallSetState(self, selector, state);
-    if (!gECInMatch) return;
-    @try {
-        if (!ECBallInPlay(self)) ECDropBallMarker(self);
-    } @catch (NSException *exception) { }
-}
-
 static void ECRemoveVisualBall(id self, SEL selector) {
     @try { ECDropBallMarker(self); }
     @catch (NSException *exception) { }
@@ -718,12 +706,20 @@ static void ECStripUIKitOverlay(void) {
     }
 }
 
-// Ball onTable is state 1..2; potting moves the state to 3..4 and then 0, and
-// updateVisualBall itself keys the sphere's visibility off state != 0. Reading
-// the game's own state means a potted ball cannot flicker back.
-static BOOL ECBallInPlay(id ball) {
-    if (![ball respondsToSelector:@selector(onTable)]) return YES;
-    return ((BOOL (*)(id, SEL))objc_msgSend)(ball, @selector(onTable));
+// Do not gate on Ball onTable: that is state 1..2, but setState: also uses 2
+// and 4 to move the sphere between _clothClippingNode and _notClippingNode, so
+// plenty of in-play balls sit outside that range. updateVisualBall sets the
+// sphere's own visibility from state != 0, so mirroring the sphere is both
+// correct for potted balls and immune to the state enum.
+static BOOL ECSphereVisible(id sphere) {
+    if (![sphere respondsToSelector:@selector(visible)]) return YES;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(sphere, @selector(visible));
+}
+
+static void ECSetMarkerVisible(id marker, BOOL visible) {
+    if (marker && [marker respondsToSelector:@selector(setVisible:)]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(marker, @selector(setVisible:), visible);
+    }
 }
 
 // Ball position is a struct of two doubles and radius is an MCNumber wrapping
@@ -751,20 +747,26 @@ static void ECDropBallMarker(id ball) {
 
 static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
     if (!ECLooksLikeObject(ball)) return;
-    if (!ECBallInPlay(ball)) {
-        ECDropBallMarker(ball);
-        return;
-    }
     id sphere = ECVisualSphere(ball);
     if (!ECLooksLikeObject(sphere)) return;
+    id existing = objc_getAssociatedObject(ball, kECMarkerKey);
+    if (!ECSphereVisible(sphere)) {
+        ECSetMarkerVisible(existing, NO);
+        return;
+    }
+    // setState: leaves the sphere parentless until it is re-added, so hide
+    // rather than drop: dropping here is what made rings vanish mid-rack.
     id parent = ECInvokeId(sphere, @"parent");
-    if (!ECLooksLikeObject(parent)) return;
+    if (!ECLooksLikeObject(parent)) {
+        ECSetMarkerVisible(existing, NO);
+        return;
+    }
     CGPoint pos = CGPointZero;
     if ([sphere respondsToSelector:@selector(position)]) {
         pos = ((CGPoint (*)(id, SEL))objc_msgSend)(sphere, @selector(position));
     }
     int slot = ECSlotForBall(ball);
-    id marker = objc_getAssociatedObject(ball, kECMarkerKey);
+    id marker = existing;
     if (!ECLooksLikeObject(marker)) {
         id texture = ECCircleTexture();
         Class spriteCls = NSClassFromString(@"CCSprite");
@@ -798,6 +800,7 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
                        pos.x, pos.y, size.width, size.height, [parent class], ball == gECCachedCueBall]);
         }
     }
+    ECSetMarkerVisible(marker, YES);
     if ([marker respondsToSelector:@selector(setPosition:)]) {
         ((void (*)(id, SEL, CGPoint))objc_msgSend)(marker, @selector(setPosition:), pos);
     }
@@ -1010,12 +1013,10 @@ static void ECInstallHooks(void) {
                                  (IMP)ECBallSetVisualScale, (IMP *)&ECOriginalBallSetVisualScale);
         BOOL visualOK = ECHookVoidMethod(ball, NSSelectorFromString(@"updateVisualBall"),
                                         (IMP)ECUpdateVisualBall, (IMP *)&ECOriginalUpdateVisualBall);
-        BOOL stateOK = ECHookIMP(ball, NSSelectorFromString(@"setState:"),
-                                 (IMP)ECBallSetState, (IMP *)&ECOriginalBallSetState);
         BOOL rmOK = ECHookVoidMethod(ball, NSSelectorFromString(@"removeVisualBallFromParent"),
                                      (IMP)ECRemoveVisualBall, (IMP *)&ECOriginalRemoveVisualBall);
-        ECLogLine([NSString stringWithFormat:@"observe aim=%d cueBall=%d pos=%d spot=%d rad=%d origin=%d scale=%d visual=%d state=%d rm=%d",
-                   aimOK, cueBallOK, posOK, spotOK, radOK, originOK, scaleOK, visualOK, stateOK, rmOK]);
+        ECLogLine([NSString stringWithFormat:@"observe aim=%d cueBall=%d pos=%d spot=%d rad=%d origin=%d scale=%d visual=%d rm=%d",
+                   aimOK, cueBallOK, posOK, spotOK, radOK, originOK, scaleOK, visualOK, rmOK]);
         ECDumpClassSelectors(visualCue, @"visualCue");
         ECDumpClassSelectors(NSClassFromString(@"VisualCueWide"), @"visualCueWide");
         ECDumpClassSelectors(userInfo, @"userInfoClass");
