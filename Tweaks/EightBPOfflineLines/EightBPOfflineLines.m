@@ -30,9 +30,12 @@ static void (*ECOriginalUpdateVisualGuide)(id, SEL) = NULL;
 static int (*ECOriginalLowAimRatio)(id, SEL) = NULL;
 static int (*ECOriginalHighAimRatio)(id, SEL) = NULL;
 static int (*ECOriginalGuidelineRange)(id, SEL) = NULL;
+static void (*ECOriginalSetLowAimRatio)(id, SEL, int) = NULL;
+static void (*ECOriginalSetHighAimRatio)(id, SEL, int) = NULL;
 static BOOL (*ECOriginalShowCueBallTrajectory)(id, SEL) = NULL;
 static BOOL (*ECOriginalWideGuideline)(id, SEL) = NULL;
 static BOOL (*ECOriginalHideGuidelinesMode)(id, SEL) = NULL;
+static void (*ECOriginalSetHideGuidelinesMode)(id, SEL, BOOL) = NULL;
 static BOOL (*ECOriginalNoGuidelinesOffline)(id, SEL) = NULL;
 static BOOL (*ECOriginalFixedGuidelines)(id, SEL) = NULL;
 
@@ -101,11 +104,30 @@ static id ECFindUserInfo(void) {
     return nil;
 }
 
-static int ECTargetAimRatio(void) {
-    if (gECMultiplier <= 1) return 0;
-    if (gECMultiplier >= 8) return 120;
-    if (gECMultiplier >= 4) return 50;
-    return 20;
+// Classic public iOS tweaks did not scale 8/14 by a multiplier.
+// 2013 GNSPS: VisualGuide -calculateGuideLength:distanceModifier: → 1000
+//   (that selector is gone in 56.29.2; VisualGuide is a C++ pointer now).
+// 2017 iOSGods: UserInfo lowAimRatio=-900, highAimRatio=1300 (a SPAN),
+//   plus VisualCue hideGuidelinesMode = NO.
+// Writing the same positive value to both ivars collapses the range.
+static void ECTargetAimSpan(int *lowOut, int *highOut) {
+    if (gECMultiplier <= 1) {
+        *lowOut = 0;
+        *highOut = 0;
+        return;
+    }
+    if (gECMultiplier >= 8) {
+        *lowOut = -900;
+        *highOut = 1300;
+        return;
+    }
+    if (gECMultiplier >= 4) {
+        *lowOut = -450;
+        *highOut = 650;
+        return;
+    }
+    *lowOut = -225;
+    *highOut = 325;
 }
 
 static BOOL ECSetIntIvar(id object, const char *name, int value) {
@@ -160,7 +182,8 @@ static void ECDumpAimIvars(id object, NSString *label) {
 
 static void ECApplyAimValues(void) {
     if (!ECExtensionIsActive()) return;
-    int target = ECTargetAimRatio();
+    int low = 0, high = 0;
+    ECTargetAimSpan(&low, &high);
     id user = ECFindUserInfo();
     id manager = ECFindGameManager();
     static BOOL dumped = NO;
@@ -169,18 +192,18 @@ static void ECApplyAimValues(void) {
         ECDumpAimIvars(user, @"userInfo");
         ECDumpAimIvars(manager, @"gameManager");
     }
-    ECInvokeIntSetter(user, @"setLowAimRatio:", target);
-    ECInvokeIntSetter(user, @"setHighAimRatio:", target);
-    ECInvokeIntSetter(user, @"setGuidelineRange:", target);
-    BOOL wroteLow = ECSetIntIvar(user, "mLowAimRatio", target) || ECSetIntIvar(user, "_lowAimRatio", target);
-    BOOL wroteHigh = ECSetIntIvar(user, "mHighAimRatio", target) || ECSetIntIvar(user, "_highAimRatio", target);
-    ECSetIntIvar(manager, "mLowAimRatio", target);
-    ECSetIntIvar(manager, "mHighAimRatio", target);
-    static int lastLogged = -1;
-    if (lastLogged != target || !user) {
-        lastLogged = target;
-        ECLogLine([NSString stringWithFormat:@"apply target=%d user=%@ wroteLow=%d wroteHigh=%d",
-                   target, user, wroteLow, wroteHigh]);
+    ECInvokeIntSetter(user, @"setLowAimRatio:", low);
+    ECInvokeIntSetter(user, @"setHighAimRatio:", high);
+    BOOL wroteLow = ECSetIntIvar(user, "mLowAimRatio", low) || ECSetIntIvar(user, "_lowAimRatio", low);
+    BOOL wroteHigh = ECSetIntIvar(user, "mHighAimRatio", high) || ECSetIntIvar(user, "_highAimRatio", high);
+    ECSetIntIvar(manager, "mLowAimRatio", low);
+    ECSetIntIvar(manager, "mHighAimRatio", high);
+    static int lastLow = 1, lastHigh = 1;
+    if (lastLow != low || lastHigh != high || !user) {
+        lastLow = low;
+        lastHigh = high;
+        ECLogLine([NSString stringWithFormat:@"apply span low=%d high=%d user=%@ wroteLow=%d wroteHigh=%d",
+                   low, high, user, wroteLow, wroteHigh]);
     }
 }
 
@@ -280,30 +303,49 @@ static void ECStartHotSeatGame(id self, SEL selector) {
     });
 }
 
-static int ECScaleAim(int value) {
-    if (!ECExtensionIsActive()) return value;
-    int base = value > 0 ? value : 4;
-    long long extended = (long long)base * (long long)gECMultiplier;
-    int target = ECTargetAimRatio();
-    if (extended < target) extended = target;
-    return (int)MIN(extended, INT32_MAX);
-}
-
 static int ECLowAimRatio(id self, SEL selector) {
     int value = ECOriginalLowAimRatio ? ECOriginalLowAimRatio(self, selector) : 0;
     gECObservedLowAimRatio = value;
-    return ECScaleAim(value);
+    if (!ECExtensionIsActive()) return value;
+    int low = 0, high = 0;
+    ECTargetAimSpan(&low, &high);
+    return low;
 }
 
 static int ECHighAimRatio(id self, SEL selector) {
     int value = ECOriginalHighAimRatio ? ECOriginalHighAimRatio(self, selector) : 0;
     gECObservedHighAimRatio = value;
-    return ECScaleAim(value);
+    if (!ECExtensionIsActive()) return value;
+    int low = 0, high = 0;
+    ECTargetAimSpan(&low, &high);
+    return high;
 }
 
 static int ECGuidelineRange(id self, SEL selector) {
     int value = ECOriginalGuidelineRange ? ECOriginalGuidelineRange(self, selector) : 0;
-    return ECScaleAim(value);
+    if (!ECExtensionIsActive()) return value;
+    int low = 0, high = 0;
+    ECTargetAimSpan(&low, &high);
+    return high - low;
+}
+
+static void ECSetLowAimRatio(id self, SEL selector, int value) {
+    int low = 0, high = 0;
+    ECTargetAimSpan(&low, &high);
+    int forced = ECExtensionIsActive() ? low : value;
+    if (ECOriginalSetLowAimRatio) ECOriginalSetLowAimRatio(self, selector, forced);
+}
+
+static void ECSetHighAimRatio(id self, SEL selector, int value) {
+    int low = 0, high = 0;
+    ECTargetAimSpan(&low, &high);
+    int forced = ECExtensionIsActive() ? high : value;
+    if (ECOriginalSetHighAimRatio) ECOriginalSetHighAimRatio(self, selector, forced);
+}
+
+static void ECSetHideGuidelinesMode(id self, SEL selector, BOOL value) {
+    BOOL forced = ECExtensionIsActive() ? NO : value;
+    if (ECOriginalSetHideGuidelinesMode) ECOriginalSetHideGuidelinesMode(self, selector, forced);
 }
 
 static BOOL ECShowCueBallTrajectory(id self, SEL selector) {
@@ -367,6 +409,40 @@ static BOOL ECHookBoolGetter(Class cls, SEL selector, IMP replacement, IMP *orig
     return *original != NULL;
 }
 
+static BOOL ECHookIntSetter(Class cls, SEL selector, IMP replacement, IMP *original) {
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method || method_getNumberOfArguments(method) != 3) return NO;
+    *original = method_setImplementation(method, replacement);
+    return *original != NULL;
+}
+
+static BOOL ECHookBoolSetter(Class cls, SEL selector, IMP replacement, IMP *original) {
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method || method_getNumberOfArguments(method) != 3) return NO;
+    *original = method_setImplementation(method, replacement);
+    return *original != NULL;
+}
+
+static void ECDumpClassSelectors(Class cls, NSString *label) {
+    if (!cls) {
+        ECLogLine([NSString stringWithFormat:@"%@ missing", label]);
+        return;
+    }
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int i = 0; i < count; i++) {
+        NSString *name = NSStringFromSelector(method_getName(methods[i]));
+        NSString *lower = name.lowercaseString;
+        if (!([lower containsString:@"guide"] || [lower containsString:@"aim"] ||
+              [lower containsString:@"length"] || [lower containsString:@"cue"] ||
+              [lower containsString:@"visual"])) continue;
+        [names addObject:name];
+    }
+    free(methods);
+    ECLogLine([NSString stringWithFormat:@"%@ %@ %@", label, cls, [names componentsJoinedByString:@" "]]);
+}
+
 static void ECInstallHooks(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -388,16 +464,29 @@ static void ECInstallHooks(void) {
                                       (IMP)ECHighAimRatio, (IMP *)&ECOriginalHighAimRatio);
         ECHookIntGetter(userInfo, NSSelectorFromString(@"guidelineRange"),
                         (IMP)ECGuidelineRange, (IMP *)&ECOriginalGuidelineRange);
+        BOOL setLowOK = ECHookIntSetter(userInfo, NSSelectorFromString(@"setLowAimRatio:"),
+                                        (IMP)ECSetLowAimRatio, (IMP *)&ECOriginalSetLowAimRatio);
+        BOOL setHighOK = ECHookIntSetter(userInfo, NSSelectorFromString(@"setHighAimRatio:"),
+                                         (IMP)ECSetHighAimRatio, (IMP *)&ECOriginalSetHighAimRatio);
+
+        Class visualCue = NSClassFromString(@"VisualCue");
+        ECDumpClassSelectors(visualCue, @"visualCue");
+        ECDumpClassSelectors(NSClassFromString(@"VisualCueWide"), @"visualCueWide");
+        ECDumpClassSelectors(userInfo, @"userInfoClass");
 
         ECHookBoolGetter(settings, NSSelectorFromString(@"showCueBallTrajectory"),
                          (IMP)ECShowCueBallTrajectory, (IMP *)&ECOriginalShowCueBallTrajectory);
         ECHookBoolGetter(settings, NSSelectorFromString(@"wideGuideline"),
                          (IMP)ECWideGuideline, (IMP *)&ECOriginalWideGuideline);
-        if (!ECHookBoolGetter(settings, NSSelectorFromString(@"hideGuidelinesMode"),
+        if (!ECHookBoolGetter(visualCue, NSSelectorFromString(@"hideGuidelinesMode"),
+                              (IMP)ECHideGuidelinesMode, (IMP *)&ECOriginalHideGuidelinesMode) &&
+            !ECHookBoolGetter(settings, NSSelectorFromString(@"hideGuidelinesMode"),
                               (IMP)ECHideGuidelinesMode, (IMP *)&ECOriginalHideGuidelinesMode)) {
             ECHookBoolGetter(gameManager, NSSelectorFromString(@"hideGuidelinesMode"),
                              (IMP)ECHideGuidelinesMode, (IMP *)&ECOriginalHideGuidelinesMode);
         }
+        ECHookBoolSetter(visualCue, NSSelectorFromString(@"setHideGuidelinesMode:"),
+                         (IMP)ECSetHideGuidelinesMode, (IMP *)&ECOriginalSetHideGuidelinesMode);
         if (!ECHookBoolGetter(settings, NSSelectorFromString(@"noGuidelinesOffline"),
                               (IMP)ECNoGuidelinesOffline, (IMP *)&ECOriginalNoGuidelinesOffline)) {
             ECHookBoolGetter(gameManager, NSSelectorFromString(@"noGuidelinesOffline"),
@@ -409,8 +498,8 @@ static void ECInstallHooks(void) {
         }
 
         gECHooksInstalled = lowOK && highOK;
-        ECLogLine([NSString stringWithFormat:@"hook enter=%d exit=%d low=%d high=%d gm=%@ user=%@ settings=%@",
-                   enterOK, exitOK, lowOK, highOK, gameManager, userInfo, settings]);
+        ECLogLine([NSString stringWithFormat:@"hook enter=%d exit=%d low=%d high=%d setLow=%d setHigh=%d gm=%@ user=%@ settings=%@ visual=%@",
+                   enterOK, exitOK, lowOK, highOK, setLowOK, setHighOK, gameManager, userInfo, settings, visualCue]);
         ECWriteStatus(gECHooksInstalled ? @"hooks-installed" : @"incompatible-runtime");
     });
 }
@@ -638,6 +727,8 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 - (void)attachToWindow:(UIWindow *)window {
+    (void)window;
+    return;
     if (!window) return;
     self.frame = window.bounds;
     if (self.superview != window) {
@@ -669,6 +760,7 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 - (void)tick {
+    return;
     @try {
         if (!gECInMatch || !ECExtensionIsActive() || gECMultiplier <= 1) {
             self.hidden = YES;
@@ -902,13 +994,11 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 
 - (void)start {
     [self install];
-    [EmberEightBPLineOverlay.sharedOverlay attachToWindow:[self guestWindow]];
     [self.keepAliveTimer invalidate];
     __weak typeof(self) weakSelf = self;
     self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
         ECApplyAimValues();
         [weakSelf install];
-        [EmberEightBPLineOverlay.sharedOverlay attachToWindow:[weakSelf guestWindow]];
     }];
 }
 
