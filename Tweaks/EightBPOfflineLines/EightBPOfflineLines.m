@@ -32,7 +32,8 @@ static void ECScheduleOverlay(void);
 static void ECRequestOverlayRedraw(void);
 static void ECStripUIKitOverlay(void);
 static void ECRemoveBallMarkers(void);
-static void ECSyncCocosMarker(id ball);
+static void ECSyncCocosMarker(id ball, BOOL visualFresh);
+static void ECDropBallMarker(id ball);
 static int ECSlotForBall(id ball);
 static BOOL ECLooksLikeObject(id object);
 static id ECIvarObject(id object, const char *name);
@@ -53,6 +54,10 @@ static ECSnap gECCachedSnaps[20];
 static int gECCachedSnapCount = 0;
 static CGPoint gECCachedVisualOrigin = {NAN, NAN};
 static float gECVisualScale = 0;
+// Ball updateVisualBall maps physics -> visual with one scale shared by every
+// ball (it picks between two constants from a global render mode), so this is
+// latched once from a ball far enough off the table origin to measure cleanly.
+static double gECDerivedVisualScale = 0;
 static ECDBox gECTableBox = {NAN, NAN, NAN, NAN};
 static __weak UIView *gECRenderHost = nil;
 static __weak UIView *gECVisualCueView = nil;
@@ -85,6 +90,8 @@ static void (*ECOriginalBallSetRadius)(id, SEL, double) = NULL;
 static void (*ECOriginalBallSetVisualOrigin)(id, SEL, CGPoint) = NULL;
 static void (*ECOriginalBallSetVisualScale)(id, SEL, float) = NULL;
 static void (*ECOriginalUpdateVisualBall)(id, SEL) = NULL;
+static void (*ECOriginalBallSetState)(id, SEL, int) = NULL;
+static void (*ECOriginalRemoveVisualBall)(id, SEL) = NULL;
 static CGPoint gECWindowPos[20];
 static CGFloat gECWindowRadius[20];
 static BOOL gECHasWindow[20];
@@ -93,6 +100,14 @@ static __weak UIView *gECGLView = nil;
 static id gECRingTexture = nil;
 static int gECVisualLog = 0;
 static const void *kECMarkerKey = &kECMarkerKey;
+
+// Ring geometry. The drawn band stops EC_RING_INSET short of the texture edge,
+// so EC_RING_OUTER_FRACTION is how much of the sprite the visible circle uses.
+#define EC_RING_TEXTURE_SIZE 128
+#define EC_RING_INSET 2.0
+#define EC_RING_BAND 9.0
+#define EC_RING_OUTER_FRACTION ((EC_RING_TEXTURE_SIZE * 0.5 - EC_RING_INSET) / (EC_RING_TEXTURE_SIZE * 0.5))
+#define EC_RING_PADDING 1.18
 
 typedef struct {
     unsigned int force;
@@ -350,6 +365,7 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECCachedSnapCount = 0;
     gECCachedVisualOrigin = CGPointMake(NAN, NAN);
     gECVisualScale = 0;
+    gECDerivedVisualScale = 0;
     gECTableBox = (ECDBox){NAN, NAN, NAN, NAN};
     gECRenderHost = nil;
     gECVisualCueView = nil;
@@ -537,7 +553,9 @@ static void ECBallSetPosition(id self, SEL selector, ECDPoint pos) {
     if (ECOriginalBallSetPosition) ECOriginalBallSetPosition(self, selector, pos);
     ECCacheBallPosition(self, pos);
     if (gECInMatch) {
-        @try { ECSyncCocosMarker(self); }
+        // The sphere has not been moved yet, so this cannot be used to measure
+        // the visual scale.
+        @try { ECSyncCocosMarker(self, NO); }
         @catch (NSException *exception) { }
     }
 }
@@ -545,6 +563,22 @@ static void ECBallSetPosition(id self, SEL selector, ECDPoint pos) {
 static void ECBallSpotAt(id self, SEL selector, ECDPoint pos) {
     if (ECOriginalBallSpotAt) ECOriginalBallSpotAt(self, selector, pos);
     ECCacheBallPosition(self, pos);
+}
+
+// Potting runs through setState:, so drop the ring the moment the ball leaves
+// play instead of waiting for the next visual update.
+static void ECBallSetState(id self, SEL selector, int state) {
+    if (ECOriginalBallSetState) ECOriginalBallSetState(self, selector, state);
+    if (!gECInMatch) return;
+    @try {
+        if (!ECBallInPlay(self)) ECDropBallMarker(self);
+    } @catch (NSException *exception) { }
+}
+
+static void ECRemoveVisualBall(id self, SEL selector) {
+    @try { ECDropBallMarker(self); }
+    @catch (NSException *exception) { }
+    if (ECOriginalRemoveVisualBall) ECOriginalRemoveVisualBall(self, selector);
 }
 
 static void ECBallSetRadius(id self, SEL selector, double radius) {
@@ -590,12 +624,12 @@ static id ECCircleTexture(void) {
     Class texCls = NSClassFromString(@"CCTexture2D");
     if (!texCls) return nil;
     SEL initSel = @selector(initWithData:pixelFormat:pixelsWide:pixelsHigh:contentSize:);
-    const int n = 128;
+    const int n = EC_RING_TEXTURE_SIZE;
     uint32_t *pixels = calloc((size_t)n * n, sizeof(uint32_t));
     if (!pixels) return nil;
     float cx = (n - 1) * 0.5f;
-    float outer = n * 0.5f - 2.0f;
-    float inner = outer - 9.0f;
+    float outer = (float)(n * 0.5 - EC_RING_INSET);
+    float inner = (float)(outer - EC_RING_BAND);
     float mid = (outer + inner) * 0.5f;
     float half = (outer - inner) * 0.5f;
     for (int y = 0; y < n; y++) {
@@ -664,11 +698,7 @@ static void ECRemoveBallMarkers(void) {
     for (int i = 0; i < 20; i++) {
         id ball = gECCachedBalls[i];
         if (!ball) continue;
-        id marker = objc_getAssociatedObject(ball, kECMarkerKey);
-        if (marker && [marker respondsToSelector:@selector(removeFromParent)]) {
-            ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
-        }
-        objc_setAssociatedObject(ball, kECMarkerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ECDropBallMarker(ball);
         gECCachedBalls[i] = nil;
     }
     gECCachedSnapCount = 0;
@@ -687,8 +717,43 @@ static void ECStripUIKitOverlay(void) {
     }
 }
 
-static void ECSyncCocosMarker(id ball) {
+// Ball onTable is state 1..2; potting moves the state to 3..4 and then 0, and
+// updateVisualBall itself keys the sphere's visibility off state != 0. Reading
+// the game's own state means a potted ball cannot flicker back.
+static BOOL ECBallInPlay(id ball) {
+    if (![ball respondsToSelector:@selector(onTable)]) return YES;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(ball, @selector(onTable));
+}
+
+// Ball position is a struct of two doubles and radius is an MCNumber wrapping
+// one double, so both come back in floating-point registers. Reading them live
+// keeps them in step with the sphere position we pair them against.
+static ECDPoint ECBallLivePosition(id ball) {
+    if (![ball respondsToSelector:@selector(position)]) return (ECDPoint){NAN, NAN};
+    return ((ECDPoint (*)(id, SEL))objc_msgSend)(ball, @selector(position));
+}
+
+static double ECBallLiveRadius(id ball) {
+    if (![ball respondsToSelector:@selector(radius)]) return 0;
+    double r = ((double (*)(id, SEL))objc_msgSend)(ball, @selector(radius));
+    return (r > 0.5 && r < 20.0) ? r : 0;
+}
+
+static void ECDropBallMarker(id ball) {
+    if (!ball) return;
+    id marker = objc_getAssociatedObject(ball, kECMarkerKey);
+    if (marker && [marker respondsToSelector:@selector(removeFromParent)]) {
+        ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
+    }
+    objc_setAssociatedObject(ball, kECMarkerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
     if (!ECLooksLikeObject(ball)) return;
+    if (!ECBallInPlay(ball)) {
+        ECDropBallMarker(ball);
+        return;
+    }
     id sphere = ECVisualSphere(ball);
     if (!ECLooksLikeObject(sphere)) return;
     id parent = ECInvokeId(sphere, @"parent");
@@ -738,27 +803,38 @@ static void ECSyncCocosMarker(id ball) {
     // ProjectedSphere is a 3D node, so its contentSize is 0x0 and cannot size
     // the ring. updateVisualBall builds the sphere position as
     //   visual = mVisualTableOrigin + physics * scale
-    // so the scale falls straight out of a position we already have, and the
-    // ball radius is cached from Ball setRadius:. Both come from the game.
-    if (slot >= 0 && [marker respondsToSelector:@selector(contentSize)]) {
-        CGSize markSize = ((CGSize (*)(id, SEL))objc_msgSend)(marker, @selector(contentSize));
-        ECDPoint phys = gECCachedSnaps[slot].pos;
-        double radius = gECCachedSnaps[slot].radius > 0.01 ? gECCachedSnaps[slot].radius : 3.6;
+    // with one scale for every ball, so measure that scale once from a ball far
+    // enough from the origin that the division is well conditioned. Measuring
+    // per ball is what made some rings tiny and others huge: balls sitting near
+    // the origin divide by a near-zero physics coordinate.
+    if (visualFresh) {
+        ECDPoint phys = ECBallLivePosition(ball);
         CGPoint origin = gECCachedVisualOrigin;
-        double vscale = 1.7007874015748;
-        if (isfinite(origin.x) && isfinite(origin.y) && ECPointValid(phys)) {
-            double candidate = 0;
-            if (fabs(phys.x) > 1.0) candidate = (pos.x - origin.x) / phys.x;
-            else if (fabs(phys.y) > 1.0) candidate = (pos.y - origin.y) / phys.y;
-            if (candidate > 0.2 && candidate < 20.0) vscale = candidate;
+        if (ECPointValid(phys) && isfinite(origin.x) && isfinite(origin.y)) {
+            BOOL useX = fabs(phys.x) >= fabs(phys.y);
+            double denom = useX ? phys.x : phys.y;
+            double delta = useX ? (pos.x - origin.x) : (pos.y - origin.y);
+            if (fabs(denom) >= 20.0) {
+                double candidate = delta / denom;
+                if (candidate > 0.2 && candidate < 20.0) gECDerivedVisualScale = candidate;
+            }
         }
-        double diameter = radius * vscale * 2.0 * 1.3;
-        if (markSize.width > 1 && diameter > 1 && [marker respondsToSelector:@selector(setScale:)]) {
-            ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:), (float)(diameter / markSize.width));
+    }
+    if ([marker respondsToSelector:@selector(contentSize)]) {
+        CGSize markSize = ((CGSize (*)(id, SEL))objc_msgSend)(marker, @selector(contentSize));
+        double radius = ECBallLiveRadius(ball);
+        if (radius <= 0 && slot >= 0) radius = gECCachedSnaps[slot].radius;
+        if (radius <= 0.5) radius = 3.6;
+        double vscale = gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+        // The drawn ring stops short of the sprite edge, so convert the wanted
+        // outer diameter into a sprite size instead of scaling the sprite to it.
+        double wanted = radius * vscale * 2.0 * EC_RING_PADDING / EC_RING_OUTER_FRACTION;
+        if (markSize.width > 1 && wanted > 1 && [marker respondsToSelector:@selector(setScale:)]) {
+            ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:), (float)(wanted / markSize.width));
             if (gECVisualLog < 6) {
                 gECVisualLog++;
-                ECLogLine([NSString stringWithFormat:@"ring-size mark=%.1f r=%.2f vscale=%.4f diameter=%.1f",
-                           markSize.width, radius, vscale, diameter]);
+                ECLogLine([NSString stringWithFormat:@"ring-size mark=%.1f r=%.2f vscale=%.4f sprite=%.1f fresh=%d",
+                           markSize.width, radius, vscale, wanted, visualFresh]);
             }
         }
     }
@@ -789,7 +865,7 @@ static void ECUpdateVisualBall(id self, SEL selector) {
     if (ECOriginalUpdateVisualBall) ECOriginalUpdateVisualBall(self, selector);
     if (!gECInMatch) return;
     @try {
-        ECSyncCocosMarker(self);
+        ECSyncCocosMarker(self, YES);
     } @catch (NSException *exception) {
         ECLogLine([NSString stringWithFormat:@"cocos-marker %@", exception]);
     }
@@ -933,15 +1009,27 @@ static void ECInstallHooks(void) {
                                  (IMP)ECBallSetVisualScale, (IMP *)&ECOriginalBallSetVisualScale);
         BOOL visualOK = ECHookVoidMethod(ball, NSSelectorFromString(@"updateVisualBall"),
                                         (IMP)ECUpdateVisualBall, (IMP *)&ECOriginalUpdateVisualBall);
-        ECLogLine([NSString stringWithFormat:@"observe aim=%d cueBall=%d pos=%d spot=%d rad=%d origin=%d scale=%d visual=%d",
-                   aimOK, cueBallOK, posOK, spotOK, radOK, originOK, scaleOK, visualOK]);
+        BOOL stateOK = ECHookIMP(ball, NSSelectorFromString(@"setState:"),
+                                 (IMP)ECBallSetState, (IMP *)&ECOriginalBallSetState);
+        BOOL rmOK = ECHookVoidMethod(ball, NSSelectorFromString(@"removeVisualBallFromParent"),
+                                     (IMP)ECRemoveVisualBall, (IMP *)&ECOriginalRemoveVisualBall);
+        ECLogLine([NSString stringWithFormat:@"observe aim=%d cueBall=%d pos=%d spot=%d rad=%d origin=%d scale=%d visual=%d state=%d rm=%d",
+                   aimOK, cueBallOK, posOK, spotOK, radOK, originOK, scaleOK, visualOK, stateOK, rmOK]);
         ECDumpClassSelectors(visualCue, @"visualCue");
         ECDumpClassSelectors(NSClassFromString(@"VisualCueWide"), @"visualCueWide");
         ECDumpClassSelectors(userInfo, @"userInfoClass");
         ECDumpClassSelectors(gameManager, @"gameManagerClass");
 
-        // wideGuideline / showCueBallTrajectory swap in a different guide widget
-        // mid-aim, which is another way the cue stops responding to drags.
+        // These two are the extended-line switches and they live on
+        // UserSettingsManager, not VisualCue/GameManager. They were dropped
+        // while chasing the frozen cue, which is what stopped the lines from
+        // extending. They are plain getters and never write aim state, so the
+        // cue still rotates with them on.
+        BOOL trajOK = ECHookBoolGetter(settings, NSSelectorFromString(@"showCueBallTrajectory"),
+                                       (IMP)ECShowCueBallTrajectory, (IMP *)&ECOriginalShowCueBallTrajectory);
+        BOOL wideOK = ECHookBoolGetter(settings, NSSelectorFromString(@"wideGuideline"),
+                                       (IMP)ECWideGuideline, (IMP *)&ECOriginalWideGuideline);
+        ECLogLine([NSString stringWithFormat:@"guide-hooks traj=%d wide=%d", trajOK, wideOK]);
         if (!ECHookBoolGetter(visualCue, NSSelectorFromString(@"hideGuidelinesMode"),
                               (IMP)ECHideGuidelinesMode, (IMP *)&ECOriginalHideGuidelinesMode) &&
             !ECHookBoolGetter(settings, NSSelectorFromString(@"hideGuidelinesMode"),
