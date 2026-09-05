@@ -526,11 +526,13 @@ static id ECGetCueBallHook(id self, SEL selector) {
 static void ECBallSetPosition(id self, SEL selector, ECDPoint pos) {
     if (ECOriginalBallSetPosition) ECOriginalBallSetPosition(self, selector, pos);
     ECCacheBallPosition(self, pos);
+    if (gECInMatch && gECOverlayAllowed) ECRequestOverlayRedraw();
 }
 
 static void ECBallSpotAt(id self, SEL selector, ECDPoint pos) {
     if (ECOriginalBallSpotAt) ECOriginalBallSpotAt(self, selector, pos);
     ECCacheBallPosition(self, pos);
+    if (gECInMatch && gECOverlayAllowed) ECRequestOverlayRedraw();
 }
 
 static void ECBallSetRadius(id self, SEL selector, double radius) {
@@ -1158,6 +1160,14 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
     return overlay;
 }
 
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    return NO;
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    return nil;
+}
+
 - (void)clearPaths {
     self.hidden = YES;
     self.stroke.path = nil;
@@ -1168,6 +1178,7 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 
 - (void)attachToWindow:(UIWindow *)window {
     if (!window || gECOverlayDead) return;
+    self.userInteractionEnabled = NO;
     if (self.superview != window) {
         self.frame = window.bounds;
         [self removeFromSuperview];
@@ -1179,162 +1190,71 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
     }
 }
 
-- (void)refreshMapWithBox:(ECDBox)box {
-    ECDBox rails = ECDefaultTableBox();
-    if (isfinite(box.minX) && (box.maxX - box.minX) > 10) rails = box;
-    double tableW = MAX(rails.maxX - rails.minX, 1);
-    double tableH = MAX(rails.maxY - rails.minY, 1);
-    UIView *host = ECRenderView(self.window);
-    gECRenderHost = host;
-    CGPoint origin = gECCachedVisualOrigin;
-    CGPoint center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
-    double scale = gECVisualScale;
-    if (host && isfinite(origin.x) && isfinite(origin.y)) {
-        CGPoint converted = [self convertPoint:origin fromView:host];
-        if (CGRectContainsPoint(CGRectInset(self.bounds, -64, -64), converted)) center = converted;
-        if (scale < 0.05) {
-            scale = MIN(host.bounds.size.width / tableW, host.bounds.size.height / tableH);
-        }
-    }
-    if (scale < 0.05) {
-        scale = MIN((self.bounds.size.width - 8) / tableW, (self.bounds.size.height - 72) / tableH);
-    }
-    if (scale < 0.35) scale = 0.35;
-    gECMapCenter = center;
-    gECMapScale = scale;
-}
-
 - (CGPoint)mapPoint:(ECDPoint)world box:(ECDBox)box {
-    if (!isfinite(gECMapCenter.x) || gECMapScale < 0.05) [self refreshMapWithBox:box];
-    return CGPointMake(gECMapCenter.x + world.x * gECMapScale, gECMapCenter.y - world.y * gECMapScale);
-}
-
-- (void)addGhostAt:(ECDPoint)world radius:(double)radius box:(ECDBox)box onto:(UIBezierPath *)ghosts {
-    CGPoint center = [self mapPoint:world box:box];
-    CGPoint rim = [self mapPoint:ECMakePoint(world.x + radius, world.y) box:box];
-    CGFloat r = MAX(4.5, hypot(rim.x - center.x, rim.y - center.y));
-    [ghosts appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectMake(center.x - r, center.y - r, r * 2, r * 2)]];
+    (void)box;
+    CGPoint origin = gECCachedVisualOrigin;
+    double scale = (gECVisualScale > 0.05) ? gECVisualScale : 1.0;
+    if (!isfinite(origin.x) || !isfinite(origin.y)) {
+        return CGPointMake(CGRectGetMidX(self.bounds) + world.x * scale,
+                           CGRectGetMidY(self.bounds) - world.y * scale);
+    }
+    UIView *host = gECVisualCueView ?: gECRenderHost ?: ECRenderView(self.window);
+    gECRenderHost = host;
+    CGPoint cocos = CGPointMake(origin.x + world.x * scale, origin.y + world.y * scale);
+    if (host && host != self && host != self.window) {
+        CGPoint inHost = (host == gECVisualCueView)
+            ? CGPointMake(origin.x + world.x * scale, origin.y - world.y * scale)
+            : CGPointMake(cocos.x, host.bounds.size.height - cocos.y);
+        return [self convertPoint:inHost fromView:host];
+    }
+    return CGPointMake(cocos.x, self.bounds.size.height - cocos.y);
 }
 
 - (void)updateFromCache {
     @try {
-        if (gECOverlayDead || !gECOverlayAllowed || !gECInMatch || !ECExtensionIsActive() || gECMultiplier <= 1) {
+        if (gECOverlayDead || !gECOverlayAllowed || !gECInMatch || !ECIsLocalMatch() || gECCachedSnapCount < 1) {
             [self clearPaths];
             return;
         }
-        if (isnan(gECCachedAngle) || gECCachedSnapCount < 1) {
-            static BOOL emptyLogged = NO;
-            if (!emptyLogged) {
-                emptyLogged = YES;
-                ECLogLine([NSString stringWithFormat:@"overlay-empty-cache angle=%.3f snaps=%d cue=%@",
-                           gECCachedAngle, gECCachedSnapCount, gECCachedCueBall]);
-            }
-            return;
-        }
-        ECDPoint cue = ECMakePoint(NAN, NAN);
-        double cueRadius = 3.6;
-        ECSnap obstacles[20];
-        int obstacleCount = 0;
+        ECDBox box = ECDefaultTableBox();
+        UIBezierPath *cueCircles = [UIBezierPath bezierPath];
+        UIBezierPath *ballCircles = [UIBezierPath bezierPath];
+        int drawn = 0;
         for (int i = 0; i < gECCachedSnapCount; i++) {
-            if (gECCachedBalls[i] == gECCachedCueBall || (!gECCachedCueBall && i == 0 && !ECPointValid(cue))) {
-                cue = gECCachedSnaps[i].pos;
-                cueRadius = gECCachedSnaps[i].radius > 0.01 ? gECCachedSnaps[i].radius : 3.6;
-                continue;
-            }
+            ECDPoint pos = gECCachedSnaps[i].pos;
+            if (!ECPointValid(pos)) continue;
             BOOL dup = NO;
-            for (int j = 0; j < obstacleCount; j++) {
-                if (hypot(obstacles[j].pos.x - gECCachedSnaps[i].pos.x,
-                          obstacles[j].pos.y - gECCachedSnaps[i].pos.y) < 0.4) dup = YES;
+            for (int j = 0; j < i; j++) {
+                if (gECCachedBalls[j] == gECCachedBalls[i]) continue;
+                if (hypot(gECCachedSnaps[j].pos.x - pos.x, gECCachedSnaps[j].pos.y - pos.y) < 0.35) dup = YES;
             }
             if (dup) continue;
-            ECDBox rails = ECDefaultTableBox();
-            if (gECCachedSnaps[i].pos.x < rails.minX - 8 || gECCachedSnaps[i].pos.x > rails.maxX + 8 ||
-                gECCachedSnaps[i].pos.y < rails.minY - 8 || gECCachedSnaps[i].pos.y > rails.maxY + 8) continue;
-            obstacles[obstacleCount++] = gECCachedSnaps[i];
-        }
-        if (!ECPointValid(cue) && gECCachedSnapCount > 0) {
-            cue = gECCachedSnaps[0].pos;
-            cueRadius = gECCachedSnaps[0].radius;
-        }
-        if (!ECPointValid(cue)) return;
-        ECDPoint dir;
-        if (ECPointValid(gECAimDir)) {
-            dir = ECNorm(gECAimDir);
-        } else {
-            double radians = (fabs(gECCachedAngle) > 8.0) ? (gECCachedAngle * M_PI / 180.0) : gECCachedAngle;
-            dir = ECNorm(ECMakePoint(cos(radians), sin(radians)));
-        }
-        ECDBox box = ECDefaultTableBox();
-        [self refreshMapWithBox:box];
-        NSInteger bounces = gECMultiplier >= 8 ? 4 : (gECMultiplier >= 4 ? 3 : 2);
-        UIBezierPath *paths[3] = { [UIBezierPath bezierPath], [UIBezierPath bezierPath], [UIBezierPath bezierPath] };
-        UIBezierPath *ghosts = [UIBezierPath bezierPath];
-        typedef struct {
-            ECDPoint start;
-            ECDPoint dir;
-            double radius;
-            int ignore;
-            int slot;
-            int depth;
-            double minT;
-        } ECJob;
-        ECJob jobs[5];
-        int jobCount = 1;
-        jobs[0] = (ECJob){cue, dir, cueRadius, -1, 0, 0, 0.05};
-        int firstHit = -1;
-        for (int j = 0; j < jobCount && j < 5; j++) {
-            ECJob job = jobs[j];
-            if (hypot(job.dir.x, job.dir.y) < 0.02) continue;
-            __block BOOL started = NO;
-            int hitIndex = -1;
-            ECDPoint hitPos = ECMakePoint(NAN, NAN);
-            ECDPoint hitCenter = ECMakePoint(NAN, NAN);
-            ECDPoint inDir = job.dir;
-            UIBezierPath *path = paths[job.slot < 3 ? job.slot : 2];
-            ECTracePath(job.start, job.dir, box, job.radius, obstacles, obstacleCount, job.ignore, bounces, job.minT, ^(ECDPoint from, ECDPoint to) {
-                CGPoint a = [self mapPoint:from box:box];
-                CGPoint b = [self mapPoint:to box:box];
-                if (!started) {
-                    [path moveToPoint:a];
-                    started = YES;
-                }
-                [path addLineToPoint:b];
-            }, &hitIndex, &hitPos, &hitCenter, &inDir);
-            if (j == 0) firstHit = hitIndex;
-            if (hitIndex < 0 || !ECPointValid(hitPos) || job.depth >= 2 || jobCount >= 5) continue;
-            ECDPoint normal = ECNorm(ECMakePoint(hitCenter.x - hitPos.x, hitCenter.y - hitPos.y));
-            ECDPoint objectDir, leftover;
-            ECElasticSplit(inDir, normal, &objectDir, &leftover);
-            [self addGhostAt:hitPos radius:job.radius box:box onto:ghosts];
-            [self addGhostAt:hitCenter radius:obstacles[hitIndex].radius box:box onto:ghosts];
-            if (hypot(objectDir.x, objectDir.y) > 0.03 && jobCount < 5) {
-                int nextSlot = (job.slot == 0) ? 1 : 2;
-                jobs[jobCount++] = (ECJob){hitCenter, objectDir, obstacles[hitIndex].radius, hitIndex, nextSlot, job.depth + 1, 0.001};
-            }
-            if (hypot(leftover.x, leftover.y) > 0.03 && jobCount < 5) {
-                jobs[jobCount++] = (ECJob){hitPos, leftover, job.radius, hitIndex, job.slot == 0 ? 0 : 2, job.depth + 1, 0.001};
-            }
+            double radius = gECCachedSnaps[i].radius > 0.01 ? gECCachedSnaps[i].radius : 3.6;
+            CGPoint center = [self mapPoint:pos box:box];
+            CGPoint rim = [self mapPoint:ECMakePoint(pos.x + radius, pos.y) box:box];
+            CGFloat r = MAX(5.0, hypot(rim.x - center.x, rim.y - center.y));
+            UIBezierPath *ring = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(center.x - r, center.y - r, r * 2, r * 2)];
+            if (gECCachedBalls[i] == gECCachedCueBall) [cueCircles appendPath:ring];
+            else [ballCircles appendPath:ring];
+            drawn++;
         }
         static BOOL dumped = NO;
         if (!dumped) {
             dumped = YES;
-            ECLogLine([NSString stringWithFormat:@"overlay-phys snaps=%d angle=%.3f dir=%.2f,%.2f cue=%.2f,%.2f hit=%d jobs=%d origin=%.1f,%.1f vscale=%.2f map=%.1f,%.1f x%.2f host=%@ %.0fx%.0f bounds=%.0fx%.0f cueView=%d",
-                       obstacleCount, gECCachedAngle, dir.x, dir.y, cue.x, cue.y, firstHit, jobCount,
-                       gECCachedVisualOrigin.x, gECCachedVisualOrigin.y, gECVisualScale,
-                       gECMapCenter.x, gECMapCenter.y, gECMapScale,
+            ECLogLine([NSString stringWithFormat:@"overlay-balls snaps=%d drawn=%d origin=%.1f,%.1f vscale=%.2f host=%@ %.0fx%.0f bounds=%.0fx%.0f",
+                       gECCachedSnapCount, drawn, gECCachedVisualOrigin.x, gECCachedVisualOrigin.y, gECVisualScale,
                        NSStringFromClass(gECRenderHost.class),
                        gECRenderHost.bounds.size.width, gECRenderHost.bounds.size.height,
-                       self.bounds.size.width, self.bounds.size.height,
-                       gECVisualCueView != nil]);
+                       self.bounds.size.width, self.bounds.size.height]);
         }
-        if (paths[0].empty && paths[1].empty) return;
+        if (drawn == 0) return;
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         self.hidden = NO;
-        self.stroke.path = paths[0].CGPath;
-        self.objectStroke.path = paths[1].CGPath;
-        self.comboStroke.path = paths[2].CGPath;
-        self.ghost.path = ghosts.CGPath;
+        self.stroke.path = cueCircles.CGPath;
+        self.objectStroke.path = ballCircles.CGPath;
+        self.comboStroke.path = nil;
+        self.ghost.path = nil;
         [CATransaction commit];
     } @catch (NSException *exception) {
         gECOverlayDead = YES;
@@ -1356,16 +1276,13 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 static void ECRequestOverlayRedraw(void) {
     static BOOL pending = NO;
     static CFTimeInterval lastDraw = 0;
-    static float lastAngle = NAN;
     if (pending) return;
     CFTimeInterval now = CACurrentMediaTime();
-    BOOL angleMoved = isnan(lastAngle) || fabsf(gECCachedAngle - lastAngle) > 0.0006f;
-    if (!angleMoved && (now - lastDraw) < (1.0 / 28.0)) return;
+    if ((now - lastDraw) < (1.0 / 30.0)) return;
     pending = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
         pending = NO;
         lastDraw = CACurrentMediaTime();
-        lastAngle = gECCachedAngle;
         EmberEightBPLineOverlay *overlay = [EmberEightBPLineOverlay sharedOverlay];
         if (!overlay.superview) {
             UIWindow *window = [[EmberEightBPOfflineLinesController sharedController] guestWindow];
