@@ -41,6 +41,8 @@ typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
 typedef struct { ECDPoint pos; double radius; } ECSnap;
 
+static BOOL ECPointValid(ECDPoint p);
+
 static inline ECDPoint ECMakePoint(double x, double y) { return (ECDPoint){x, y}; }
 
 static float gECCachedAngle = NAN;
