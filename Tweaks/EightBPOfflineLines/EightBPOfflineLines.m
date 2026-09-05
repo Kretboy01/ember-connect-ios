@@ -578,10 +578,16 @@ static id ECVisualSphere(id ball) {
     return ECIvarObject(ball, "visualBall");
 }
 
+// CCTexture2D here is Miniclip's fork: initWithData:pixelFormat:... forwards
+// the format straight into mc::renderer, so the stock cocos2d enum values do
+// not apply. Guessing wrong makes the renderer read the wrong bytes per pixel
+// and shears the ring into blades. Probe instead and keep the format that
+// reports 32 bits per pixel.
 static id ECCircleTexture(void) {
     if (gECRingTexture) return gECRingTexture;
     Class texCls = NSClassFromString(@"CCTexture2D");
     if (!texCls) return nil;
+    SEL initSel = @selector(initWithData:pixelFormat:pixelsWide:pixelsHigh:contentSize:);
     const int n = 128;
     uint32_t *pixels = calloc((size_t)n * n, sizeof(uint32_t));
     if (!pixels) return nil;
@@ -596,19 +602,59 @@ static id ECCircleTexture(void) {
             float edge = half - fabsf(d - mid);
             if (edge <= 0) continue;
             float a = edge < 1.5f ? edge / 1.5f : 1.0f;
-            pixels[y * n + x] = ((uint32_t)(a * 255.0f) << 24) | 0x00FFFFFF;
+            // Premultiplied white so setColor: tints cleanly.
+            uint32_t v = (uint32_t)(a * 255.0f);
+            pixels[y * n + x] = (v << 24) | (v << 16) | (v << 8) | v;
         }
     }
-    id tex = ((id (*)(id, SEL))objc_msgSend)(texCls, @selector(alloc));
-    SEL initSel = @selector(initWithData:pixelFormat:pixelsWide:pixelsHigh:contentSize:);
-    if ([tex respondsToSelector:initSel]) {
+    static const int formats[] = {1, 0, 2, 3, 6, 7, 8, 4, 5};
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        id tex = ((id (*)(id, SEL))objc_msgSend)(texCls, @selector(alloc));
+        if (![tex respondsToSelector:initSel]) break;
         tex = ((id (*)(id, SEL, const void *, int, unsigned long, unsigned long, CGSize))objc_msgSend)(
-            tex, initSel, pixels, 1, (unsigned long)n, (unsigned long)n, CGSizeMake(n, n));
-    } else {
-        tex = nil;
+            tex, initSel, pixels, formats[i], (unsigned long)n, (unsigned long)n, CGSizeMake(n, n));
+        if (!ECLooksLikeObject(tex)) continue;
+        unsigned long bits = 0;
+        if ([tex respondsToSelector:@selector(bitsPerPixelForFormat)]) {
+            bits = ((unsigned long (*)(id, SEL))objc_msgSend)(tex, @selector(bitsPerPixelForFormat));
+        }
+        unsigned long wide = 0;
+        if ([tex respondsToSelector:@selector(pixelsWide)]) {
+            wide = ((unsigned long (*)(id, SEL))objc_msgSend)(tex, @selector(pixelsWide));
+        }
+        CGSize content = CGSizeZero;
+        if ([tex respondsToSelector:@selector(contentSize)]) {
+            content = ((CGSize (*)(id, SEL))objc_msgSend)(tex, @selector(contentSize));
+        }
+        ECLogLine([NSString stringWithFormat:@"ring-fmt try=%d bits=%lu wide=%lu content=%.1fx%.1f",
+                   formats[i], bits, wide, content.width, content.height]);
+        if (bits == 32 && wide == (unsigned long)n) {
+            gECRingTexture = tex;
+            break;
+        }
     }
     free(pixels);
-    if (ECLooksLikeObject(tex)) gECRingTexture = tex;
+    if (gECRingTexture) {
+        if ([gECRingTexture respondsToSelector:@selector(setHasPremultipliedAlpha:)]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(gECRingTexture, @selector(setHasPremultipliedAlpha:), YES);
+        }
+        if ([gECRingTexture respondsToSelector:@selector(setAntiAliasTexParameters)]) {
+            ((void (*)(id, SEL))objc_msgSend)(gECRingTexture, @selector(setAntiAliasTexParameters));
+        }
+    } else {
+        // No usable raw format. Let the engine build the bitmap itself from a
+        // circle glyph — it owns the pixel format on that path.
+        SEL glyphSel = @selector(initWithString:dimensions:alignment:fontName:fontSize:);
+        id tex = ((id (*)(id, SEL))objc_msgSend)(texCls, @selector(alloc));
+        if ([tex respondsToSelector:glyphSel]) {
+            tex = ((id (*)(id, SEL, id, CGSize, unsigned char, id, double))objc_msgSend)(
+                tex, glyphSel, @"\u25EF", CGSizeMake(n, n), 1, @"Helvetica", 104.0);
+        } else {
+            tex = nil;
+        }
+        if (ECLooksLikeObject(tex)) gECRingTexture = tex;
+        ECLogLine([NSString stringWithFormat:@"ring-fmt glyph=%d", gECRingTexture != nil]);
+    }
     return gECRingTexture;
 }
 
