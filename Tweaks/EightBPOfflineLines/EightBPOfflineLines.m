@@ -6,8 +6,10 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <math.h>
 
 #define EC_LINES_BUTTON_TAG 0x8B901
+#define EC_LINE_OVERLAY_TAG 0x8B902
 
 static NSString *const ECBundleIdentifier = @"com.miniclip.8ballpoolmult";
 static NSString *const ECMultiplierKey = @"EmberEightBPOfflineLines.multiplier";
@@ -409,6 +411,267 @@ static void ECInstallHooks(void) {
     });
 }
 
+static id ECFindResponder(id root, NSString *selectorName, int depth) {
+    if (!root || depth > 3) return nil;
+    @try {
+        if ([root respondsToSelector:NSSelectorFromString(selectorName)]) return root;
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList([root class], &count);
+        for (unsigned int i = 0; i < count && ivars; i++) {
+            const char *type = ivar_getTypeEncoding(ivars[i]);
+            if (!type || type[0] != '@') continue;
+            id child = object_getIvar(root, ivars[i]);
+            if (!child || child == root) continue;
+            id found = ECFindResponder(child, selectorName, depth + 1);
+            if (found) {
+                free(ivars);
+                return found;
+            }
+        }
+        if (ivars) free(ivars);
+    } @catch (NSException *exception) {
+        ECLogLine([NSString stringWithFormat:@"find %@ failed %@", selectorName, exception]);
+    }
+    return nil;
+}
+
+static float ECReadFloat(id object, NSString *selectorName, float fallback) {
+    if (!object) return fallback;
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![object respondsToSelector:selector]) return fallback;
+    NSMethodSignature *signature = [object methodSignatureForSelector:selector];
+    if (!signature || signature.numberOfArguments != 2) return fallback;
+    const char *type = signature.methodReturnType;
+    if (type && type[0] == 'f') return ((float (*)(id, SEL))objc_msgSend)(object, selector);
+    if (type && type[0] == 'd') return (float)((double (*)(id, SEL))objc_msgSend)(object, selector);
+    return fallback;
+}
+
+static CGPoint ECReadPoint(id object, NSString *selectorName) {
+    if (!object) return CGPointZero;
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![object respondsToSelector:selector]) return CGPointZero;
+    NSMethodSignature *signature = [object methodSignatureForSelector:selector];
+    if (!signature) return CGPointZero;
+    const char *type = signature.methodReturnType;
+    if (type && type[0] == '{') {
+        return ((CGPoint (*)(id, SEL))objc_msgSend)(object, selector);
+    }
+    return CGPointZero;
+}
+
+static id ECIvarObject(id object, const char *name) {
+    if (!object) return nil;
+    Ivar ivar = class_getInstanceVariable([object class], name);
+    if (!ivar) return nil;
+    const char *type = ivar_getTypeEncoding(ivar);
+    if (!type || type[0] != '@') return nil;
+    return object_getIvar(object, ivar);
+}
+
+static UIView *ECRenderView(UIWindow *window) {
+    __block UIView *best = nil;
+    __block CGFloat bestArea = 0;
+    void (^walk)(UIView *);
+    __block void (^walkBlock)(UIView *) = ^(UIView *view) {
+        NSString *name = NSStringFromClass(view.class);
+        CGFloat area = CGRectGetWidth(view.bounds) * CGRectGetHeight(view.bounds);
+        if (area > bestArea && (CGRectGetWidth(view.bounds) > 200) &&
+            ([name containsString:@"EAGL"] || [name containsString:@"Metal"] ||
+             [name containsString:@"GLK"] || [name containsString:@"CCGL"] ||
+             [name containsString:@"Render"] || [name containsString:@"Cocos"] ||
+             [name containsString:@"Director"])) {
+            best = view;
+            bestArea = area;
+        }
+        for (UIView *child in view.subviews) walkBlock(child);
+    };
+    walk = walkBlock;
+    if (window) walk(window);
+    return best ?: window;
+}
+
+static CGPoint ECCueBallScreenPoint(id host, UIView *space) {
+    id sprite = ECIvarObject(host, "mCueBallSprite");
+    if (!sprite) sprite = ECInvokeId(host, @"getCueBall");
+    CGPoint point = CGPointZero;
+    if (sprite) {
+        point = ECReadPoint(sprite, @"position");
+        SEL convert = NSSelectorFromString(@"convertToWorldSpace:");
+        if ([sprite respondsToSelector:convert]) {
+            point = ((CGPoint (*)(id, SEL, CGPoint))objc_msgSend)(sprite, convert, CGPointZero);
+        }
+    }
+    if (CGPointEqualToPoint(point, CGPointZero)) {
+        point = ECReadPoint(host, @"getCueBallPositionTarget");
+    }
+    UIView *render = ECRenderView(space.window ?: (UIWindow *)space);
+    CGRect bounds = render.bounds;
+    CGPoint mapped = point;
+    if (point.y > 1 && point.y < bounds.size.height * 3) {
+        if (point.y <= bounds.size.height && point.x <= bounds.size.width * 1.5) {
+            mapped = CGPointMake(point.x, bounds.size.height - point.y);
+        }
+    }
+    return [render convertPoint:mapped toView:space];
+}
+
+static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSInteger bounces,
+                        void (^emit)(CGPoint, CGPoint)) {
+    CGFloat length = (CGRectGetWidth(table) + CGRectGetHeight(table)) * 2.0;
+    CGPoint origin = start;
+    CGPoint dir = direction;
+    CGFloat mag = hypot(dir.x, dir.y);
+    if (mag < 0.001) return;
+    dir = CGPointMake(dir.x / mag, dir.y / mag);
+    for (NSInteger i = 0; i <= bounces; i++) {
+        CGFloat tHit = length;
+        CGPoint normal = CGPointZero;
+        CGFloat left = CGRectGetMinX(table), right = CGRectGetMaxX(table);
+        CGFloat top = CGRectGetMinY(table), bottom = CGRectGetMaxY(table);
+        if (dir.x > 0.0001) {
+            CGFloat t = (right - origin.x) / dir.x;
+            if (t > 0.001 && t < tHit) { tHit = t; normal = CGPointMake(-1, 0); }
+        } else if (dir.x < -0.0001) {
+            CGFloat t = (left - origin.x) / dir.x;
+            if (t > 0.001 && t < tHit) { tHit = t; normal = CGPointMake(1, 0); }
+        }
+        if (dir.y > 0.0001) {
+            CGFloat t = (bottom - origin.y) / dir.y;
+            if (t > 0.001 && t < tHit) { tHit = t; normal = CGPointMake(0, -1); }
+        } else if (dir.y < -0.0001) {
+            CGFloat t = (top - origin.y) / dir.y;
+            if (t > 0.001 && t < tHit) { tHit = t; normal = CGPointMake(0, 1); }
+        }
+        CGPoint dest = CGPointMake(origin.x + dir.x * tHit, origin.y + dir.y * tHit);
+        emit(origin, dest);
+        if (normal.x != 0) dir.x = -dir.x;
+        if (normal.y != 0) dir.y = -dir.y;
+        origin = dest;
+    }
+}
+
+@interface EmberEightBPLineOverlay : UIView
+@property (nonatomic, strong) CAShapeLayer *stroke;
+@property (nonatomic, strong) CADisplayLink *link;
+@property (nonatomic, assign) BOOL aiming;
+@property (nonatomic, assign) NSTimeInterval lastAimLog;
++ (instancetype)sharedOverlay;
+- (void)attachToWindow:(UIWindow *)window;
+@end
+
+@implementation EmberEightBPLineOverlay
+
++ (instancetype)sharedOverlay {
+    static EmberEightBPLineOverlay *overlay;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        overlay = [[EmberEightBPLineOverlay alloc] initWithFrame:CGRectZero];
+        overlay.userInteractionEnabled = NO;
+        overlay.opaque = NO;
+        overlay.backgroundColor = UIColor.clearColor;
+        overlay.tag = EC_LINE_OVERLAY_TAG;
+        overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        CAShapeLayer *stroke = [CAShapeLayer layer];
+        stroke.fillColor = UIColor.clearColor.CGColor;
+        stroke.strokeColor = [UIColor colorWithWhite:1 alpha:0.92].CGColor;
+        stroke.lineWidth = 2.2;
+        stroke.lineCap = kCALineCapRound;
+        stroke.lineJoin = kCALineJoinRound;
+        stroke.shadowColor = [UIColor colorWithRed:0.55 green:0.85 blue:1 alpha:1].CGColor;
+        stroke.shadowRadius = 4;
+        stroke.shadowOpacity = 0.8;
+        [overlay.layer addSublayer:stroke];
+        overlay.stroke = stroke;
+    });
+    return overlay;
+}
+
+- (void)attachToWindow:(UIWindow *)window {
+    if (!window) return;
+    self.frame = window.bounds;
+    if (self.superview != window) {
+        [self removeFromSuperview];
+        [window addSubview:self];
+    }
+    [window bringSubviewToFront:self];
+    if (self.link) return;
+    self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
+    [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(aimingPan:)];
+    pan.cancelsTouchesInView = NO;
+    pan.delaysTouchesBegan = NO;
+    pan.delaysTouchesEnded = NO;
+    [window addGestureRecognizer:pan];
+}
+
+- (void)aimingPan:(UIPanGestureRecognizer *)gesture {
+    self.aiming = gesture.state == UIGestureRecognizerStateBegan ||
+                  gesture.state == UIGestureRecognizerStateChanged;
+    if (gesture.state == UIGestureRecognizerStateEnded ||
+        gesture.state == UIGestureRecognizerStateCancelled) {
+        self.aiming = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (gesture.state != UIGestureRecognizerStateChanged) self.aiming = NO;
+        });
+    }
+}
+
+- (void)tick {
+    if (!ECExtensionIsActive() || gECMultiplier <= 1) {
+        self.hidden = YES;
+        self.stroke.path = nil;
+        return;
+    }
+    id manager = ECFindGameManager();
+    id host = ECFindResponder(manager, @"aimAngle", 0);
+    if (!host) host = ECFindResponder(manager, @"getAimAngleTarget", 0);
+    if (!host) host = ECFindResponder(manager, @"getCueBall", 0);
+    if (!host) host = manager;
+    float angle = ECReadFloat(host, @"aimAngle", NAN);
+    if (isnan(angle)) angle = ECReadFloat(host, @"getAimAngleTarget", NAN);
+    CGPoint cue = ECCueBallScreenPoint(host, self);
+    id visualCue = ECInvokeId(host, @"visualCue") ?: ECIvarObject(host, "mVisualCue") ?: ECIvarObject(manager, "mVisualCue");
+    static BOOL dumped = NO;
+    if (!dumped && (host || visualCue)) {
+        dumped = YES;
+        ECDumpAimIvars(host, @"aimHost");
+        ECDumpAimIvars(visualCue, @"visualCue");
+        ECLogLine([NSString stringWithFormat:@"overlay host=%@ angle=%.3f cue=%.1f,%.1f visual=%@",
+                   [host class], angle, cue.x, cue.y, [visualCue class]]);
+        ECInvokeIntSetter(visualCue, @"setMaxLineLength:", 9999);
+        ECSetIntIvar(visualCue, "_maxLineLength", 9999);
+        ECSetIntIvar(visualCue, "mMaxLineLength", 9999);
+    }
+    if (isnan(angle) || (cue.x == 0 && cue.y == 0)) {
+        self.hidden = YES;
+        self.stroke.path = nil;
+        return;
+    }
+    self.hidden = NO;
+    CGFloat radians = (fabs(angle) > 8.0) ? (angle * (float)M_PI / 180.0f) : angle;
+    CGPoint dir = CGPointMake(cos(radians), -sin(radians));
+    CGRect table = CGRectInset(self.bounds, 18, 28);
+    NSInteger bounces = gECMultiplier >= 8 ? 3 : (gECMultiplier >= 4 ? 2 : 1);
+    UIBezierPath *path = [UIBezierPath bezierPath];
+    __block NSInteger parts = 0;
+    ECBounceRay(cue, dir, table, bounces, ^(CGPoint from, CGPoint to) {
+        if (parts == 0) [path moveToPoint:from];
+        [path addLineToPoint:to];
+        parts++;
+    });
+    self.stroke.path = path.CGPath;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - self.lastAimLog > 1.5) {
+        self.lastAimLog = now;
+        ECLogLine([NSString stringWithFormat:@"draw angle=%.3f cue=%.1f,%.1f parts=%ld x%ld",
+                   angle, cue.x, cue.y, (long)parts, (long)gECMultiplier]);
+    }
+}
+
+@end
+
 @interface EmberEightBPOfflineLinesController : NSObject <UIGestureRecognizerDelegate>
 @property (nonatomic, weak) UIButton *button;
 @property (nonatomic, weak) UIWindow *hostWindow;
@@ -582,11 +845,13 @@ static void ECInstallHooks(void) {
 
 - (void)start {
     [self install];
+    [EmberEightBPLineOverlay.sharedOverlay attachToWindow:[self guestWindow]];
     [self.keepAliveTimer invalidate];
     __weak typeof(self) weakSelf = self;
     self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
         ECApplyAimValues();
         [weakSelf install];
+        [EmberEightBPLineOverlay.sharedOverlay attachToWindow:[weakSelf guestWindow]];
     }];
 }
 
