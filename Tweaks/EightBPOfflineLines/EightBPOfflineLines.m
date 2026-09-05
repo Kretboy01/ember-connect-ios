@@ -95,6 +95,8 @@ static void (*ECOriginalRemoveVisualBall)(id, SEL) = NULL;
 static CGPoint gECWindowPos[20];
 static CGFloat gECWindowRadius[20];
 static BOOL gECHasWindow[20];
+/** Latches once a ball is potted; cleared only by a respot or a new rack. */
+static BOOL gECPotted[20];
 static int gECWindowHits = 0;
 static __weak UIView *gECGLView = nil;
 static id gECRingTexture = nil;
@@ -380,6 +382,7 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECHiddenLog = 0;
     gECCachedTable = nil;
     memset(gECHasWindow, 0, sizeof(gECHasWindow));
+    memset(gECPotted, 0, sizeof(gECPotted));
     ECRemoveBallMarkers();
     ECStripUIKitOverlay();
     dispatch_async(dispatch_get_main_queue(), ^{ ECWriteStatus(@"game-exited"); });
@@ -389,6 +392,8 @@ static void ECStartHotSeatGame(id self, SEL selector) {
     ECCaptureGameManager(self);
     if (ECOriginalStartHotSeatGame) ECOriginalStartHotSeatGame(self, selector);
     gECInMatch = YES;
+    // A fresh rack puts every ball back in play.
+    memset(gECPotted, 0, sizeof(gECPotted));
     dispatch_async(dispatch_get_main_queue(), ^{
         gECOverlayAllowed = YES;
         ECRefreshNativeGuide();
@@ -567,9 +572,11 @@ static void ECBallSetPosition(id self, SEL selector, ECDPoint pos) {
     }
 }
 
+// A respot puts the ball back in play, so it must clear the potted latch.
 static void ECBallSpotAt(id self, SEL selector, ECDPoint pos) {
     if (ECOriginalBallSpotAt) ECOriginalBallSpotAt(self, selector, pos);
     ECCacheBallPosition(self, pos);
+    ECClearPotted(self);
 }
 
 static void ECRemoveVisualBall(id self, SEL selector) {
@@ -697,6 +704,7 @@ static void ECRemoveBallMarkers(void) {
         if (!ball) continue;
         ECDropBallMarker(ball);
         gECCachedBalls[i] = nil;
+        gECPotted[i] = NO;
     }
     gECCachedSnapCount = 0;
 }
@@ -720,11 +728,24 @@ static void ECStripUIKitOverlay(void) {
 // cleared while the balls are in motion. Table keeps an explicit mBallsPotted
 // list, which is the game's own record of what has actually been potted, so it
 // says nothing about motion and cannot flip back on its own.
+// Latched, because mBallsPotted is the table's working list for a shot and the
+// game empties it in processPottedBalls; without the latch the ring would come
+// back once the list was cleared. A respot is the only thing that undoes it.
 static BOOL ECBallIsPotted(id ball) {
-    if (!gECCachedTable || !ball) return NO;
+    if (!ball) return NO;
+    int slot = ECSlotForBall(ball);
+    if (slot >= 0 && gECPotted[slot]) return YES;
+    if (!gECCachedTable) return NO;
     id potted = ECIvarObject(gECCachedTable, "mBallsPotted");
     if (![potted isKindOfClass:NSArray.class]) return NO;
-    return [(NSArray *)potted indexOfObjectIdenticalTo:ball] != NSNotFound;
+    if ([(NSArray *)potted indexOfObjectIdenticalTo:ball] == NSNotFound) return NO;
+    if (slot >= 0) gECPotted[slot] = YES;
+    return YES;
+}
+
+static void ECClearPotted(id ball) {
+    int slot = ECSlotForBall(ball);
+    if (slot >= 0) gECPotted[slot] = NO;
 }
 
 static BOOL ECSphereVisible(id sphere) {
@@ -890,6 +911,7 @@ static int ECSlotForBall(id ball) {
     gECCachedSnaps[i].pos = (ECDPoint){NAN, NAN};
     gECCachedSnaps[i].radius = 3.6;
     gECHasWindow[i] = NO;
+    gECPotted[i] = NO;
     return i;
 }
 
