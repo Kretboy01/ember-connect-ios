@@ -790,6 +790,10 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
     id existing = objc_getAssociatedObject(ball, kECMarkerKey);
     if (ECBallIsPotted(ball)) {
         ECSetMarkerVisible(existing, NO);
+        if (existing && gECHiddenLog < 12) {
+            gECHiddenLog++;
+            ECLogLine([NSString stringWithFormat:@"ring-hidden slot=%d potted", ECSlotForBall(ball)]);
+        }
         return;
     }
     // setState: leaves the sphere parentless until it is re-added, so hide
@@ -809,6 +813,14 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
         pos = ((CGPoint (*)(id, SEL))objc_msgSend)(sphere, @selector(position));
     }
     int slot = ECSlotForBall(ball);
+    // Sit one step above the sphere rather than at a fixed depth. setState:
+    // re-adds the sphere to the Table node at a z taken from a global counter,
+    // which is well above any constant of ours, so a hardcoded z left the ring
+    // buried behind the table art once the ball changed state.
+    long long ringZ = 1;
+    if ([sphere respondsToSelector:@selector(zOrder)]) {
+        ringZ = ((long long (*)(id, SEL))objc_msgSend)(sphere, @selector(zOrder)) + 1;
+    }
     id marker = existing;
     if (!ECLooksLikeObject(marker)) {
         id texture = ECCircleTexture();
@@ -828,19 +840,15 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
             ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(marker, @selector(setColor:), color);
         }
         if ([parent respondsToSelector:@selector(addChild:z:)]) {
-            ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, 800);
+            ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, ringZ);
         } else if ([parent respondsToSelector:@selector(addChild:)]) {
             ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), marker);
         }
         objc_setAssociatedObject(ball, kECMarkerKey, marker, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (gECVisualLog < 4) {
             gECVisualLog++;
-            CGSize size = CGSizeZero;
-            if ([sphere respondsToSelector:@selector(contentSize)]) {
-                size = ((CGSize (*)(id, SEL))objc_msgSend)(sphere, @selector(contentSize));
-            }
-            ECLogLine([NSString stringWithFormat:@"cocos-marker pos=%.1f,%.1f size=%.1fx%.1f parent=%@ cue=%d",
-                       pos.x, pos.y, size.width, size.height, [parent class], ball == gECCachedCueBall]);
+            ECLogLine([NSString stringWithFormat:@"cocos-marker pos=%.1f,%.1f z=%lld parent=%@ cue=%d",
+                       pos.x, pos.y, ringZ, [parent class], ball == gECCachedCueBall]);
         }
     }
     ECSetMarkerVisible(marker, YES);
@@ -892,11 +900,23 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
         if ([marker respondsToSelector:@selector(removeFromParent)]) {
             ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
         }
-        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, 800);
+        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, ringZ);
         if (gECReparentLog < 12) {
             gECReparentLog++;
-            ECLogLine([NSString stringWithFormat:@"ring-reparent slot=%d from=%@ to=%@ sphereVisible=%d",
-                       slot, [markerParent class], [parent class], ECSphereVisible(sphere)]);
+            ECLogLine([NSString stringWithFormat:@"ring-reparent slot=%d from=%@ to=%@ z=%lld visible=%d",
+                       slot, [markerParent class], [parent class], ringZ, ECSphereVisible(sphere)]);
+        }
+    } else if ([marker respondsToSelector:@selector(zOrder)] &&
+               [parent respondsToSelector:@selector(reorderChild:z:)]) {
+        // The sphere's z moves with its state, so follow it every frame.
+        long long markerZ = ((long long (*)(id, SEL))objc_msgSend)(marker, @selector(zOrder));
+        if (markerZ != ringZ) {
+            ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(reorderChild:z:), marker, ringZ);
+            if (gECReparentLog < 12) {
+                gECReparentLog++;
+                ECLogLine([NSString stringWithFormat:@"ring-reorder slot=%d z=%lld->%lld parent=%@",
+                           slot, markerZ, ringZ, [parent class]]);
+            }
         }
     }
 }
