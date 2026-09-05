@@ -936,11 +936,74 @@ static int ECSlotForBall(id ball) {
     return i;
 }
 
+// Nothing in the hide paths is firing, yet rings still disappear, so dump the
+// whole per-ball state once a second and let the log say what is actually
+// different about the balls that lose their ring.
+static void ECLogRingSnapshot(void) {
+    static double last = 0;
+    static int emitted = 0;
+    if (emitted >= 25) return;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (now - last < 1.0) return;
+    last = now;
+    emitted++;
+
+    NSMutableArray *parts = [NSMutableArray array];
+    for (int i = 0; i < gECCachedSnapCount; i++) {
+        id ball = gECCachedBalls[i];
+        if (!ball) continue;
+        id marker = objc_getAssociatedObject(ball, kECMarkerKey);
+        id sphere = ECVisualSphere(ball);
+        id spParent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+        long long sz = 0;
+        if (ECLooksLikeObject(sphere) && [sphere respondsToSelector:@selector(zOrder)]) {
+            sz = ((long long (*)(id, SEL))objc_msgSend)(sphere, @selector(zOrder));
+        }
+        if (!ECLooksLikeObject(marker)) {
+            [parts addObject:[NSString stringWithFormat:@"%d:NOMARK s(v%d z%lld %@)", i,
+                              ECSphereVisible(sphere), sz,
+                              spParent ? NSStringFromClass([spParent class]) : @"nil"]];
+            continue;
+        }
+        BOOL mv = [marker respondsToSelector:@selector(visible)]
+            ? ((BOOL (*)(id, SEL))objc_msgSend)(marker, @selector(visible)) : NO;
+        long long mz = [marker respondsToSelector:@selector(zOrder)]
+            ? ((long long (*)(id, SEL))objc_msgSend)(marker, @selector(zOrder)) : 0;
+        id mParent = ECInvokeId(marker, @"parent");
+        float mscale = [marker respondsToSelector:@selector(scale)]
+            ? ((float (*)(id, SEL))objc_msgSend)(marker, @selector(scale)) : -1;
+        [parts addObject:[NSString stringWithFormat:@"%d:m(v%d z%lld sc%.2f %@) s(v%d z%lld %@) pot%d",
+                          i, mv, mz, mscale,
+                          mParent ? NSStringFromClass([mParent class]) : @"nil",
+                          ECSphereVisible(sphere), sz,
+                          spParent ? NSStringFromClass([spParent class]) : @"nil",
+                          gECPotted[i]]];
+    }
+
+    // mBallsPotted has never matched a ball, so record what it actually holds.
+    NSString *pottedInfo = @"table=nil";
+    if (gECCachedTable) {
+        id potted = ECIvarObject(gECCachedTable, "mBallsPotted");
+        if (!potted) {
+            pottedInfo = @"mBallsPotted=nil";
+        } else {
+            id first = [potted respondsToSelector:@selector(firstObject)] ? [potted firstObject] : nil;
+            pottedInfo = [NSString stringWithFormat:@"mBallsPotted=%@ n=%lu first=%@",
+                          [potted class],
+                          [potted respondsToSelector:@selector(count)] ? (unsigned long)[potted count] : 0,
+                          first ? NSStringFromClass([first class]) : @"nil"];
+        }
+    }
+    ECLogLine([NSString stringWithFormat:@"ring-snap %@ || %@",
+               pottedInfo, [parts componentsJoinedByString:@" | "]]);
+}
+
 static void ECUpdateVisualBall(id self, SEL selector) {
     if (ECOriginalUpdateVisualBall) ECOriginalUpdateVisualBall(self, selector);
     if (!gECInMatch) return;
     @try {
         ECSyncCocosMarker(self, YES);
+        ECLogRingSnapshot();
     } @catch (NSException *exception) {
         ECLogLine([NSString stringWithFormat:@"cocos-marker %@", exception]);
     }
