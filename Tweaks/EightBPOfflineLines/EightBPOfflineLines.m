@@ -7,6 +7,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import <string.h>
 
 #define EC_LINES_BUTTON_TAG 0x8B901
 #define EC_LINE_OVERLAY_TAG 0x8B902
@@ -27,6 +28,8 @@ static BOOL gECHooksInstalled = NO;
 @class EmberEightBPOfflineLinesController;
 static void ECScheduleOverlay(void);
 static void ECRequestOverlayRedraw(void);
+static BOOL ECLooksLikeObject(id object);
+static id ECIvarObject(id object, const char *name);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -73,6 +76,12 @@ static void (*ECOriginalBallSpotAt)(id, SEL, ECDPoint) = NULL;
 static void (*ECOriginalBallSetRadius)(id, SEL, double) = NULL;
 static void (*ECOriginalBallSetVisualOrigin)(id, SEL, CGPoint) = NULL;
 static void (*ECOriginalBallSetVisualScale)(id, SEL, float) = NULL;
+static void (*ECOriginalUpdateVisualBall)(id, SEL) = NULL;
+static CGPoint gECWindowPos[20];
+static CGFloat gECWindowRadius[20];
+static BOOL gECHasWindow[20];
+static int gECWindowHits = 0;
+static __weak UIView *gECGLView = nil;
 
 typedef struct {
     unsigned int force;
@@ -350,6 +359,9 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECVisualCueView = nil;
     gECMapCenter = CGPointMake(NAN, NAN);
     gECMapScale = 0;
+    gECGLView = nil;
+    gECWindowHits = 0;
+    memset(gECHasWindow, 0, sizeof(gECHasWindow));
     dispatch_async(dispatch_get_main_queue(), ^{ ECWriteStatus(@"game-exited"); });
 }
 
@@ -514,7 +526,6 @@ static void ECSetAimAngle(id self, SEL selector, double angle) {
     gECCachedAngle = (float)angle;
     if ([self isKindOfClass:UIView.class]) gECVisualCueView = (UIView *)self;
     if (ECOriginalSetAimAngle) ECOriginalSetAimAngle(self, selector, angle);
-    if (gECInMatch && ECExtensionIsActive()) ECRequestOverlayRedraw();
 }
 
 static id ECGetCueBallHook(id self, SEL selector) {
@@ -526,13 +537,11 @@ static id ECGetCueBallHook(id self, SEL selector) {
 static void ECBallSetPosition(id self, SEL selector, ECDPoint pos) {
     if (ECOriginalBallSetPosition) ECOriginalBallSetPosition(self, selector, pos);
     ECCacheBallPosition(self, pos);
-    if (gECInMatch && gECOverlayAllowed) ECRequestOverlayRedraw();
 }
 
 static void ECBallSpotAt(id self, SEL selector, ECDPoint pos) {
     if (ECOriginalBallSpotAt) ECOriginalBallSpotAt(self, selector, pos);
     ECCacheBallPosition(self, pos);
-    if (gECInMatch && gECOverlayAllowed) ECRequestOverlayRedraw();
 }
 
 static void ECBallSetRadius(id self, SEL selector, double radius) {
@@ -548,6 +557,84 @@ static void ECBallSetVisualOrigin(id self, SEL selector, CGPoint origin) {
 static void ECBallSetVisualScale(id self, SEL selector, float scale) {
     if (scale > 0.05f && scale < 40.0f) gECVisualScale = scale;
     if (ECOriginalBallSetVisualScale) ECOriginalBallSetVisualScale(self, selector, scale);
+}
+
+static id ECSharedDirector(void) {
+    Class cls = NSClassFromString(@"CCDirector");
+    return cls ? ECInvokeId(cls, @"sharedDirector") : nil;
+}
+
+static UIView *ECDirectorGLView(void) {
+    if (gECGLView && gECGLView.superview) return gECGLView;
+    id director = ECSharedDirector();
+    id view = ECInvokeId(director, @"view");
+    if (![view isKindOfClass:UIView.class]) view = ECInvokeId(director, @"openGLView");
+    if ([view isKindOfClass:UIView.class]) gECGLView = (UIView *)view;
+    return gECGLView;
+}
+
+static CGPoint ECMsgPoint(id object, SEL selector, CGPoint point) {
+    if (!object || ![object respondsToSelector:selector]) return CGPointMake(NAN, NAN);
+    return ((CGPoint (*)(id, SEL, CGPoint))objc_msgSend)(object, selector, point);
+}
+
+static int ECSlotForBall(id ball) {
+    if (!ball) return -1;
+    for (int i = 0; i < gECCachedSnapCount; i++) {
+        if (gECCachedBalls[i] == ball) return i;
+    }
+    if (gECCachedSnapCount >= 20) return -1;
+    int i = gECCachedSnapCount++;
+    gECCachedBalls[i] = ball;
+    gECCachedSnaps[i].pos = (ECDPoint){NAN, NAN};
+    gECCachedSnaps[i].radius = 3.6;
+    gECHasWindow[i] = NO;
+    return i;
+}
+
+// After the game writes ProjectedSphere.position in updateVisualBall, ask
+// Cocos for the exact window point it uses: world-space of the anchor, then
+// CCDirector convertToUI:. Cache numbers only — do not keep the sphere.
+static void ECCacheWindowFromBall(id ball) {
+    if (!ECLooksLikeObject(ball)) return;
+    id sphere = ECIvarObject(ball, "visualBall");
+    if (!ECLooksLikeObject(sphere)) return;
+    CGPoint world = ECMsgPoint(sphere, @selector(convertToWorldSpaceAR:), CGPointZero);
+    if (!isfinite(world.x) || !isfinite(world.y)) return;
+    id director = ECSharedDirector();
+    CGPoint ui = world;
+    if (director && [director respondsToSelector:@selector(convertToUI:)]) {
+        ui = ECMsgPoint(director, @selector(convertToUI:), world);
+    } else {
+        ui = ECMsgPoint(sphere, @selector(convertToWindowSpace:), CGPointZero);
+    }
+    if (!isfinite(ui.x) || !isfinite(ui.y)) return;
+    CGFloat radius = 8;
+    if ([sphere respondsToSelector:@selector(contentSize)]) {
+        CGSize size = ((CGSize (*)(id, SEL))objc_msgSend)(sphere, @selector(contentSize));
+        CGPoint rimWorld = ECMsgPoint(sphere, @selector(convertToWorldSpaceAR:), CGPointMake(size.width * 0.5, 0));
+        CGPoint rimUI = director ? ECMsgPoint(director, @selector(convertToUI:), rimWorld) : rimWorld;
+        CGFloat measured = hypot(rimUI.x - ui.x, rimUI.y - ui.y);
+        if (measured > 2 && measured < 80) radius = measured;
+    }
+    int slot = ECSlotForBall(ball);
+    if (slot < 0) return;
+    gECWindowPos[slot] = ui;
+    gECWindowRadius[slot] = radius;
+    gECHasWindow[slot] = YES;
+    gECWindowHits++;
+}
+
+static void ECUpdateVisualBall(id self, SEL selector) {
+    if (ECOriginalUpdateVisualBall) ECOriginalUpdateVisualBall(self, selector);
+    if (!gECInMatch) return;
+    @try {
+        ECCacheWindowFromBall(self);
+    } @catch (NSException *exception) {
+        ECLogLine([NSString stringWithFormat:@"visual-window %@", exception]);
+        return;
+    }
+    if (gECOverlayAllowed) ECRequestOverlayRedraw();
 }
 
 static void ECUpdateVisualGuide(id self, SEL selector) {
@@ -695,8 +782,10 @@ static void ECInstallHooks(void) {
                                   (IMP)ECBallSetVisualOrigin, (IMP *)&ECOriginalBallSetVisualOrigin);
         BOOL scaleOK = ECHookIMP(ball, NSSelectorFromString(@"setVisualBallScale:"),
                                  (IMP)ECBallSetVisualScale, (IMP *)&ECOriginalBallSetVisualScale);
-        ECLogLine([NSString stringWithFormat:@"observe aim=%d cueBall=%d pos=%d spot=%d rad=%d origin=%d scale=%d",
-                   aimOK, cueBallOK, posOK, spotOK, radOK, originOK, scaleOK]);
+        BOOL visualOK = ECHookVoidMethod(ball, NSSelectorFromString(@"updateVisualBall"),
+                                        (IMP)ECUpdateVisualBall, (IMP *)&ECOriginalUpdateVisualBall);
+        ECLogLine([NSString stringWithFormat:@"observe aim=%d cueBall=%d pos=%d spot=%d rad=%d origin=%d scale=%d visual=%d",
+                   aimOK, cueBallOK, posOK, spotOK, radOK, originOK, scaleOK, visualOK]);
         ECDumpClassSelectors(visualCue, @"visualCue");
         ECDumpClassSelectors(NSClassFromString(@"VisualCueWide"), @"visualCueWide");
         ECDumpClassSelectors(userInfo, @"userInfoClass");
@@ -1109,6 +1198,7 @@ static void ECTracePath(ECDPoint start, ECDPoint direction, ECDBox box, double r
 @property (nonatomic, strong) CAShapeLayer *ghost;
 + (instancetype)sharedOverlay;
 - (void)attachToWindow:(UIWindow *)window;
+- (void)attachToGameView;
 - (void)clearPaths;
 - (void)updateFromCache;
 @end
@@ -1177,17 +1267,23 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 }
 
 - (void)attachToWindow:(UIWindow *)window {
-    if (!window || gECOverlayDead) return;
+    (void)window;
+    [self attachToGameView];
+}
+
+- (void)attachToGameView {
+    if (gECOverlayDead) return;
     self.userInteractionEnabled = NO;
-    if (self.superview != window) {
-        self.frame = window.bounds;
-        [self removeFromSuperview];
-        UIView *button = [window viewWithTag:EC_LINES_BUTTON_TAG];
-        if (button) [window insertSubview:self belowSubview:button];
-        else [window addSubview:self];
-    } else if (!CGSizeEqualToSize(self.bounds.size, window.bounds.size)) {
-        self.frame = window.bounds;
+    UIView *gl = ECDirectorGLView();
+    if (!gl) return;
+    if (self.superview == gl) {
+        if (!CGSizeEqualToSize(self.bounds.size, gl.bounds.size)) self.frame = gl.bounds;
+        return;
     }
+    [self removeFromSuperview];
+    self.frame = gl.bounds;
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [gl addSubview:self];
 }
 
 - (CGPoint)mapPoint:(ECDPoint)world box:(ECDBox)box {
@@ -1210,41 +1306,52 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
     return CGPointMake(cocos.x, self.bounds.size.height - cocos.y);
 }
 
+- (CGPoint)overlayPointFromWindow:(CGPoint)ui {
+    if (!isfinite(ui.x) || !isfinite(ui.y)) return CGPointMake(NAN, NAN);
+    CGRect local = CGRectInset(self.bounds, -48, -48);
+    if (CGRectContainsPoint(local, ui)) return ui;
+    if (self.window) {
+        CGPoint fromWindow = [self convertPoint:ui fromView:self.window];
+        if (CGRectContainsPoint(CGRectInset(self.bounds, -80, -80), fromWindow)) return fromWindow;
+    }
+    UIView *gl = self.superview;
+    if (gl && gl != self.window) {
+        CGPoint fromGL = [self convertPoint:ui fromView:gl];
+        if (CGRectContainsPoint(CGRectInset(self.bounds, -80, -80), fromGL)) return fromGL;
+    }
+    return ui;
+}
+
 - (void)updateFromCache {
     @try {
-        if (gECOverlayDead || !gECOverlayAllowed || !gECInMatch || !ECIsLocalMatch() || gECCachedSnapCount < 1) {
+        if (gECOverlayDead || !gECOverlayAllowed || !gECInMatch || !ECIsLocalMatch()) {
             [self clearPaths];
             return;
         }
-        ECDBox box = ECDefaultTableBox();
+        if (!self.superview) [self attachToGameView];
+        if (!self.superview) return;
         UIBezierPath *cueCircles = [UIBezierPath bezierPath];
         UIBezierPath *ballCircles = [UIBezierPath bezierPath];
         int drawn = 0;
+        CGPoint first = CGPointMake(NAN, NAN);
         for (int i = 0; i < gECCachedSnapCount; i++) {
-            ECDPoint pos = gECCachedSnaps[i].pos;
-            if (!ECPointValid(pos)) continue;
-            BOOL dup = NO;
-            for (int j = 0; j < i; j++) {
-                if (gECCachedBalls[j] == gECCachedBalls[i]) continue;
-                if (hypot(gECCachedSnaps[j].pos.x - pos.x, gECCachedSnaps[j].pos.y - pos.y) < 0.35) dup = YES;
-            }
-            if (dup) continue;
-            double radius = gECCachedSnaps[i].radius > 0.01 ? gECCachedSnaps[i].radius : 3.6;
-            CGPoint center = [self mapPoint:pos box:box];
-            CGPoint rim = [self mapPoint:ECMakePoint(pos.x + radius, pos.y) box:box];
-            CGFloat r = MAX(5.0, hypot(rim.x - center.x, rim.y - center.y));
+            if (!gECHasWindow[i]) continue;
+            CGPoint center = [self overlayPointFromWindow:gECWindowPos[i]];
+            if (!isfinite(center.x) || !isfinite(center.y)) continue;
+            CGFloat r = gECWindowRadius[i] > 2 ? gECWindowRadius[i] : 8;
             UIBezierPath *ring = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(center.x - r, center.y - r, r * 2, r * 2)];
             if (gECCachedBalls[i] == gECCachedCueBall) [cueCircles appendPath:ring];
             else [ballCircles appendPath:ring];
+            if (drawn == 0) first = center;
             drawn++;
         }
         static BOOL dumped = NO;
-        if (!dumped) {
+        if (!dumped && drawn > 0) {
             dumped = YES;
-            ECLogLine([NSString stringWithFormat:@"overlay-balls snaps=%d drawn=%d origin=%.1f,%.1f vscale=%.2f host=%@ %.0fx%.0f bounds=%.0fx%.0f",
-                       gECCachedSnapCount, drawn, gECCachedVisualOrigin.x, gECCachedVisualOrigin.y, gECVisualScale,
-                       NSStringFromClass(gECRenderHost.class),
-                       gECRenderHost.bounds.size.width, gECRenderHost.bounds.size.height,
+            ECLogLine([NSString stringWithFormat:@"overlay-window drawn=%d hits=%d first=%.1f,%.1f parent=%@ %.0fx%.0f overlay=%.0fx%.0f",
+                       drawn, gECWindowHits, first.x, first.y,
+                       NSStringFromClass(self.superview.class),
+                       self.superview.bounds.size.width, self.superview.bounds.size.height,
                        self.bounds.size.width, self.bounds.size.height]);
         }
         if (drawn == 0) return;
@@ -1284,10 +1391,7 @@ static void ECRequestOverlayRedraw(void) {
         pending = NO;
         lastDraw = CACurrentMediaTime();
         EmberEightBPLineOverlay *overlay = [EmberEightBPLineOverlay sharedOverlay];
-        if (!overlay.superview) {
-            UIWindow *window = [[EmberEightBPOfflineLinesController sharedController] guestWindow];
-            if (window) [overlay attachToWindow:window];
-        }
+        if (!overlay.superview) [overlay attachToGameView];
         [overlay updateFromCache];
     });
 }
@@ -1419,7 +1523,7 @@ static void ECRequestOverlayRedraw(void) {
         self.button = (UIButton *)existing;
         self.hostWindow = host;
         [host bringSubviewToFront:existing];
-        [[EmberEightBPLineOverlay sharedOverlay] attachToWindow:host];
+        [[EmberEightBPLineOverlay sharedOverlay] attachToGameView];
         [self updateButton];
         return;
     }
@@ -1453,7 +1557,7 @@ static void ECRequestOverlayRedraw(void) {
     [host bringSubviewToFront:button];
     self.button = button;
     self.hostWindow = host;
-    [[EmberEightBPLineOverlay sharedOverlay] attachToWindow:host];
+    [[EmberEightBPLineOverlay sharedOverlay] attachToGameView];
     [self updateButton];
     ECWriteStatus(@"menu-installed");
 }
@@ -1477,8 +1581,7 @@ static void ECRequestOverlayRedraw(void) {
 
 static void ECScheduleOverlay(void) {
     gECOverlayAllowed = YES;
-    UIWindow *window = [[EmberEightBPOfflineLinesController sharedController] guestWindow];
-    if (window) [[EmberEightBPLineOverlay sharedOverlay] attachToWindow:window];
+    [[EmberEightBPLineOverlay sharedOverlay] attachToGameView];
     ECLogLine(@"overlay-ready");
 }
 
