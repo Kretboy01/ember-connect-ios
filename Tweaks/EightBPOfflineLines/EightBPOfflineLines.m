@@ -4,14 +4,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
-#import <OpenGLES/ES2/gl.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
-#import <dlfcn.h>
 #import <math.h>
-#import <stdlib.h>
-#import <string.h>
-#include "../../LiveContainerRuntime/litehook/src/litehook.h"
 
 #define EC_LINES_BUTTON_TAG 0x8B901
 #define EC_LINE_OVERLAY_TAG 0x8B902
@@ -43,14 +38,17 @@ static BOOL (*ECOriginalHideGuidelinesMode)(id, SEL) = NULL;
 static void (*ECOriginalSetHideGuidelinesMode)(id, SEL, BOOL) = NULL;
 static BOOL (*ECOriginalNoGuidelinesOffline)(id, SEL) = NULL;
 static BOOL (*ECOriginalFixedGuidelines)(id, SEL) = NULL;
-static GLint gECGuidelineUniform = -1;
-static GLint (*ECOriginalGetUniformLocation)(GLuint, const GLchar *) = NULL;
-static void (*ECOriginalUniform1f)(GLint, GLfloat) = NULL;
-static void (*ECOriginalUniform1fv)(GLint, GLsizei, const GLfloat *) = NULL;
-static int gECScaledUniformCount = 0;
-static BOOL gECOverlayScheduled = NO;
+static void (*ECOriginalApplyCueStatsForShot)(id, SEL, int, int, int) = NULL;
 
-static void ECScheduleOverlay(void);
+typedef struct {
+    unsigned int force;
+    unsigned int aim;
+    unsigned int spin;
+    unsigned int time;
+} ECCueStats;
+
+static ECCueStats (*ECOriginalGetCueStats)(id, SEL, int) = NULL;
+static ECCueStats (*ECOriginalGetCueStatsWithBonus)(id, SEL, int) = NULL;
 
 static BOOL ECInvokeBool(id object, NSString *selectorName, BOOL fallback) {
     if (!object) return fallback;
@@ -296,7 +294,6 @@ static void ECGameManagerOnEnter(id self, SEL selector) {
     dispatch_async(dispatch_get_main_queue(), ^{
         ECRefreshNativeGuide();
         ECWriteStatus(@"game-entered");
-        ECScheduleOverlay();
     });
 }
 
@@ -304,7 +301,6 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     if (ECOriginalGameManagerOnExit) ECOriginalGameManagerOnExit(self, selector);
     if (gECGameManager == self) gECGameManager = nil;
     gECInMatch = NO;
-    gECOverlayScheduled = NO;
     dispatch_async(dispatch_get_main_queue(), ^{ ECWriteStatus(@"game-exited"); });
 }
 
@@ -315,7 +311,6 @@ static void ECStartHotSeatGame(id self, SEL selector) {
     dispatch_async(dispatch_get_main_queue(), ^{
         ECRefreshNativeGuide();
         ECWriteStatus(@"hotseat-started");
-        ECScheduleOverlay();
     });
 }
 
@@ -362,6 +357,56 @@ static void ECSetHighAimRatio(id self, SEL selector, int value) {
 static void ECSetHideGuidelinesMode(id self, SEL selector, BOOL value) {
     BOOL forced = ECExtensionIsActive() ? NO : value;
     if (ECOriginalSetHideGuidelinesMode) ECOriginalSetHideGuidelinesMode(self, selector, forced);
+}
+
+// 56.29.2 builds guide length from CueStats.aim (IIII = force, aim, spin, time),
+// applied through applyCueStatsForShot:aim:spin:. UserInfo low/high ratios are unused at draw.
+static unsigned int ECTargetCueAim(void) {
+    if (gECMultiplier >= 8) return 1000;
+    if (gECMultiplier >= 4) return 200;
+    if (gECMultiplier >= 2) return 80;
+    return 0;
+}
+
+static ECCueStats ECBoostCueStats(ECCueStats stats, NSString *label, int cueId) {
+    static BOOL logged = NO;
+    if (!logged) {
+        logged = YES;
+        ECLogLine([NSString stringWithFormat:@"%@ id=%d force=%u aim=%u spin=%u time=%u",
+                   label, cueId, stats.force, stats.aim, stats.spin, stats.time]);
+    }
+    if (ECExtensionIsActive()) {
+        unsigned int target = ECTargetCueAim();
+        if (target > stats.aim) stats.aim = target;
+    }
+    return stats;
+}
+
+static ECCueStats ECGetCueStats(id self, SEL selector, int cueId) {
+    ECCueStats stats = {0, 0, 0, 0};
+    if (ECOriginalGetCueStats) stats = ECOriginalGetCueStats(self, selector, cueId);
+    return ECBoostCueStats(stats, @"getCueStats", cueId);
+}
+
+static ECCueStats ECGetCueStatsWithBonus(id self, SEL selector, int cueId) {
+    ECCueStats stats = {0, 0, 0, 0};
+    if (ECOriginalGetCueStatsWithBonus) stats = ECOriginalGetCueStatsWithBonus(self, selector, cueId);
+    return ECBoostCueStats(stats, @"getCueStatsWithBonus", cueId);
+}
+
+static void ECApplyCueStatsForShot(id self, SEL selector, int shot, int aim, int spin) {
+    int forcedAim = aim;
+    if (ECExtensionIsActive()) {
+        unsigned int target = ECTargetCueAim();
+        if ((int)target > forcedAim) forcedAim = (int)target;
+        static BOOL logged = NO;
+        if (!logged) {
+            logged = YES;
+            ECLogLine([NSString stringWithFormat:@"applyCueStatsForShot shot=%d aim=%d->%d spin=%d",
+                       shot, aim, forcedAim, spin]);
+        }
+    }
+    if (ECOriginalApplyCueStatsForShot) ECOriginalApplyCueStatsForShot(self, selector, shot, forcedAim, spin);
 }
 
 static BOOL ECShowCueBallTrajectory(id self, SEL selector) {
@@ -439,99 +484,20 @@ static BOOL ECHookBoolSetter(Class cls, SEL selector, IMP replacement, IMP *orig
     return *original != NULL;
 }
 
-static float ECScaleGuidelineLength(float value) {
-    if (!ECExtensionIsActive() || gECMultiplier <= 1) return value;
-    if (value <= 0) return value;
-    return value * (float)gECMultiplier;
+static BOOL ECHookCueStatsGetter(Class cls, SEL selector, IMP replacement, IMP *original) {
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method || method_getNumberOfArguments(method) != 3) return NO;
+    const char *encoding = method_getTypeEncoding(method) ?: "";
+    if (!strstr(encoding, "CueStats")) return NO;
+    *original = method_setImplementation(method, replacement);
+    return *original != NULL;
 }
 
-static GLint ECGetUniformLocation(GLuint program, const GLchar *name) {
-    GLint location = ECOriginalGetUniformLocation ? ECOriginalGetUniformLocation(program, name) : -1;
-    if (name && strstr(name, "guidelineLength") && location >= 0) {
-        gECGuidelineUniform = location;
-        static BOOL logged = NO;
-        if (!logged) {
-            logged = YES;
-            ECLogLine([NSString stringWithFormat:@"gl uniform %s loc=%d", name, location]);
-        }
-    }
-    return location;
-}
-
-static void ECUniform1f(GLint location, GLfloat value) {
-    if (location >= 0 && location == gECGuidelineUniform) {
-        float scaled = ECScaleGuidelineLength(value);
-        if (gECScaledUniformCount < 8) {
-            ECLogLine([NSString stringWithFormat:@"glUniform1f guideline %.3f -> %.3f", value, scaled]);
-        }
-        gECScaledUniformCount++;
-        value = scaled;
-    }
-    if (ECOriginalUniform1f) ECOriginalUniform1f(location, value);
-}
-
-static void ECUniform1fv(GLint location, GLsizei count, const GLfloat *value) {
-    if (location >= 0 && location == gECGuidelineUniform && count >= 1 && value) {
-        GLfloat scaled = ECScaleGuidelineLength(value[0]);
-        if (ECOriginalUniform1fv) ECOriginalUniform1fv(location, 1, &scaled);
-        return;
-    }
-    if (ECOriginalUniform1fv) ECOriginalUniform1fv(location, count, value);
-}
-
-static void ECInstallGLHooks(void) {
-    void *getLocation = dlsym(RTLD_DEFAULT, "glGetUniformLocation");
-    void *uniform1f = dlsym(RTLD_DEFAULT, "glUniform1f");
-    void *uniform1fv = dlsym(RTLD_DEFAULT, "glUniform1fv");
-    ECOriginalGetUniformLocation = getLocation;
-    ECOriginalUniform1f = uniform1f;
-    ECOriginalUniform1fv = uniform1fv;
-    if (getLocation) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getLocation, ECGetUniformLocation, NULL);
-    if (uniform1f) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, uniform1f, ECUniform1f, NULL);
-    if (uniform1fv) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, uniform1fv, ECUniform1fv, NULL);
-    ECLogLine([NSString stringWithFormat:@"gl hook loc=%d u1f=%d u1fv=%d",
-               getLocation != NULL, uniform1f != NULL, uniform1fv != NULL]);
-}
-
-static void ECHookSetUniformClasses(void) {
-    SEL selector = NSSelectorFromString(@"setUniform:value:");
-    int classCount = objc_getClassList(NULL, 0);
-    if (classCount <= 0) return;
-    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned)classCount);
-    classCount = objc_getClassList(classes, classCount);
-    int hooked = 0;
-    for (int i = 0; i < classCount; i++) {
-        Method method = class_getInstanceMethod(classes[i], selector);
-        if (!method || method_getNumberOfArguments(method) != 4) continue;
-        char *encoding = method_getTypeEncoding(method) ? strdup(method_getTypeEncoding(method)) : NULL;
-        IMP original = method_getImplementation(method);
-        if (!original) {
-            if (encoding) free(encoding);
-            continue;
-        }
-        const char *types = encoding ?: "";
-        if (strstr(types, "@") && strchr(types + 1, '@')) {
-            IMP replacement = imp_implementationWithBlock(^(id self, id name, id value) {
-                if (ECExtensionIsActive() && [name isKindOfClass:NSString.class] &&
-                    [[(NSString *)name lowercaseString] containsString:@"guideline"] &&
-                    [value respondsToSelector:@selector(floatValue)]) {
-                    value = @(ECScaleGuidelineLength([(NSNumber *)value floatValue]));
-                    if (gECScaledUniformCount < 8) {
-                        ECLogLine([NSString stringWithFormat:@"setUniform %@ -> %@", name, value]);
-                    }
-                    gECScaledUniformCount++;
-                }
-                ((void (*)(id, SEL, id, id))original)(self, selector, name, value);
-            });
-            method_setImplementation(method, replacement);
-            hooked++;
-            ECLogLine([NSString stringWithFormat:@"setUniform class=%@ enc=%s", classes[i], types]);
-        }
-        if (encoding) free(encoding);
-        if (hooked >= 8) break;
-    }
-    free(classes);
-    ECLogLine([NSString stringWithFormat:@"setUniform hooked=%d", hooked]);
+static BOOL ECHookApplyCueStats(Class cls, SEL selector, IMP replacement, IMP *original) {
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method || method_getNumberOfArguments(method) != 5) return NO;
+    *original = method_setImplementation(method, replacement);
+    return *original != NULL;
 }
 
 static void ECDumpClassSelectors(Class cls, NSString *label) {
@@ -579,14 +545,18 @@ static void ECInstallHooks(void) {
                                         (IMP)ECSetLowAimRatio, (IMP *)&ECOriginalSetLowAimRatio);
         BOOL setHighOK = ECHookIntSetter(userInfo, NSSelectorFromString(@"setHighAimRatio:"),
                                          (IMP)ECSetHighAimRatio, (IMP *)&ECOriginalSetHighAimRatio);
+        BOOL statsOK = ECHookCueStatsGetter(userInfo, NSSelectorFromString(@"getCueStats:"),
+                                            (IMP)ECGetCueStats, (IMP *)&ECOriginalGetCueStats);
+        BOOL bonusOK = ECHookCueStatsGetter(userInfo, NSSelectorFromString(@"getCueStatsWithBonus:"),
+                                            (IMP)ECGetCueStatsWithBonus, (IMP *)&ECOriginalGetCueStatsWithBonus);
+        BOOL applyOK = ECHookApplyCueStats(gameManager, NSSelectorFromString(@"applyCueStatsForShot:aim:spin:"),
+                                           (IMP)ECApplyCueStatsForShot, (IMP *)&ECOriginalApplyCueStatsForShot);
 
         Class visualCue = NSClassFromString(@"VisualCue");
         ECDumpClassSelectors(visualCue, @"visualCue");
         ECDumpClassSelectors(NSClassFromString(@"VisualCueWide"), @"visualCueWide");
         ECDumpClassSelectors(userInfo, @"userInfoClass");
         ECDumpClassSelectors(gameManager, @"gameManagerClass");
-        ECInstallGLHooks();
-        ECHookSetUniformClasses();
 
         ECHookBoolGetter(settings, NSSelectorFromString(@"showCueBallTrajectory"),
                          (IMP)ECShowCueBallTrajectory, (IMP *)&ECOriginalShowCueBallTrajectory);
@@ -611,9 +581,9 @@ static void ECInstallHooks(void) {
                                  (IMP)ECFixedGuidelines, (IMP *)&ECOriginalFixedGuidelines)) break;
         }
 
-        gECHooksInstalled = lowOK && highOK;
-        ECLogLine([NSString stringWithFormat:@"hook enter=%d exit=%d low=%d high=%d setLow=%d setHigh=%d gm=%@ user=%@ settings=%@ visual=%@",
-                   enterOK, exitOK, lowOK, highOK, setLowOK, setHighOK, gameManager, userInfo, settings, visualCue]);
+        gECHooksInstalled = lowOK && highOK && (statsOK || applyOK);
+        ECLogLine([NSString stringWithFormat:@"hook enter=%d exit=%d low=%d high=%d setLow=%d setHigh=%d stats=%d bonus=%d apply=%d gm=%@ user=%@",
+                   enterOK, exitOK, lowOK, highOK, setLowOK, setHighOK, statsOK, bonusOK, applyOK, gameManager, userInfo]);
         ECWriteStatus(gECHooksInstalled ? @"hooks-installed" : @"incompatible-runtime");
     });
 }
@@ -842,6 +812,8 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 - (void)attachToWindow:(UIWindow *)window {
+    (void)window;
+    return;
     if (!window) return;
     self.frame = window.bounds;
     if (self.superview != window) {
@@ -1125,21 +1097,6 @@ static void ECBounceRay(CGPoint start, CGPoint direction, CGRect table, NSIntege
 }
 
 @end
-
-static void ECScheduleOverlay(void) {
-    if (gECOverlayScheduled) return;
-    gECOverlayScheduled = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (!gECInMatch || !ECExtensionIsActive()) {
-            gECOverlayScheduled = NO;
-            return;
-        }
-        UIWindow *window = [[EmberEightBPOfflineLinesController sharedController] guestWindow];
-        [EmberEightBPLineOverlay.sharedOverlay attachToWindow:window];
-        ECLogLine([NSString stringWithFormat:@"overlay-attached window=%@", window]);
-    });
-}
 
 static void EmberEightBPOfflineLinesBoot(void) {
     NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier ?: @"";

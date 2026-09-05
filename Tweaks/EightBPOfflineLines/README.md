@@ -2,7 +2,7 @@
 
 An Ember Connect tweak for 8 Ball Pool (`com.miniclip.8ballpoolmult`) that extends the game's native aiming guide in offline/practice games.
 
-56.x no longer uses the 2013/2017 ObjC aim-ratio hooks for line length. The current path scales the `u_guidelineLength` shader uniform and, after the table is up, draws a longer overlay line from `VisualCue`.
+56.29.2 builds guideline length from `CueStats.aim` (`getCueStats:` / `applyCueStatsForShot:aim:spin:`). The 2013 VisualGuide selector and 2017 UserInfo ratio hooks do not control draw length. Shader `setUniform` is a C++ struct and must not be hooked as objects.
 
 ## Local-match guard
 

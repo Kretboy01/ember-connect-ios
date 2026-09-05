@@ -111,15 +111,11 @@ jobs:
             -fobjc-arc \
             -fblocks \
             -dynamiclib \
-            -I LiveContainerRuntime/litehook/src \
-            -I LiveContainerRuntime/litehook/external/include \
             Tweaks/EightBPOfflineLines/EightBPOfflineLines.m \
-            LiveContainerRuntime/litehook/src/litehook.c \
             -framework Foundation \
             -framework UIKit \
             -framework QuartzCore \
             -framework CoreGraphics \
-            -framework OpenGLES \
             -install_name @rpath/EightBPOfflineLines.dylib \
             -o BuiltTweaks/EightBPOfflineLines.dylib
 
