@@ -23,6 +23,7 @@ static int gECObservedHighAimRatio = 0;
 static void (*ECOriginalGameManagerOnEnter)(id, SEL) = NULL;
 static void (*ECOriginalGameManagerOnExit)(id, SEL) = NULL;
 static void (*ECOriginalStartHotSeatGame)(id, SEL) = NULL;
+static void (*ECOriginalUpdateVisualGuide)(id, SEL) = NULL;
 static int (*ECOriginalLowAimRatio)(id, SEL) = NULL;
 static int (*ECOriginalHighAimRatio)(id, SEL) = NULL;
 static int (*ECOriginalGuidelineRange)(id, SEL) = NULL;
@@ -30,6 +31,7 @@ static BOOL (*ECOriginalShowCueBallTrajectory)(id, SEL) = NULL;
 static BOOL (*ECOriginalWideGuideline)(id, SEL) = NULL;
 static BOOL (*ECOriginalHideGuidelinesMode)(id, SEL) = NULL;
 static BOOL (*ECOriginalNoGuidelinesOffline)(id, SEL) = NULL;
+static BOOL (*ECOriginalFixedGuidelines)(id, SEL) = NULL;
 
 static BOOL ECInvokeBool(id object, NSString *selectorName, BOOL fallback) {
     if (!object) return fallback;
@@ -78,6 +80,105 @@ static id ECFindGameManager(void) {
     return nil;
 }
 
+static id ECFindUserInfo(void) {
+    Class cls = NSClassFromString(@"UserInfo");
+    if (cls) {
+        for (NSString *name in @[@"sharedUserInfo", @"sharedInstance", @"shared", @"instance", @"currentUser", @"getInstance"]) {
+            id found = ECInvokeId(cls, name);
+            if (found) return found;
+        }
+    }
+    id manager = ECFindGameManager();
+    for (NSString *name in @[@"userInfo", @"getUserInfo", @"currentUser", @"playerInfo"]) {
+        id found = ECInvokeId(manager, name);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static int ECTargetAimRatio(void) {
+    if (gECMultiplier <= 1) return 0;
+    if (gECMultiplier >= 8) return 120;
+    if (gECMultiplier >= 4) return 50;
+    return 20;
+}
+
+static BOOL ECSetIntIvar(id object, const char *name, int value) {
+    if (!object) return NO;
+    Ivar ivar = class_getInstanceVariable([object class], name);
+    if (!ivar) return NO;
+    const char *type = ivar_getTypeEncoding(ivar);
+    if (!type || (type[0] != 'i' && type[0] != 'I' && type[0] != 'q' && type[0] != 'Q')) return NO;
+    if (type[0] == 'q' || type[0] == 'Q') {
+        *(long long *)((uintptr_t)object + ivar_getOffset(ivar)) = value;
+    } else {
+        *(int *)((uintptr_t)object + ivar_getOffset(ivar)) = value;
+    }
+    return YES;
+}
+
+static void ECInvokeIntSetter(id object, NSString *selectorName, int value) {
+    if (!object) return;
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![object respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, int))objc_msgSend)(object, selector, value);
+}
+
+static void ECDumpAimIvars(id object, NSString *label) {
+    if (!object) {
+        ECLogLine([NSString stringWithFormat:@"%@ missing", label]);
+        return;
+    }
+    unsigned int count = 0;
+    Ivar *ivars = class_copyIvarList([object class], &count);
+    NSMutableArray *parts = [NSMutableArray array];
+    for (unsigned int i = 0; i < count; i++) {
+        const char *name = ivar_getName(ivars[i]);
+        if (!name) continue;
+        NSString *nsName = @(name);
+        if (!([nsName.lowercaseString containsString:@"aim"] ||
+              [nsName.lowercaseString containsString:@"guide"] ||
+              [nsName.lowercaseString containsString:@"visual"])) continue;
+        const char *type = ivar_getTypeEncoding(ivars[i]) ?: "?";
+        uintptr_t addr = (uintptr_t)object + ivar_getOffset(ivars[i]);
+        if (type[0] == 'i' || type[0] == 'I') {
+            [parts addObject:[NSString stringWithFormat:@"%s=%d", name, *(int *)addr]];
+        } else if (type[0] == 'B' || type[0] == 'c') {
+            [parts addObject:[NSString stringWithFormat:@"%s=%d", name, (int)*(char *)addr]];
+        } else {
+            [parts addObject:[NSString stringWithFormat:@"%s(%s)", name, type]];
+        }
+    }
+    free(ivars);
+    ECLogLine([NSString stringWithFormat:@"%@ %@ %@", label, [object class], [parts componentsJoinedByString:@" "]]);
+}
+
+static void ECApplyAimValues(void) {
+    if (!ECExtensionIsActive()) return;
+    int target = ECTargetAimRatio();
+    id user = ECFindUserInfo();
+    id manager = ECFindGameManager();
+    static BOOL dumped = NO;
+    if (!dumped) {
+        dumped = YES;
+        ECDumpAimIvars(user, @"userInfo");
+        ECDumpAimIvars(manager, @"gameManager");
+    }
+    ECInvokeIntSetter(user, @"setLowAimRatio:", target);
+    ECInvokeIntSetter(user, @"setHighAimRatio:", target);
+    ECInvokeIntSetter(user, @"setGuidelineRange:", target);
+    BOOL wroteLow = ECSetIntIvar(user, "mLowAimRatio", target) || ECSetIntIvar(user, "_lowAimRatio", target);
+    BOOL wroteHigh = ECSetIntIvar(user, "mHighAimRatio", target) || ECSetIntIvar(user, "_highAimRatio", target);
+    ECSetIntIvar(manager, "mLowAimRatio", target);
+    ECSetIntIvar(manager, "mHighAimRatio", target);
+    static int lastLogged = -1;
+    if (lastLogged != target || !user) {
+        lastLogged = target;
+        ECLogLine([NSString stringWithFormat:@"apply target=%d user=%@ wroteLow=%d wroteHigh=%d",
+                   target, user, wroteLow, wroteHigh]);
+    }
+}
+
 // Network matches stay locked. Pass and Play is isOnLocalGame / hotseat, not
 // isOnOfflineGame, which is why the first build never extended the line.
 static BOOL ECIsLocalMatch(void) {
@@ -103,13 +204,12 @@ static BOOL ECExtensionIsActive(void) {
 }
 
 static void ECRefreshNativeGuide(void) {
+    ECApplyAimValues();
     id manager = ECFindGameManager();
     if (!manager || !ECIsLocalMatch()) return;
-    for (NSString *name in @[@"updateCueStatsAndVisualGuide", @"setShowCueBallTrajectory"]) {
-        SEL selector = NSSelectorFromString(name);
-        if ([manager respondsToSelector:selector]) {
-            ((void (*)(id, SEL))objc_msgSend)(manager, selector);
-        }
+    SEL selector = NSSelectorFromString(@"updateCueStatsAndVisualGuide");
+    if ([manager respondsToSelector:selector]) {
+        ((void (*)(id, SEL))objc_msgSend)(manager, selector);
     }
 }
 
@@ -173,9 +273,11 @@ static void ECStartHotSeatGame(id self, SEL selector) {
 }
 
 static int ECScaleAim(int value) {
-    if (!ECExtensionIsActive() || value <= 0) return value;
-    long long extended = (long long)value * (long long)gECMultiplier;
-    if (extended < 32) extended = 32;
+    if (!ECExtensionIsActive()) return value;
+    int base = value > 0 ? value : 4;
+    long long extended = (long long)base * (long long)gECMultiplier;
+    int target = ECTargetAimRatio();
+    if (extended < target) extended = target;
     return (int)MIN(extended, INT32_MAX);
 }
 
@@ -214,6 +316,18 @@ static BOOL ECHideGuidelinesMode(id self, SEL selector) {
 static BOOL ECNoGuidelinesOffline(id self, SEL selector) {
     if (ECExtensionIsActive()) return NO;
     return ECOriginalNoGuidelinesOffline ? ECOriginalNoGuidelinesOffline(self, selector) : NO;
+}
+
+static BOOL ECFixedGuidelines(id self, SEL selector) {
+    if (ECExtensionIsActive()) return NO;
+    return ECOriginalFixedGuidelines ? ECOriginalFixedGuidelines(self, selector) : NO;
+}
+
+static void ECUpdateVisualGuide(id self, SEL selector) {
+    ECCaptureGameManager(self);
+    ECApplyAimValues();
+    if (ECOriginalUpdateVisualGuide) ECOriginalUpdateVisualGuide(self, selector);
+    if (ECExtensionIsActive()) ECApplyAimValues();
 }
 
 static BOOL ECHookVoidMethod(Class cls, SEL selector, IMP replacement, IMP *original) {
@@ -258,6 +372,8 @@ static void ECInstallHooks(void) {
                                        (IMP)ECGameManagerOnExit, (IMP *)&ECOriginalGameManagerOnExit);
         ECHookVoidMethod(gameManager, NSSelectorFromString(@"startHotSeatGame"),
                          (IMP)ECStartHotSeatGame, (IMP *)&ECOriginalStartHotSeatGame);
+        ECHookVoidMethod(gameManager, NSSelectorFromString(@"updateCueStatsAndVisualGuide"),
+                         (IMP)ECUpdateVisualGuide, (IMP *)&ECOriginalUpdateVisualGuide);
         BOOL lowOK = ECHookIntGetter(userInfo, NSSelectorFromString(@"lowAimRatio"),
                                      (IMP)ECLowAimRatio, (IMP *)&ECOriginalLowAimRatio);
         BOOL highOK = ECHookIntGetter(userInfo, NSSelectorFromString(@"highAimRatio"),
@@ -278,6 +394,10 @@ static void ECInstallHooks(void) {
                               (IMP)ECNoGuidelinesOffline, (IMP *)&ECOriginalNoGuidelinesOffline)) {
             ECHookBoolGetter(gameManager, NSSelectorFromString(@"noGuidelinesOffline"),
                              (IMP)ECNoGuidelinesOffline, (IMP *)&ECOriginalNoGuidelinesOffline);
+        }
+        for (Class cls in @[settings, gameManager, userInfo]) {
+            if (ECHookBoolGetter(cls, NSSelectorFromString(@"isFixedGameplayGuidelinesFeatureActive"),
+                                 (IMP)ECFixedGuidelines, (IMP *)&ECOriginalFixedGuidelines)) break;
         }
 
         gECHooksInstalled = lowOK && highOK;
@@ -463,6 +583,7 @@ static void ECInstallHooks(void) {
     [self.keepAliveTimer invalidate];
     __weak typeof(self) weakSelf = self;
     self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+        ECApplyAimValues();
         [weakSelf install];
     }];
 }
