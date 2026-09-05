@@ -34,6 +34,7 @@ static void ECStripUIKitOverlay(void);
 static void ECRemoveBallMarkers(void);
 static void ECSyncCocosMarker(id ball, BOOL visualFresh);
 static void ECDropBallMarker(id ball);
+static void ECClearPotted(id ball);
 static int ECSlotForBall(id ball);
 static BOOL ECLooksLikeObject(id object);
 static id ECIvarObject(id object, const char *name);
