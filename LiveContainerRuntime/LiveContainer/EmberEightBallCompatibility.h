@@ -35,6 +35,7 @@ static long (*Ember8BRealSyscall)(long, long, long, long, long, long, long, long
 static void *Ember8BAbortPayload;
 static IMP Ember8BRealPresent;
 static IMP Ember8BRealSuspend;
+static int Ember8BAcceptTaps;
 static void *(*Ember8BRealDlsym)(void *, const char *);
 static int (*Ember8BRealNanosleep)(const struct timespec *, struct timespec *);
 static kern_return_t (*Ember8BRealTaskTerminate)(task_t);
@@ -193,27 +194,80 @@ static bool Ember8BIsRaspAlert(id controller) {
     return Ember8BIsRaspText(alert.title) || Ember8BIsRaspText(alert.message);
 }
 
-static void Ember8BHideRaspViews(UIView *view) {
+static NSString *Ember8BViewText(UIView *view) {
+    if ([view isKindOfClass:UILabel.class]) return ((UILabel *)view).text;
+    if ([view isKindOfClass:UITextView.class]) return ((UITextView *)view).text;
+    if ([view isKindOfClass:UIButton.class]) return [(UIButton *)view titleForState:UIControlStateNormal];
+    return nil;
+}
+
+static bool Ember8BViewTreeHasText(UIView *view, bool (*test)(NSString *)) {
+    if (!view) return false;
+    if (test(Ember8BViewText(view))) return true;
+    for (UIView *sub in view.subviews) {
+        if (Ember8BViewTreeHasText(sub, test)) return true;
+    }
+    return false;
+}
+
+static bool Ember8BIsPrivacyTitle(NSString *text) {
+    if (text.length == 0) return false;
+    NSString *lower = text.lowercaseString;
+    return [lower containsString:@"before we begin"] || [lower isEqualToString:@"welcome!"];
+}
+
+static bool Ember8BIsAcceptTitle(NSString *text) {
+    if (text.length == 0) return false;
+    NSString *trim = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return [trim.lowercaseString isEqualToString:@"accept"];
+}
+
+static void Ember8BDisableRaspOverlays(UIView *view, UIView *root) {
     if (!view) return;
-    NSString *text = nil;
-    if ([view isKindOfClass:UILabel.class]) text = ((UILabel *)view).text;
-    else if ([view isKindOfClass:UITextView.class]) text = ((UITextView *)view).text;
-    if (Ember8BIsRaspText(text)) {
+    if (Ember8BIsRaspText(Ember8BViewText(view))) {
         UIView *hide = view;
-        for (int i = 0; i < 8 && hide.superview; i++) hide = hide.superview;
-        if (!hide.hidden) {
-            hide.hidden = YES;
-            Ember8BLog("hid rasp overlay");
+        while (hide.superview && hide.superview != root && hide.superview.bounds.size.width < root.bounds.size.width * 0.98) {
+            hide = hide.superview;
+        }
+        hide.hidden = YES;
+        hide.userInteractionEnabled = NO;
+        hide.alpha = 0;
+        Ember8BLog("disabled rasp overlay");
+    }
+    for (UIView *sub in view.subviews) Ember8BDisableRaspOverlays(sub, root);
+}
+
+static void Ember8BTapAcceptButtons(UIView *view, bool inPrivacy) {
+    if (!view) return;
+    bool here = inPrivacy || Ember8BIsPrivacyTitle(Ember8BViewText(view));
+    if ([view isKindOfClass:UIButton.class] && here && Ember8BIsAcceptTitle(Ember8BViewText(view))) {
+        UIButton *button = (UIButton *)view;
+        if (button.enabled && button.userInteractionEnabled && Ember8BAcceptTaps < 3) {
+            Ember8BAcceptTaps += 1;
+            Ember8BLog("auto-tapping privacy Accept");
+            [button sendActionsForControlEvents:UIControlEventTouchUpInside];
         }
     }
-    for (UIView *sub in view.subviews) Ember8BHideRaspViews(sub);
+    for (UIView *sub in view.subviews) Ember8BTapAcceptButtons(sub, here);
 }
 
 static void Ember8BStripRaspUI(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return;
+    UIWindow *gameWindow = nil;
     for (UIWindow *window in app.windows) {
-        Ember8BHideRaspViews(window);
+        NSString *cls = NSStringFromClass(window.rootViewController.class);
+        if (window.windowLevel <= UIWindowLevelNormal && ![cls containsString:@"Alert"]) {
+            if (!gameWindow || window.isKeyWindow) gameWindow = window;
+        }
+        bool raspWindow = Ember8BViewTreeHasText(window, Ember8BIsRaspText) || Ember8BIsRaspAlert(window.rootViewController);
+        if (raspWindow && window.windowLevel > UIWindowLevelNormal) {
+            window.userInteractionEnabled = NO;
+            window.hidden = YES;
+            Ember8BLog("disabled rasp window");
+            continue;
+        }
+        Ember8BDisableRaspOverlays(window, window);
         UIViewController *presented = window.rootViewController.presentedViewController;
         while (presented) {
             UIViewController *next = presented.presentedViewController;
@@ -223,6 +277,13 @@ static void Ember8BStripRaspUI(void) {
             }
             presented = next;
         }
+        if (Ember8BViewTreeHasText(window, Ember8BIsPrivacyTitle)) {
+            Ember8BTapAcceptButtons(window, false);
+        }
+    }
+    if (gameWindow && !gameWindow.isKeyWindow) {
+        [gameWindow makeKeyAndVisible];
+        Ember8BLog("restored game key window");
     }
 }
 
