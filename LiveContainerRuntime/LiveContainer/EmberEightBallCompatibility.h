@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <objc/runtime.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -30,6 +31,8 @@ static int (*Ember8BRealPthreadKill)(pthread_t, int);
 static int (*Ember8BRealPthreadKillNP)(int, int);
 static long (*Ember8BRealSyscall)(long, long, long, long, long, long, long, long);
 static void *Ember8BAbortPayload;
+static IMP Ember8BRealPresent;
+static IMP Ember8BRealSuspend;
 
 static void Ember8BLog(const char *message) {
     if (Ember8BLogFD >= 0) {
@@ -49,12 +52,9 @@ static bool Ember8BShouldIgnore(const char *kind, int status, uintptr_t caller) 
     Ember8BLog(kind);
     Ember8BLogPtr("status", (uintptr_t)(unsigned)status);
     Ember8BLogPtr("caller", caller);
-    if (seen <= 16) {
-        Ember8BLog("ignoring startup terminate");
-        return true;
-    }
-    Ember8BLog("allowing terminate");
-    return false;
+    Ember8BLogPtr("ignored", (uintptr_t)(unsigned)seen);
+    Ember8BLog("ignoring Appdome terminate");
+    return true;
 }
 
 static void Ember8BAllowExit(int status) {
@@ -164,6 +164,119 @@ static void Ember8BImageAdded(const struct mach_header *header, intptr_t slide) 
     Ember8BRebindImage((const mach_header_u *)header);
 }
 
+static bool Ember8BIsRaspText(NSString *text) {
+    if (text.length == 0) return false;
+    NSString *lower = text.lowercaseString;
+    return [lower containsString:@"attack"] ||
+           [lower containsString:@"administrator"] ||
+           [lower containsString:@"protect the app"] ||
+           [lower containsString:@"has been detected"] ||
+           [lower containsString:@"ref:"];
+}
+
+static bool Ember8BIsRaspAlert(id controller) {
+    if (![controller isKindOfClass:UIAlertController.class]) return false;
+    UIAlertController *alert = controller;
+    return Ember8BIsRaspText(alert.title) || Ember8BIsRaspText(alert.message);
+}
+
+static void Ember8BHideRaspViews(UIView *view) {
+    if (!view) return;
+    NSString *text = nil;
+    if ([view isKindOfClass:UILabel.class]) text = ((UILabel *)view).text;
+    else if ([view isKindOfClass:UITextView.class]) text = ((UITextView *)view).text;
+    if (Ember8BIsRaspText(text)) {
+        UIView *hide = view;
+        for (int i = 0; i < 8 && hide.superview; i++) hide = hide.superview;
+        if (!hide.hidden) {
+            hide.hidden = YES;
+            Ember8BLog("hid rasp overlay");
+        }
+    }
+    for (UIView *sub in view.subviews) Ember8BHideRaspViews(sub);
+}
+
+static void Ember8BStripRaspUI(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (!app) return;
+    for (UIWindow *window in app.windows) {
+        Ember8BHideRaspViews(window);
+        UIViewController *presented = window.rootViewController.presentedViewController;
+        while (presented) {
+            UIViewController *next = presented.presentedViewController;
+            if (Ember8BIsRaspAlert(presented)) {
+                Ember8BLog("dismissed rasp alert");
+                [presented dismissViewControllerAnimated:NO completion:nil];
+            }
+            presented = next;
+        }
+    }
+}
+
+static void Ember8BHookPresent(id self, SEL sel, UIViewController *controller, BOOL animated, id completion) {
+    if (Ember8BIsRaspAlert(controller)) {
+        Ember8BLog("swallowed rasp alert");
+        if (completion) ((void (^)(void))completion)();
+        return;
+    }
+    if (Ember8BRealPresent) {
+        ((void (*)(id, SEL, UIViewController *, BOOL, id))Ember8BRealPresent)(self, sel, controller, animated, completion);
+    }
+}
+
+static void Ember8BHookSuspend(id self, SEL sel) {
+    Ember8BLog("blocked UIApplication suspend");
+    (void)self;
+    (void)sel;
+}
+
+static void Ember8BInstallUIHooks(void) {
+    Method present = class_getInstanceMethod(UIViewController.class, @selector(presentViewController:animated:completion:));
+    if (present && !Ember8BRealPresent) {
+        Ember8BRealPresent = method_setImplementation(present, (IMP)Ember8BHookPresent);
+        Ember8BLog("presentViewController hooked");
+    }
+    Method suspend = class_getInstanceMethod(UIApplication.class, @selector(suspend));
+    if (suspend && !Ember8BRealSuspend) {
+        Ember8BRealSuspend = method_setImplementation(suspend, (IMP)Ember8BHookSuspend);
+        Ember8BLog("UIApplication.suspend hooked");
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        static dispatch_source_t timer;
+        if (timer) return;
+        timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 250ull * NSEC_PER_MSEC, 50ull * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(timer, ^{ Ember8BStripRaspUI(); });
+        dispatch_resume(timer);
+        Ember8BLog("rasp ui sweeper armed");
+    });
+}
+
+// Weak-bind replacements for Appdome's optional enforcement hooks.
+__attribute__((used, visibility("default")))
+void _Z37sleep_then_exit_critical_flow_handlerv(void) {
+    Ember8BLog("sleep_then_exit nop");
+}
+
+__attribute__((used, visibility("default")))
+void _Z40validate_critical_flow_fork_util_handlerv(void) {
+    Ember8BLog("validate_critical_flow nop");
+}
+
+__attribute__((used, visibility("default")))
+bool _Z33is_conditional_enforcement_policyRK13MessagePolicy(const void *policy) {
+    (void)policy;
+    Ember8BLog("conditional enforcement denied");
+    return false;
+}
+
+__attribute__((used, visibility("default")))
+void _Z26handle_dynamic_enforcementNSt3__110shared_ptrINS_13unordered_mapINS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEES7_NS_4hashIS7_EENS_8equal_toIS7_EENS5_INS_4pairIKS7_S7_EEEEEEEEP15EventDescriptorSH_(void *map, void *event) {
+    (void)map;
+    (void)event;
+    Ember8BLog("dynamic enforcement nop");
+}
+
 static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *settings, NSString *documents) {
     if (![bundle.bundleIdentifier isEqualToString:@"com.miniclip.8ballpoolmult"] ||
         [settings[@"EmberEightBallCompatibilityDisabled"] boolValue]) return;
@@ -196,6 +309,7 @@ static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *s
     if (Ember8BRealSyscall) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealSyscall, Ember8BHookSyscall, nil);
     if (Ember8BAbortPayload) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BAbortPayload, Ember8BHookAbort, nil);
     _dyld_register_func_for_add_image(Ember8BImageAdded);
+    Ember8BInstallUIHooks();
     Ember8BLog("56.29.2 terminate gate armed before guest load");
     Ember8BLogPtr("syscall", (uintptr_t)Ember8BRealSyscall);
     Ember8BLogPtr("pthread_kill_np", (uintptr_t)Ember8BRealPthreadKillNP);
@@ -208,6 +322,7 @@ static void EmberEightBallCompatibilityGuestLoaded(const char *guestExec) {
     // syscall/exit, then patch those slots. Do not write libsystem TEXT.
     if (guestExec) dlopen(guestExec, RTLD_NOW | RTLD_NOLOAD);
     Ember8BRebindAllImages();
+    Ember8BInstallUIHooks();
     Ember8BLog("terminate gate rebound after guest load");
 }
 #else
