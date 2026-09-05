@@ -13,7 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
+#include <mach/mach.h>
 
 #if defined(__arm64__) && !defined(__arm64e__)
 static int Ember8BLogFD = -1;
@@ -33,6 +35,14 @@ static long (*Ember8BRealSyscall)(long, long, long, long, long, long, long, long
 static void *Ember8BAbortPayload;
 static IMP Ember8BRealPresent;
 static IMP Ember8BRealSuspend;
+static void *(*Ember8BRealDlsym)(void *, const char *);
+static int (*Ember8BRealNanosleep)(const struct timespec *, struct timespec *);
+static kern_return_t (*Ember8BRealTaskTerminate)(task_t);
+static kern_return_t Ember8BHookTaskTerminate(task_t task);
+static void *Ember8BHookDlsym(void *handle, const char *symbol);
+static int Ember8BHookNanosleep(const struct timespec *req, struct timespec *rem);
+void _Z37sleep_then_exit_critical_flow_handlerv(void);
+void _Z40validate_critical_flow_fork_util_handlerv(void);
 
 static void Ember8BLog(const char *message) {
     if (Ember8BLogFD >= 0) {
@@ -149,6 +159,9 @@ static void Ember8BRebindImage(const mach_header_u *mh) {
     Ember8BRebindNamed(mh, Ember8BRealPthreadKillNP, Ember8BHookPthreadKillNP);
     Ember8BRebindNamed(mh, Ember8BRealSyscall, Ember8BHookSyscall);
     Ember8BRebindNamed(mh, Ember8BAbortPayload, Ember8BHookAbort);
+    if (Ember8BRealNanosleep) Ember8BRebindNamed(mh, Ember8BRealNanosleep, Ember8BHookNanosleep);
+    if (Ember8BRealTaskTerminate) Ember8BRebindNamed(mh, Ember8BRealTaskTerminate, Ember8BHookTaskTerminate);
+    if (Ember8BRealDlsym) Ember8BRebindNamed(mh, Ember8BRealDlsym, Ember8BHookDlsym);
 }
 
 static void Ember8BRebindAllImages(void) {
@@ -215,13 +228,47 @@ static void Ember8BStripRaspUI(void) {
 
 static void Ember8BHookPresent(id self, SEL sel, UIViewController *controller, BOOL animated, id completion) {
     if (Ember8BIsRaspAlert(controller)) {
+        // Do not run Appdome's present-completion; that starts the delayed close.
         Ember8BLog("swallowed rasp alert");
-        if (completion) ((void (^)(void))completion)();
+        (void)completion;
         return;
     }
     if (Ember8BRealPresent) {
         ((void (*)(id, SEL, UIViewController *, BOOL, id))Ember8BRealPresent)(self, sel, controller, animated, completion);
     }
+}
+
+static void *Ember8BHookDlsym(void *handle, const char *symbol) {
+    if (Ember8BArmed && symbol) {
+        if (!strcmp(symbol, "exit") || !strcmp(symbol, "_exit") || !strcmp(symbol, "_Exit")) return Ember8BHookExit;
+        if (!strcmp(symbol, "abort") || !strcmp(symbol, "abort_with_payload") || !strcmp(symbol, "__abort_with_payload")) return Ember8BHookAbort;
+        if (!strcmp(symbol, "kill")) return Ember8BHookKill;
+        if (!strcmp(symbol, "raise")) return Ember8BHookRaise;
+        if (!strcmp(symbol, "pthread_kill")) return Ember8BHookPthreadKill;
+        if (!strcmp(symbol, "__pthread_kill")) return Ember8BHookPthreadKillNP;
+        if (!strcmp(symbol, "syscall")) return Ember8BHookSyscall;
+        if (!strcmp(symbol, "task_terminate") && Ember8BRealTaskTerminate) return Ember8BHookTaskTerminate;
+        if (!strcmp(symbol, "_Z37sleep_then_exit_critical_flow_handlerv")) return _Z37sleep_then_exit_critical_flow_handlerv;
+        if (!strcmp(symbol, "_Z40validate_critical_flow_fork_util_handlerv")) return _Z40validate_critical_flow_fork_util_handlerv;
+    }
+    if (Ember8BRealDlsym) return Ember8BRealDlsym(handle, symbol);
+    return NULL;
+}
+
+static int Ember8BHookNanosleep(const struct timespec *req, struct timespec *rem) {
+    if (req && req->tv_sec >= 5) {
+        Ember8BLog("blocked long nanosleep");
+        Ember8BLogPtr("sleep_sec", (uintptr_t)req->tv_sec);
+        return 0;
+    }
+    if (Ember8BRealNanosleep) return Ember8BRealNanosleep(req, rem);
+    return 0;
+}
+
+static kern_return_t Ember8BHookTaskTerminate(task_t task) {
+    Ember8BLog("blocked task_terminate");
+    (void)task;
+    return KERN_SUCCESS;
 }
 
 static void Ember8BHookSuspend(id self, SEL sel) {
@@ -308,11 +355,16 @@ static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *s
     if (Ember8BRealPthreadKillNP) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealPthreadKillNP, Ember8BHookPthreadKillNP, nil);
     if (Ember8BRealSyscall) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealSyscall, Ember8BHookSyscall, nil);
     if (Ember8BAbortPayload) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BAbortPayload, Ember8BHookAbort, nil);
+    Ember8BRealNanosleep = nanosleep;
+    Ember8BRealTaskTerminate = task_terminate;
+    if (Ember8BRealNanosleep) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealNanosleep, Ember8BHookNanosleep, nil);
+    if (Ember8BRealTaskTerminate) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealTaskTerminate, Ember8BHookTaskTerminate, nil);
     _dyld_register_func_for_add_image(Ember8BImageAdded);
     Ember8BInstallUIHooks();
     Ember8BLog("56.29.2 terminate gate armed before guest load");
     Ember8BLogPtr("syscall", (uintptr_t)Ember8BRealSyscall);
     Ember8BLogPtr("pthread_kill_np", (uintptr_t)Ember8BRealPthreadKillNP);
+    Ember8BLogPtr("sleep_then_exit", (uintptr_t)_Z37sleep_then_exit_critical_flow_handlerv);
 }
 
 static void EmberEightBallCompatibilityGuestLoaded(const char *guestExec) {
@@ -322,6 +374,8 @@ static void EmberEightBallCompatibilityGuestLoaded(const char *guestExec) {
     // syscall/exit, then patch those slots. Do not write libsystem TEXT.
     if (guestExec) dlopen(guestExec, RTLD_NOW | RTLD_NOLOAD);
     Ember8BRebindAllImages();
+    Ember8BRealDlsym = dlsym;
+    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlsym, Ember8BHookDlsym, nil);
     Ember8BInstallUIHooks();
     Ember8BLog("terminate gate rebound after guest load");
 }
