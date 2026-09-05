@@ -494,7 +494,7 @@ static float ECReadIvarAngle(id object) {
         if (type[0] == 'd') found = (float)*(double *)addr;
         else if (type[0] == 'f') found = *(float *)addr;
         else if (strstr(type, "MCNumber") && type[0] == '{') found = (float)*(double *)addr;
-        else if (type[0] == '@') found = ECReadMCNumber(*(__unsafe_unretained id *)addr);
+        else if (type[0] == '@') found = ECReadMCNumber(object_getIvar(object, ivars[i]));
         if (!isnan(found)) break;
     }
     if (ivars) free(ivars);
