@@ -25,6 +25,11 @@ static void (*Ember8BRealAbort)(void);
 static int (*Ember8BRealRaise)(int);
 static int (*Ember8BRealKill)(pid_t, int);
 static void (*Ember8BRealTerminate)(void);
+static void (*Ember8BRealObjcTerminate)(void);
+static int (*Ember8BRealPthreadKill)(pthread_t, int);
+static int (*Ember8BRealPthreadKillNP)(int, int);
+static long (*Ember8BRealSyscall)(long, long, long, long, long, long, long, long);
+static void *Ember8BAbortPayload;
 
 static void Ember8BLog(const char *message) {
     if (Ember8BLogFD >= 0) {
@@ -94,6 +99,7 @@ static int Ember8BHookPthreadKill(pthread_t thread, int sig) {
     if (pthread_equal(thread, pthread_self())) {
         if (Ember8BShouldIgnore("pthread_kill-self", sig, (uintptr_t)__builtin_return_address(0))) return 0;
     }
+    if (Ember8BRealPthreadKill) return Ember8BRealPthreadKill(thread, sig);
     return -1;
 }
 
@@ -102,17 +108,47 @@ static void Ember8BHookTerminate(void) {
     Ember8BAllowExit(134);
 }
 
+static void Ember8BHookObjcTerminate(void) {
+    if (Ember8BShouldIgnore("objc_terminate", 0, (uintptr_t)__builtin_return_address(0))) return;
+    Ember8BAllowExit(134);
+}
+
+static long Ember8BHookSyscall(long number, long a1, long a2, long a3, long a4, long a5, long a6, long a7) {
+    if (number == SYS_exit) {
+        if (Ember8BShouldIgnore("syscall-exit", (int)a1, (uintptr_t)__builtin_return_address(0))) return 0;
+        Ember8BAllowExit((int)a1);
+    }
+    if (number == SYS_kill && (a1 == (long)getpid() || a1 == 0 || a1 == -1)) {
+        if (Ember8BShouldIgnore("syscall-kill", (int)a2, (uintptr_t)__builtin_return_address(0))) return 0;
+    }
+    if (Ember8BRealSyscall) return Ember8BRealSyscall(number, a1, a2, a3, a4, a5, a6, a7);
+    return -1;
+}
+
+static int Ember8BHookPthreadKillNP(int thread, int sig) {
+    if (Ember8BShouldIgnore("__pthread_kill", sig, (uintptr_t)__builtin_return_address(0))) return 0;
+    if (Ember8BRealPthreadKillNP) return Ember8BRealPthreadKillNP(thread, sig);
+    return -1;
+}
+
+static void Ember8BRebindNamed(const mach_header_u *mh, void *replacee, void *replacement) {
+    if (mh && replacee && replacement) litehook_rebind_symbol(mh, replacee, replacement, nil);
+}
+
 static void Ember8BRebindImage(const mach_header_u *mh) {
     if (!mh) return;
-    litehook_rebind_symbol(mh, exit, Ember8BHookExit, nil);
-    litehook_rebind_symbol(mh, _Exit, Ember8BHook_Exit, nil);
-    litehook_rebind_symbol(mh, _exit, Ember8BHook_exit, nil);
-    litehook_rebind_symbol(mh, abort, Ember8BHookAbort, nil);
-    litehook_rebind_symbol(mh, raise, Ember8BHookRaise, nil);
-    litehook_rebind_symbol(mh, kill, Ember8BHookKill, nil);
-    if (Ember8BRealTerminate) {
-        litehook_rebind_symbol(mh, Ember8BRealTerminate, Ember8BHookTerminate, nil);
-    }
+    Ember8BRebindNamed(mh, exit, Ember8BHookExit);
+    Ember8BRebindNamed(mh, _Exit, Ember8BHook_Exit);
+    Ember8BRebindNamed(mh, _exit, Ember8BHook_exit);
+    Ember8BRebindNamed(mh, abort, Ember8BHookAbort);
+    Ember8BRebindNamed(mh, raise, Ember8BHookRaise);
+    Ember8BRebindNamed(mh, kill, Ember8BHookKill);
+    Ember8BRebindNamed(mh, pthread_kill, Ember8BHookPthreadKill);
+    Ember8BRebindNamed(mh, Ember8BRealTerminate, Ember8BHookTerminate);
+    Ember8BRebindNamed(mh, Ember8BRealObjcTerminate, Ember8BHookObjcTerminate);
+    Ember8BRebindNamed(mh, Ember8BRealPthreadKillNP, Ember8BHookPthreadKillNP);
+    Ember8BRebindNamed(mh, Ember8BRealSyscall, Ember8BHookSyscall);
+    Ember8BRebindNamed(mh, Ember8BAbortPayload, Ember8BHookAbort);
 }
 
 static void Ember8BRebindAllImages(void) {
@@ -139,7 +175,13 @@ static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *s
     Ember8BRealAbort = abort;
     Ember8BRealRaise = raise;
     Ember8BRealKill = kill;
+    Ember8BRealPthreadKill = pthread_kill;
     Ember8BRealTerminate = dlsym(RTLD_DEFAULT, "_ZSt9terminatev");
+    Ember8BRealObjcTerminate = dlsym(RTLD_DEFAULT, "objc_terminate");
+    Ember8BRealPthreadKillNP = dlsym(RTLD_DEFAULT, "__pthread_kill");
+    Ember8BRealSyscall = dlsym(RTLD_DEFAULT, "syscall");
+    Ember8BAbortPayload = dlsym(RTLD_DEFAULT, "abort_with_payload");
+    if (!Ember8BAbortPayload) Ember8BAbortPayload = dlsym(RTLD_DEFAULT, "__abort_with_payload");
     Ember8BArmed = true;
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, exit, Ember8BHookExit, nil);
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _Exit, Ember8BHook_Exit, nil);
@@ -147,25 +189,28 @@ static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *s
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, abort, Ember8BHookAbort, nil);
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, raise, Ember8BHookRaise, nil);
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, kill, Ember8BHookKill, nil);
-    if (Ember8BRealTerminate) {
-        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealTerminate, Ember8BHookTerminate, nil);
-    }
+    litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, pthread_kill, Ember8BHookPthreadKill, nil);
+    if (Ember8BRealTerminate) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealTerminate, Ember8BHookTerminate, nil);
+    if (Ember8BRealObjcTerminate) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealObjcTerminate, Ember8BHookObjcTerminate, nil);
+    if (Ember8BRealPthreadKillNP) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealPthreadKillNP, Ember8BHookPthreadKillNP, nil);
+    if (Ember8BRealSyscall) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BRealSyscall, Ember8BHookSyscall, nil);
+    if (Ember8BAbortPayload) litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, Ember8BAbortPayload, Ember8BHookAbort, nil);
     _dyld_register_func_for_add_image(Ember8BImageAdded);
     Ember8BLog("56.29.2 terminate gate armed before guest load");
+    Ember8BLogPtr("syscall", (uintptr_t)Ember8BRealSyscall);
+    Ember8BLogPtr("pthread_kill_np", (uintptr_t)Ember8BRealPthreadKillNP);
 }
 
-static void EmberEightBallCompatibilityGuestLoaded(void) {
+static void EmberEightBallCompatibilityGuestLoaded(const char *guestExec) {
     if (!Ember8BArmed) return;
     Ember8BRebindAllImages();
-    // Force remaining lazy libc binds so GOT slots hold real exit/abort/kill,
-    // then patch those slots. Writing libsystem TEXT gets this process killed.
-    if (NSBundle.mainBundle.executablePath) {
-        dlopen(NSBundle.mainBundle.executablePath.fileSystemRepresentation, RTLD_NOW | RTLD_NOLOAD);
-    }
+    // Force the guest's remaining lazy binds so GOT slots hold real
+    // syscall/exit, then patch those slots. Do not write libsystem TEXT.
+    if (guestExec) dlopen(guestExec, RTLD_NOW | RTLD_NOLOAD);
     Ember8BRebindAllImages();
     Ember8BLog("terminate gate rebound after guest load");
 }
 #else
 static void EmberEightBallCompatibilityPrepare(NSBundle *bundle, NSDictionary *settings, NSString *documents) {}
-static void EmberEightBallCompatibilityGuestLoaded(void) {}
+static void EmberEightBallCompatibilityGuestLoaded(const char *guestExec) { (void)guestExec; }
 #endif

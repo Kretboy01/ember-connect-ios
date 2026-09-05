@@ -712,7 +712,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         return appError;
     }
     NSLog(@"[LCBootstrap] loaded bundle");
-    EmberEightBallCompatibilityGuestLoaded();
+    EmberEightBallCompatibilityGuestLoaded(appExecPath);
 
     // Find main()
     appMain = getAppEntryPoint(appHandle);
