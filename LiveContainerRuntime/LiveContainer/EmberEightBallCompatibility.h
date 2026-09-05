@@ -254,18 +254,12 @@ static void Ember8BTapAcceptButtons(UIView *view, bool inPrivacy) {
 static void Ember8BStripRaspUI(void) {
     UIApplication *app = [UIApplication sharedApplication];
     if (!app) return;
-    UIWindow *gameWindow = nil;
     for (UIWindow *window in app.windows) {
-        NSString *cls = NSStringFromClass(window.rootViewController.class);
-        if (window.windowLevel <= UIWindowLevelNormal && ![cls containsString:@"Alert"]) {
-            if (!gameWindow || window.isKeyWindow) gameWindow = window;
-        }
         bool raspWindow = Ember8BViewTreeHasText(window, Ember8BIsRaspText) || Ember8BIsRaspAlert(window.rootViewController);
-        if (raspWindow && window.windowLevel > UIWindowLevelNormal) {
+        if (raspWindow) {
             window.userInteractionEnabled = NO;
-            window.hidden = YES;
-            Ember8BLog("disabled rasp window");
-            continue;
+            if (window.windowLevel > UIWindowLevelNormal) window.hidden = YES;
+            Ember8BLog("disabled rasp window hits");
         }
         Ember8BDisableRaspOverlays(window, window);
         UIViewController *presented = window.rootViewController.presentedViewController;
@@ -280,10 +274,6 @@ static void Ember8BStripRaspUI(void) {
         if (Ember8BViewTreeHasText(window, Ember8BIsPrivacyTitle)) {
             Ember8BTapAcceptButtons(window, false);
         }
-    }
-    if (gameWindow && !gameWindow.isKeyWindow) {
-        [gameWindow makeKeyAndVisible];
-        Ember8BLog("restored game key window");
     }
 }
 
