@@ -731,6 +731,10 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 #endif
         argv[0] = (char *)appExecPath;
         ret = appMain(argc, argv);
+        if ([appBundle.bundleIdentifier isEqualToString:@"com.miniclip.8ballpoolmult"]) {
+            NSLog(@"[LCBootstrap] 8 Ball main returned %d; keeping process alive", ret);
+            CFRunLoopRun();
+        }
 #if is32BitSupported
     } else {
         char *argv32[] = {(char*)appExecPath, (char*)*path, NULL};
