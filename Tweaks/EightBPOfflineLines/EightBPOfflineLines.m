@@ -27,7 +27,6 @@ static BOOL gECHooksInstalled = NO;
 @class EmberEightBPOfflineLinesController;
 static void ECScheduleOverlay(void);
 static void ECRedrawOverlayFromCache(void);
-static void ECCaptureTableBox(id manager);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -70,8 +69,6 @@ static void (*ECOriginalBallSetPosition)(id, SEL, ECDPoint) = NULL;
 static void (*ECOriginalBallSpotAt)(id, SEL, ECDPoint) = NULL;
 static void (*ECOriginalBallSetRadius)(id, SEL, double) = NULL;
 static void (*ECOriginalBallSetVisualOrigin)(id, SEL, CGPoint) = NULL;
-static void (*ECOriginalBallSetVisualScale)(id, SEL, float) = NULL;
-static void (*ECOriginalUpdateAngleEnd)(id, SEL, ECDPoint, ECDPoint) = NULL;
 
 typedef struct {
     unsigned int force;
@@ -512,22 +509,6 @@ static void ECSetAimAngle(id self, SEL selector, double angle) {
     if (gECInMatch && ECExtensionIsActive()) ECRedrawOverlayFromCache();
 }
 
-static void ECUpdateAngleEnd(id self, SEL selector, ECDPoint start, ECDPoint end) {
-    if (ECOriginalUpdateAngleEnd) ECOriginalUpdateAngleEnd(self, selector, start, end);
-    ECDPoint delta = ECMakePoint(end.x - start.x, end.y - start.y);
-    double mag = hypot(delta.x, delta.y);
-    if (mag > 1e-6) {
-        gECAimDir = ECMakePoint(delta.x / mag, delta.y / mag);
-        gECCachedAngle = (float)atan2(delta.y, delta.x);
-    }
-    if (gECInMatch && ECExtensionIsActive()) ECRedrawOverlayFromCache();
-}
-
-static void ECBallSetVisualScale(id self, SEL selector, float scale) {
-    if (scale > 0.05f && scale < 30.0f) gECVisualScale = scale;
-    if (ECOriginalBallSetVisualScale) ECOriginalBallSetVisualScale(self, selector, scale);
-}
-
 static id ECGetCueBallHook(id self, SEL selector) {
     id ball = ECOriginalGetCueBall ? ECOriginalGetCueBall(self, selector) : nil;
     if (ball) gECCachedCueBall = ball;
@@ -560,7 +541,6 @@ static void ECUpdateVisualGuide(id self, SEL selector) {
     if (ECOriginalUpdateVisualGuide) ECOriginalUpdateVisualGuide(self, selector);
     if (ECExtensionIsActive()) {
         ECApplyAimValues();
-        ECCaptureTableBox(self);
         ECRedrawOverlayFromCache();
     }
 }
@@ -698,12 +678,8 @@ static void ECInstallHooks(void) {
                                (IMP)ECBallSetRadius, (IMP *)&ECOriginalBallSetRadius);
         BOOL originOK = ECHookIMP(ball, NSSelectorFromString(@"setVisualTableOrigin:"),
                                   (IMP)ECBallSetVisualOrigin, (IMP *)&ECOriginalBallSetVisualOrigin);
-        BOOL scaleOK = ECHookIMP(ball, NSSelectorFromString(@"setVisualBallScale:"),
-                                 (IMP)ECBallSetVisualScale, (IMP *)&ECOriginalBallSetVisualScale);
-        BOOL angleVecOK = ECHookIMP(visualCue, NSSelectorFromString(@"updateAngle:endPoint:"),
-                                    (IMP)ECUpdateAngleEnd, (IMP *)&ECOriginalUpdateAngleEnd);
-        ECLogLine([NSString stringWithFormat:@"observe aim=%d cueBall=%d pos=%d spot=%d rad=%d origin=%d scale=%d vec=%d",
-                   aimOK, cueBallOK, posOK, spotOK, radOK, originOK, scaleOK, angleVecOK]);
+        ECLogLine([NSString stringWithFormat:@"observe aim=%d cueBall=%d pos=%d spot=%d rad=%d origin=%d",
+                   aimOK, cueBallOK, posOK, spotOK, radOK, originOK]);
         ECDumpClassSelectors(visualCue, @"visualCue");
         ECDumpClassSelectors(NSClassFromString(@"VisualCueWide"), @"visualCueWide");
         ECDumpClassSelectors(userInfo, @"userInfoClass");
@@ -935,47 +911,8 @@ static ECDPoint ECReadDPoint(id object, NSString *name) {
     return point;
 }
 
-static id ECTableFromManager(id manager);
-
 static ECDBox ECDefaultTableBox(void) {
     return (ECDBox){-127.0, -63.5, 127.0, 63.5};
-}
-
-static void ECCaptureTableBox(id manager) {
-    if (isfinite(gECTableBox.minX) && (gECTableBox.maxX - gECTableBox.minX) > 10) return;
-    id table = ECTableFromManager(manager);
-    if (!table) {
-        gECTableBox = ECDefaultTableBox();
-        return;
-    }
-    @try {
-        SEL selector = NSSelectorFromString(@"tableBounds");
-        if ([table respondsToSelector:selector]) {
-            NSMethodSignature *signature = [table methodSignatureForSelector:selector];
-            NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
-            invocation.selector = selector;
-            invocation.target = table;
-            [invocation invoke];
-            double raw[4] = {0, 0, 0, 0};
-            [invocation getReturnValue:raw];
-            ECDBox originSize = {raw[0], raw[1], raw[0] + raw[2], raw[1] + raw[3]};
-            ECDBox minMax = {MIN(raw[0], raw[2]), MIN(raw[1], raw[3]), MAX(raw[0], raw[2]), MAX(raw[1], raw[3])};
-            BOOL originWide = (originSize.maxX - originSize.minX) > 20 && (originSize.maxY - originSize.minY) > 10;
-            gECTableBox = originWide ? originSize : minMax;
-            static BOOL logged = NO;
-            if (!logged) {
-                logged = YES;
-                ECLogLine([NSString stringWithFormat:@"table-bounds raw=%.2f,%.2f,%.2f,%.2f box=%.1f,%.1f,%.1f,%.1f",
-                           raw[0], raw[1], raw[2], raw[3],
-                           gECTableBox.minX, gECTableBox.minY, gECTableBox.maxX, gECTableBox.maxY]);
-            }
-        }
-    } @catch (NSException *exception) {
-        ECLogLine([NSString stringWithFormat:@"table-bounds %@", exception]);
-    }
-    if (!isfinite(gECTableBox.minX) || (gECTableBox.maxX - gECTableBox.minX) < 10) {
-        gECTableBox = ECDefaultTableBox();
-    }
 }
 
 static BOOL ECLooksLikeObject(id object) {
@@ -1193,7 +1130,6 @@ static void ECTracePath(ECDPoint start, ECDPoint direction, ECDBox box, double r
 
 - (void)attachToWindow:(UIWindow *)window {
     if (!window || gECOverlayDead) return;
-    gECRenderHost = ECRenderView(window);
     self.frame = window.bounds;
     if (self.superview != window) {
         [self removeFromSuperview];
@@ -1206,21 +1142,7 @@ static void ECTracePath(ECDPoint start, ECDPoint direction, ECDBox box, double r
 
 - (CGPoint)mapPoint:(ECDPoint)world box:(ECDBox)box {
     ECDBox rails = (isfinite(gECTableBox.minX) && (gECTableBox.maxX - gECTableBox.minX) > 10) ? gECTableBox : box;
-    CGRect felt = ECFeltRectInView(self, gECRenderHost);
-    CGPoint origin = gECCachedVisualOrigin;
-    UIView *from = gECRenderHost;
-    CGPoint center = origin;
-    if (from && from != self && from != self.window && isfinite(origin.x) && isfinite(origin.y)) {
-        center = [self convertPoint:origin fromView:from];
-    }
-    BOOL originOK = isfinite(center.x) && isfinite(center.y) &&
-        CGRectContainsPoint(CGRectInset(felt, 18, 12), center) &&
-        fabs(center.x - CGRectGetMidX(felt)) < felt.size.width * 0.12 &&
-        fabs(center.y - CGRectGetMidY(felt)) < felt.size.height * 0.12;
-    if (originOK && gECVisualScale >= 0.05) {
-        return CGPointMake(center.x + world.x * gECVisualScale, center.y - world.y * gECVisualScale);
-    }
-    return ECWorldToFelt(world, rails, felt);
+    return ECWorldToFelt(world, rails, ECFeltRectInView(self, nil));
 }
 
 - (void)updateFromCache {
@@ -1229,7 +1151,6 @@ static void ECTracePath(ECDPoint start, ECDPoint direction, ECDBox box, double r
             [self clearPaths];
             return;
         }
-        if (self.window) gECRenderHost = ECRenderView(self.window);
         if (isnan(gECCachedAngle) || gECCachedSnapCount < 1) {
             static BOOL emptyLogged = NO;
             if (!emptyLogged) {
@@ -1320,7 +1241,7 @@ static void ECTracePath(ECDPoint start, ECDPoint direction, ECDBox box, double r
         static BOOL dumped = NO;
         if (!dumped) {
             dumped = YES;
-            CGRect felt = ECFeltRectInView(self, gECRenderHost);
+            CGRect felt = ECFeltRectInView(self, nil);
             ECLogLine([NSString stringWithFormat:@"overlay-phys snaps=%d angle=%.3f dir=%.2f,%.2f cue=%.2f,%.2f hit=%d origin=%.1f,%.1f vscale=%.2f box=%.1f,%.1f,%.1f,%.1f bounds=%.0fx%.0f felt=%.0f,%.0f,%.0fx%.0f host=%@",
                        obstacleCount, gECCachedAngle, dir.x, dir.y, cue.x, cue.y, hitIndex,
                        gECCachedVisualOrigin.x, gECCachedVisualOrigin.y, gECVisualScale,
