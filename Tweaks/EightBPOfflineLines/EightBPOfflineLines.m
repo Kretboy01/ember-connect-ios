@@ -49,6 +49,7 @@ static inline ECDPoint ECMakePoint(double x, double y) { return (ECDPoint){x, y}
 static float gECCachedAngle = NAN;
 static ECDPoint gECAimDir = {NAN, NAN};
 static id gECCachedCueBall = nil;
+static id gECCachedTable = nil;
 static id gECCachedBalls[20];
 static ECSnap gECCachedSnaps[20];
 static int gECCachedSnapCount = 0;
@@ -98,6 +99,8 @@ static int gECWindowHits = 0;
 static __weak UIView *gECGLView = nil;
 static id gECRingTexture = nil;
 static int gECVisualLog = 0;
+static int gECReparentLog = 0;
+static int gECHiddenLog = 0;
 static const void *kECMarkerKey = &kECMarkerKey;
 
 // Ring geometry. The drawn band stops EC_RING_INSET short of the texture edge,
@@ -373,6 +376,9 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECGLView = nil;
     gECWindowHits = 0;
     gECVisualLog = 0;
+    gECReparentLog = 0;
+    gECHiddenLog = 0;
+    gECCachedTable = nil;
     memset(gECHasWindow, 0, sizeof(gECHasWindow));
     ECRemoveBallMarkers();
     ECStripUIKitOverlay();
@@ -545,6 +551,8 @@ static void ECSetAimAngle(id self, SEL selector, double angle) {
 static id ECGetCueBallHook(id self, SEL selector) {
     id ball = ECOriginalGetCueBall ? ECOriginalGetCueBall(self, selector) : nil;
     if (ball) gECCachedCueBall = ball;
+    // This is hooked on Table, so self is the table that owns mBallsPotted.
+    if (self) gECCachedTable = self;
     return ball;
 }
 
@@ -706,11 +714,19 @@ static void ECStripUIKitOverlay(void) {
     }
 }
 
-// Do not gate on Ball onTable: that is state 1..2, but setState: also uses 2
-// and 4 to move the sphere between _clothClippingNode and _notClippingNode, so
-// plenty of in-play balls sit outside that range. updateVisualBall sets the
-// sphere's own visibility from state != 0, so mirroring the sphere is both
-// correct for potted balls and immune to the state enum.
+// Neither Ball onTable nor the sphere's visible flag survives a shot: onTable
+// is state 1..2 while setState: also uses 2 and 4 just to swap the sphere
+// between _clothClippingNode and _notClippingNode, and the visible flag gets
+// cleared while the balls are in motion. Table keeps an explicit mBallsPotted
+// list, which is the game's own record of what has actually been potted, so it
+// says nothing about motion and cannot flip back on its own.
+static BOOL ECBallIsPotted(id ball) {
+    if (!gECCachedTable || !ball) return NO;
+    id potted = ECIvarObject(gECCachedTable, "mBallsPotted");
+    if (![potted isKindOfClass:NSArray.class]) return NO;
+    return [(NSArray *)potted indexOfObjectIdenticalTo:ball] != NSNotFound;
+}
+
 static BOOL ECSphereVisible(id sphere) {
     if (![sphere respondsToSelector:@selector(visible)]) return YES;
     return ((BOOL (*)(id, SEL))objc_msgSend)(sphere, @selector(visible));
@@ -750,7 +766,7 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
     id sphere = ECVisualSphere(ball);
     if (!ECLooksLikeObject(sphere)) return;
     id existing = objc_getAssociatedObject(ball, kECMarkerKey);
-    if (!ECSphereVisible(sphere)) {
+    if (ECBallIsPotted(ball)) {
         ECSetMarkerVisible(existing, NO);
         return;
     }
@@ -759,6 +775,11 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
     id parent = ECInvokeId(sphere, @"parent");
     if (!ECLooksLikeObject(parent)) {
         ECSetMarkerVisible(existing, NO);
+        if (existing && gECHiddenLog < 12) {
+            gECHiddenLog++;
+            ECLogLine([NSString stringWithFormat:@"ring-hidden slot=%d noparent sphereVisible=%d",
+                       ECSlotForBall(ball), ECSphereVisible(sphere)]);
+        }
         return;
     }
     CGPoint pos = CGPointZero;
@@ -842,12 +863,19 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
             }
         }
     }
+    // setState: re-parents the sphere between the clipping nodes, so the ring
+    // has to be moved across with it or it is left behind on the old node.
     id markerParent = ECInvokeId(marker, @"parent");
     if (markerParent != parent && [parent respondsToSelector:@selector(addChild:z:)]) {
         if ([marker respondsToSelector:@selector(removeFromParent)]) {
             ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
         }
         ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, 800);
+        if (gECReparentLog < 12) {
+            gECReparentLog++;
+            ECLogLine([NSString stringWithFormat:@"ring-reparent slot=%d from=%@ to=%@ sphereVisible=%d",
+                       slot, [markerParent class], [parent class], ECSphereVisible(sphere)]);
+        }
     }
 }
 
