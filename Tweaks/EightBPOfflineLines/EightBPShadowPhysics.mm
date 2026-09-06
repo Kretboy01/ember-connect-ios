@@ -26,6 +26,78 @@
 #define EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI 1
 #endif
 
+struct NativePoint {
+    double x;
+    double y;
+};
+
+struct NativeNumber {
+    double value;
+    NativeNumber() : value(0.0) {}
+    explicit NativeNumber(double input) : value(input) {}
+    NativeNumber(const NativeNumber &other) : value(other.value) {}
+    ~NativeNumber() {}
+};
+
+struct NativeRect {
+    NativePoint origin;
+    NativePoint size;
+};
+
+struct NativeVectorHeader {
+    const NativePoint *begin;
+    const NativePoint *end;
+    const NativePoint *capacity;
+};
+
+using EightBPShadowPointVector = std::vector<NativePoint>;
+
+#if EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI
+@interface ECEightBPShadowTableProperties : NSObject {
+@public
+    EightBPShadowPointVector _pockets;
+    double _pocketRadius;
+}
+- (const EightBPShadowPointVector *)getPockets;
+- (NativeNumber)getPocketRadius;
+@end
+
+@implementation ECEightBPShadowTableProperties
+- (const EightBPShadowPointVector *)getPockets { return &_pockets; }
+- (NativeNumber)getPocketRadius { return NativeNumber(_pocketRadius); }
+@end
+
+@interface ECEightBPShadowQueryFacade : NSObject {
+@public
+    NSArray *_shadowBalls;
+    EightBPShadowPointVector _tableShape;
+    NativeRect _bounds;
+    BOOL _fast;
+    ECEightBPShadowTableProperties *_properties;
+    BOOL _unexpectedRunnerCall;
+}
+- (NSArray *)balls;
+- (BOOL)isFastComputationEnabled;
+- (NativeRect)tableBounds;
+- (const EightBPShadowPointVector *)tableShape;
+- (id)tableProperties;
+- (void)addToBallRunner:(id)ball playSound:(BOOL)playSound;
+@end
+
+@implementation ECEightBPShadowQueryFacade
+- (NSArray *)balls { return _shadowBalls; }
+- (BOOL)isFastComputationEnabled { return _fast; }
+- (NativeRect)tableBounds { return _bounds; }
+- (const EightBPShadowPointVector *)tableShape { return &_tableShape; }
+- (id)tableProperties { return _properties; }
+- (void)addToBallRunner:(id)ball playSound:(BOOL)playSound {
+    (void)ball;
+    (void)playSound;
+    _unexpectedRunnerCall = YES;
+}
+@end
+#endif
+
 namespace {
 
 constexpr uintptr_t kFindCollision = 0x10000C9C8ULL;
@@ -52,30 +124,6 @@ constexpr uint16_t kMaximumFrames = 3600;
 constexpr uint16_t kMaximumEvents = 512;
 constexpr uint16_t kMaximumZeroTimeEvents = 8;
 constexpr auto kWallTimeLimit = std::chrono::milliseconds(60);
-
-struct NativePoint {
-    double x;
-    double y;
-};
-
-struct NativeNumber {
-    double value;
-    NativeNumber() : value(0.0) {}
-    explicit NativeNumber(double input) : value(input) {}
-    NativeNumber(const NativeNumber &other) : value(other.value) {}
-    ~NativeNumber() {}
-};
-
-struct NativeRect {
-    NativePoint origin;
-    NativePoint size;
-};
-
-struct NativeVectorHeader {
-    const NativePoint *begin;
-    const NativePoint *end;
-    const NativePoint *capacity;
-};
 
 struct FrictionProperties {
     double values[7];
@@ -410,52 +458,6 @@ static bool ValidateInputSurface(NSObject *table, NSObject *cueBall, const void 
 }
 
 #if EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI
-
-using PointVector = std::vector<NativePoint>;
-
-@interface ECEightBPShadowTableProperties : NSObject {
-@public
-    PointVector _pockets;
-    double _pocketRadius;
-}
-- (const PointVector *)getPockets;
-- (NativeNumber)getPocketRadius;
-@end
-
-@implementation ECEightBPShadowTableProperties
-- (const PointVector *)getPockets { return &_pockets; }
-- (NativeNumber)getPocketRadius { return NativeNumber(_pocketRadius); }
-@end
-
-@interface ECEightBPShadowQueryFacade : NSObject {
-@public
-    NSArray *_shadowBalls;
-    PointVector _tableShape;
-    NativeRect _bounds;
-    BOOL _fast;
-    ECEightBPShadowTableProperties *_properties;
-    BOOL _unexpectedRunnerCall;
-}
-- (NSArray *)balls;
-- (BOOL)isFastComputationEnabled;
-- (NativeRect)tableBounds;
-- (const PointVector *)tableShape;
-- (id)tableProperties;
-- (void)addToBallRunner:(id)ball playSound:(BOOL)playSound;
-@end
-
-@implementation ECEightBPShadowQueryFacade
-- (NSArray *)balls { return _shadowBalls; }
-- (BOOL)isFastComputationEnabled { return _fast; }
-- (NativeRect)tableBounds { return _bounds; }
-- (const PointVector *)tableShape { return &_tableShape; }
-- (id)tableProperties { return _properties; }
-- (void)addToBallRunner:(id)ball playSound:(BOOL)playSound {
-    (void)ball;
-    (void)playSound;
-    _unexpectedRunnerCall = YES;
-}
-@end
 
 struct ShadowBall {
     __strong NSObject *live = nil;
