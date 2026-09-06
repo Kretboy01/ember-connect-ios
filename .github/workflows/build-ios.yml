@@ -104,7 +104,8 @@ jobs:
           file BuiltTweaks/FlappyPractice.dylib
           xcrun otool -L BuiltTweaks/FlappyPractice.dylib
 
-          # EightBPOfflineLines — native 8 Ball Pool aim-range extension, offline guarded
+          # EightBPOfflineLines — colored ball rings + extended native aim lines (offline)
+          # Shadow rebound prediction is paused under Tweaks/EightBPOfflineLines/paused/
           xcrun --sdk iphoneos clang \
             -arch arm64 \
             -miphoneos-version-min=15.0 \
@@ -112,13 +113,11 @@ jobs:
             -fblocks \
             -dynamiclib \
             Tweaks/Shared/EmberMenu.m \
-            Tweaks/EightBPOfflineLines/EightBPShadowPhysics.mm \
             Tweaks/EightBPOfflineLines/EightBPOfflineLines.m \
             -framework Foundation \
             -framework UIKit \
             -framework QuartzCore \
             -framework CoreGraphics \
-            -lc++ \
             -install_name @rpath/EightBPOfflineLines.dylib \
             -o BuiltTweaks/EightBPOfflineLines.dylib
 
