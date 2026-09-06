@@ -1418,6 +1418,46 @@ static double ECShotSpeedForCuePower(double cuePower, double cueForce) {
     return cueForce * (1.0 - sqrt(1.0 - normalizedPower));
 }
 
+static BOOL ECTrimNativeGuideToStoppingDistance(void *guide, double stoppingDistance,
+                                                double *nativeHitDistanceOut) {
+    if (!guide || !isfinite(stoppingDistance) || stoppingDistance < 0.0) return NO;
+
+    // VisualGuide 56.29.2 stores the distance returned by Table's native
+    // collision raycast at +0x48 and the corresponding rendered start/end
+    // points at +0xb0/+0xc0.  Both pairs describe the same world-space ray;
+    // converting by their ratio preserves the game's own table/camera scale.
+    uint8_t *bytes = (uint8_t *)guide;
+    if (bytes[0x98] != 1) return NO;
+
+    double hitDistance = NAN;
+    ECDPoint start = {NAN, NAN};
+    ECDPoint end = {NAN, NAN};
+    memcpy(&hitDistance, bytes + 0x48, sizeof(hitDistance));
+    memcpy(&start, bytes + 0xb0, sizeof(start));
+    memcpy(&end, bytes + 0xc0, sizeof(end));
+    if (nativeHitDistanceOut) *nativeHitDistanceOut = hitDistance;
+    if (!isfinite(hitDistance) || hitDistance <= 0.0 ||
+        !ECPointValid(start) || !ECPointValid(end) ||
+        stoppingDistance >= hitDistance) return NO;
+
+    double fraction = fmax(0.0, fmin(1.0, stoppingDistance / hitDistance));
+    ECDPoint physicalEnd = {
+        start.x + (end.x - start.x) * fraction,
+        start.y + (end.y - start.y) * fraction,
+    };
+    memcpy(bytes + 0xc0, &physicalEnd, sizeof(physicalEnd));
+    memcpy(bytes + 0x48, &stoppingDistance, sizeof(stoppingDistance));
+
+    // The collision lies beyond the cue ball's physical stopping point, so
+    // suppress the native collision marker and outgoing ball/cue paths while
+    // retaining the primary segment (the +0x98 valid-path flag).
+    bytes[0x32] = 0;
+    bytes[0x33] = 0;
+    bytes[0x99] = 0;
+    bytes[0x9a] = 0;
+    return YES;
+}
+
 static void ECUpdatePhysicsGuideForCue(id visualCue) {
     if (!visualCue || !ECExtensionIsActive() || !ECNativePhysicsSurfaceValid()) return;
 
@@ -1438,12 +1478,30 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     double predictedDistance = ECPhysicsStoppingDistance(initialSpeed, friction);
     if (!isfinite(predictedDistance) || predictedDistance < 0.0) return;
 
-    *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = predictedDistance;
-
     void *guide = ECRawPointerIvar(visualCue, "mVisualGuide");
+    double nativeHitDistance = NAN;
+    BOOL stoppedBeforeCollision = NO;
     if (guide) {
         void (*refresh)(void *) = (void (*)(void *))ECGameAddress(EC_VISUAL_GUIDE_REFRESH_ADDRESS);
+
+        // First let the game resolve the real first ball/cushion intersection.
+        // Its stock guide always draws that whole segment, regardless of cue
+        // power; the physics distance is applied to that exact native ray below.
+        *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = predictedDistance;
         refresh(guide);
+        stoppedBeforeCollision = ECTrimNativeGuideToStoppingDistance(
+            guide, predictedDistance, &nativeHitDistance);
+
+        if (!stoppedBeforeCollision && isfinite(nativeHitDistance) &&
+            nativeHitDistance >= 0.0) {
+            // Once the cue ball can reach the collision, only its remaining
+            // physical travel budget belongs to the native outgoing paths.
+            // Refreshing with that budget prevents the pre-contact distance
+            // from being counted again after impact.
+            double remainingDistance = fmax(0.0, predictedDistance - nativeHitDistance);
+            *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = remainingDistance;
+            refresh(guide);
+        }
     }
 
     static CFTimeInterval lastLogTime = 0;
@@ -1452,8 +1510,9 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         fabs(predictedDistance - gECLastPredictedDistance) > 40.0) {
         lastLogTime = now;
         ECLogLine([NSString stringWithFormat:
-            @"physics-guide power=%.5f cueForce=%.3f speed=%.3f distance=%.3f eq=%.8f slide=%.3f roll=%.3f nativeAim=%.3f",
+            @"physics-guide power=%.5f cueForce=%.3f speed=%.3f distance=%.3f hit=%.3f preStop=%d eq=%.8f slide=%.3f roll=%.3f nativeAim=%.3f",
             cuePower, cueForce, initialSpeed, predictedDistance,
+            nativeHitDistance, stoppedBeforeCollision,
             friction[3], friction[4], friction[5], gECNativeAimDistance]);
     }
     gECLastPredictedDistance = predictedDistance;
