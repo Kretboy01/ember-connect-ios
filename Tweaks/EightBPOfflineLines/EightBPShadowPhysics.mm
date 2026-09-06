@@ -95,6 +95,7 @@ using EightBPShadowCollisionVector = std::vector<CollisionPtr>;
     BOOL _shotResultsInitialized;
     FrictionProperties _friction;
     EightBPShadowCollisionVector _collisions;
+    __unsafe_unretained NSObject *_liveTable;
 }
 - (NSArray *)balls;
 - (BOOL)isFastComputationEnabled;
@@ -110,6 +111,7 @@ using EightBPShadowCollisionVector = std::vector<CollisionPtr>;
 - (EightBPShadowCollisionVector *)collisions;
 - (void)checkValidCushionShotCollision:(void *)event;
 - (void)addToBallRunner:(id)ball playSound:(BOOL)playSound;
+- (id)ruleset;
 @end
 
 @implementation ECEightBPShadowQueryFacade
@@ -134,6 +136,12 @@ using EightBPShadowCollisionVector = std::vector<CollisionPtr>;
     // no-op — aborting here was discarding legitimate multi-cushion events.
     (void)ball;
     (void)playSound;
+}
+- (id)ruleset {
+    if (_liveTable && [_liveTable respondsToSelector:@selector(ruleset)]) {
+        return ((id (*)(id, SEL))objc_msgSend)(_liveTable, @selector(ruleset));
+    }
+    return nil;
 }
 - (void)dealloc {
     _collisions.clear();
@@ -929,6 +937,7 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
         }
 
         ECEightBPShadowQueryFacade *facade = [ECEightBPShadowQueryFacade new];
+        facade->_liveTable = table;
         facade->_shadowBalls = [clones copy];
         // Use the full query path. The fast path depends on mutable runner
         // bookkeeping that intentionally is not copied into the detached world.
@@ -954,11 +963,12 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
         SetStatus(prediction->status, "shadow stage 3/4: table geometry copied");
         FrictionProperties friction = {};
         std::memcpy(friction.values, frictionValues, sizeof(friction.values));
-        // Later friction / virtual resolvers ask this pointer for balls and
-        // table properties. Pointing at the live Table made the first contact
-        // look right (clones still had the aim-time pose) then leaked live
-        // positions into every rebound after that.
-        friction.table = facade;
+        // Friction's table pointer is only used for ruleset / constants.
+        // Keep the live Table here: pointing the whole facade at it made
+        // [table ruleset] throw and cleared the overlay. Collision queries
+        // already run against the facade, which now forwards ruleset.
+        facade->_liveTable = table;
+        friction.table = table;
         facade->_friction = friction;
 
         const auto started = std::chrono::steady_clock::now();
