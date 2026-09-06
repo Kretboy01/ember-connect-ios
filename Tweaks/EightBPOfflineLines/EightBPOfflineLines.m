@@ -57,7 +57,6 @@ static void ECHideReachedLandingMarker(id ball);
 static void ECClearTableOverlay(void);
 static void ECSyncTableOverlay(void);
 static void ECClearAimContactMarker(void);
-static void ECSyncAimContactCircle(void *guide, BOOL reachable, ECDPoint contact);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -68,6 +67,7 @@ static BOOL ECPointValid(ECDPoint p);
 static BOOL ECReadPointIvar(id object, const char *name, CGPoint *valueOut);
 static ECDPoint ECNorm(ECDPoint point);
 static ECDBox ECDefaultTableBox(void);
+static void ECSyncAimContactCircle(void *guide, BOOL reachable, ECDPoint contact);
 
 static inline ECDPoint ECMakePoint(double x, double y) { return (ECDPoint){x, y}; }
 
@@ -2296,8 +2296,8 @@ static void ECClearAimContactMarker(void) {
 static id ECStruckBallFromGuide(void *guide) {
     if (!guide) return nil;
     Class ballClass = NSClassFromString(@"Ball");
-    id struck = nil;
-    memcpy(&struck, (uint8_t *)guide + 0x18, sizeof(struck));
+    __unsafe_unretained id struck = nil;
+    memcpy((void *)&struck, (uint8_t *)guide + 0x18, sizeof(struck));
     if (ECLooksLikeObject(struck) && struck != gECCachedCueBall &&
         ballClass && [struck isKindOfClass:ballClass] && !ECBallIsPotted(struck)) {
         return struck;
