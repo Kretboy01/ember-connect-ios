@@ -91,6 +91,7 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
 - (NativeRect)tableBounds;
 - (NativeNumber)combinedBallRadiusSquared;
 - (void *)shotResults;
+- (id)ballPottedCallback;
 - (const EightBPShadowPointVector *)tableShape;
 - (id)tableProperties;
 - (void)addToBallRunner:(id)ball playSound:(BOOL)playSound;
@@ -104,6 +105,7 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
     return NativeNumber(_combinedBallRadiusSquared);
 }
 - (void *)shotResults { return _shotResults; }
+- (id)ballPottedCallback { return nil; }
 - (const EightBPShadowPointVector *)tableShape { return &_tableShape; }
 - (id)tableProperties { return _properties; }
 - (void)addToBallRunner:(id)ball playSound:(BOOL)playSound {
@@ -935,8 +937,13 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
                         return false;
                     }
                     using Resolver = void (*)(id, id, FrictionProperties *, bool);
+                    // The real collision-event resolver at 0x100064C74 passes
+                    // true here. Cursor used false, which is the lightweight
+                    // VisualGuide path and skips the live shot's post-impact
+                    // adjustment. That preserved the perfect cue approach but
+                    // sent object-ball destinations down the wrong branches.
                     reinterpret_cast<Resolver>(SlidAddress(kResolveBallBall, slide))(
-                        a, b, &friction, false);
+                        a, b, &friction, true);
                 } else if (vtable == reinterpret_cast<uintptr_t>(
                                SlidAddress(kBallLineVTable, slide)) ||
                            vtable == reinterpret_cast<uintptr_t>(
