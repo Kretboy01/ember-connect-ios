@@ -1324,6 +1324,9 @@ static id ECIvarObject(id object, const char *name) {
 #define EC_GAME_AIM_ADDRESS ((uintptr_t)0x10451A808ULL)
 #define EC_VISUAL_GUIDE_REFRESH_ADDRESS ((uintptr_t)0x100185B24ULL)
 #define EC_VISUAL_GUIDE_REFRESH_OPCODE ((uint32_t)0x3940C008U)
+#define EC_FRICTION_SLIDING_GETTER_ADDRESS ((uintptr_t)0x100300ECCULL)
+#define EC_FRICTION_ROLLING_GETTER_ADDRESS ((uintptr_t)0x100300EFCULL)
+#define EC_FRICTION_GETTER_OPCODE ((uint32_t)0xD10083FFU)
 
 static intptr_t ECGameImageSlide(void) {
     static intptr_t slide = 0;
@@ -1349,7 +1352,44 @@ static void *ECGameAddress(uintptr_t preferredAddress) {
 
 static BOOL ECNativePhysicsSurfaceValid(void) {
     uint32_t *refresh = ECGameAddress(EC_VISUAL_GUIDE_REFRESH_ADDRESS);
-    return refresh && *refresh == EC_VISUAL_GUIDE_REFRESH_OPCODE;
+    uint32_t *slidingGetter = ECGameAddress(EC_FRICTION_SLIDING_GETTER_ADDRESS);
+    uint32_t *rollingGetter = ECGameAddress(EC_FRICTION_ROLLING_GETTER_ADDRESS);
+    return refresh && *refresh == EC_VISUAL_GUIDE_REFRESH_OPCODE &&
+           slidingGetter && *slidingGetter == EC_FRICTION_GETTER_OPCODE &&
+           rollingGetter && *rollingGetter == EC_FRICTION_GETTER_OPCODE;
+}
+
+#if defined(__arm64__)
+// The game's C++ MCNumber return ABI writes the eight-byte result through x8.
+// Bridge a normal C call (object/result/function in x0/x1/x2) into that ABI so
+// prediction uses the same modifier-aware friction getters as Ball physics.
+__attribute__((naked, noinline))
+static void ECInvokeMCNumberGetter(void *object, double *result, void *function) {
+    __asm__ volatile(
+        "mov x8, x1\n"
+        "br x2\n"
+    );
+}
+#endif
+
+static BOOL ECEffectiveFrictionFactors(double *friction, double *slidingOut,
+                                       double *rollingOut) {
+    if (!friction || !slidingOut || !rollingOut || !ECNativePhysicsSurfaceValid()) return NO;
+#if defined(__arm64__)
+    double sliding = NAN;
+    double rolling = NAN;
+    ECInvokeMCNumberGetter(friction, &sliding,
+                           ECGameAddress(EC_FRICTION_SLIDING_GETTER_ADDRESS));
+    ECInvokeMCNumberGetter(friction, &rolling,
+                           ECGameAddress(EC_FRICTION_ROLLING_GETTER_ADDRESS));
+    if (!isfinite(sliding) || sliding <= 0.0 ||
+        !isfinite(rolling) || rolling <= 0.0) return NO;
+    *slidingOut = sliding;
+    *rollingOut = rolling;
+    return YES;
+#else
+    return NO;
+#endif
 }
 
 static BOOL ECReadDoubleIvar(id object, const char *name, double *valueOut) {
@@ -1382,7 +1422,8 @@ static void ECCaptureNativeCueStats(void) {
     if (isfinite(value) && value > 0.0 && value < 64.0) gECNativeAimDistance = value;
 }
 
-static double ECPhysicsStoppingDistance(double speed, const double *friction) {
+static double ECPhysicsStoppingDistance(double speed, const double *friction,
+                                        double slidingReduction, double rollingReduction) {
     if (!friction || !isfinite(speed) || speed <= 0.0) return 0.0;
 
     // FrictionProperties is constructed by the game as:
@@ -1391,8 +1432,6 @@ static double ECPhysicsStoppingDistance(double speed, const double *friction) {
     //   +0x28 velocityReductionRollingFactor
     // These are the exact precomputed factors consumed by the table physics.
     double equilibriumFactor = friction[3];
-    double slidingReduction = friction[4];
-    double rollingReduction = friction[5];
     if (!isfinite(equilibriumFactor) || equilibriumFactor <= 0.0 ||
         !isfinite(slidingReduction) || slidingReduction <= 0.0 ||
         !isfinite(rollingReduction) || rollingReduction <= 0.0) return NAN;
@@ -1474,8 +1513,13 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     double cueForce = *(double *)ECGameAddress(EC_GAME_FORCE_ADDRESS);
     if (!isfinite(cueForce) || cueForce <= 0.0) return;
 
+    double effectiveSliding = NAN;
+    double effectiveRolling = NAN;
+    if (!ECEffectiveFrictionFactors((double *)friction, &effectiveSliding, &effectiveRolling)) return;
+
     double initialSpeed = ECShotSpeedForCuePower(cuePower, cueForce);
-    double predictedDistance = ECPhysicsStoppingDistance(initialSpeed, friction);
+    double predictedDistance = ECPhysicsStoppingDistance(
+        initialSpeed, friction, effectiveSliding, effectiveRolling);
     if (!isfinite(predictedDistance) || predictedDistance < 0.0) return;
 
     void *guide = ECRawPointerIvar(visualCue, "mVisualGuide");
@@ -1510,10 +1554,11 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         fabs(predictedDistance - gECLastPredictedDistance) > 40.0) {
         lastLogTime = now;
         ECLogLine([NSString stringWithFormat:
-            @"physics-guide power=%.5f cueForce=%.3f speed=%.3f distance=%.3f hit=%.3f preStop=%d eq=%.8f slide=%.3f roll=%.3f nativeAim=%.3f",
+            @"physics-guide power=%.5f cueForce=%.3f speed=%.3f distance=%.3f hit=%.3f preStop=%d eq=%.8f slide=%.3f/%.3f roll=%.3f/%.3f nativeAim=%.3f",
             cuePower, cueForce, initialSpeed, predictedDistance,
             nativeHitDistance, stoppedBeforeCollision,
-            friction[3], friction[4], friction[5], gECNativeAimDistance]);
+            friction[3], friction[4], effectiveSliding,
+            friction[5], effectiveRolling, gECNativeAimDistance]);
     }
     gECLastPredictedDistance = predictedDistance;
 }
