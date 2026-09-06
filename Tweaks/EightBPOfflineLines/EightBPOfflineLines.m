@@ -44,6 +44,7 @@ typedef struct { double minX, minY, maxX, maxY; } ECDBox;
 typedef struct { ECDPoint pos; double radius; } ECSnap;
 
 static BOOL ECPointValid(ECDPoint p);
+static BOOL ECReadPointIvar(id object, const char *name, CGPoint *valueOut);
 
 static inline ECDPoint ECMakePoint(double x, double y) { return (ECDPoint){x, y}; }
 
@@ -858,20 +859,32 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
     // ProjectedSphere is a 3D node, so its contentSize is 0x0 and cannot size
     // the ring. updateVisualBall builds the sphere position as
     //   visual = mVisualTableOrigin + physics * scale
-    // with one scale for every ball, so measure that scale once from a ball far
-    // enough from the origin that the division is well conditioned. Measuring
-    // per ball is what made some rings tiny and others huge: balls sitting near
-    // the origin divide by a near-zero physics coordinate.
-    if (visualFresh) {
+    // with one scale for the whole table. Lock that scale once per rack, using
+    // this ball's own origin. The previous code kept replacing a shared scale
+    // while using whichever ball happened to update the global origin last;
+    // that drove marker scales from 0.43 down to 0.06-0.10 and made the rings
+    // appear to vanish and return as different balls updated.
+    if (visualFresh && gECDerivedVisualScale <= 0.2) {
         ECDPoint phys = ECBallLivePosition(ball);
-        CGPoint origin = gECCachedVisualOrigin;
-        if (ECPointValid(phys) && isfinite(origin.x) && isfinite(origin.y)) {
+        CGPoint origin = CGPointMake(NAN, NAN);
+        if (ECPointValid(phys) && ECReadPointIvar(ball, "mVisualTableOrigin", &origin)) {
             BOOL useX = fabs(phys.x) >= fabs(phys.y);
             double denom = useX ? phys.x : phys.y;
             double delta = useX ? (pos.x - origin.x) : (pos.y - origin.y);
             if (fabs(denom) >= 20.0) {
                 double candidate = delta / denom;
-                if (candidate > 0.2 && candidate < 20.0) gECDerivedVisualScale = candidate;
+                // These are the two scale constants read from updateVisualBall
+                // in 56.29.2. Snap only a close live measurement to one of
+                // them, then never let moving balls mutate ring size again.
+                const double compactScale = 1.7007874015748;
+                const double expandedScale = 3.11811023622047;
+                double compactError = fabs(candidate - compactScale) / compactScale;
+                double expandedError = fabs(candidate - expandedScale) / expandedScale;
+                if (compactError < 0.02 || expandedError < 0.02) {
+                    gECDerivedVisualScale = compactError <= expandedError ? compactScale : expandedScale;
+                    ECLogLine([NSString stringWithFormat:@"ring-scale-locked %.13f measured=%.6f",
+                               gECDerivedVisualScale, candidate]);
+                }
             }
         }
     }
@@ -1302,6 +1315,19 @@ static id ECIvarObject(id object, const char *name) {
     const char *type = ivar_getTypeEncoding(ivar);
     if (!type || type[0] != '@') return nil;
     return object_getIvar(object, ivar);
+}
+
+// Read a CGPoint value ivar without treating it as an Objective-C object.
+// Ball keeps its own mVisualTableOrigin, so using a process-wide copy can pair
+// one ball's physics position with another ball's origin while the rack is
+// animating and produce a bogus visual scale.
+static BOOL ECReadPointIvar(id object, const char *name, CGPoint *valueOut) {
+    if (!object || !name || !valueOut) return NO;
+    Ivar ivar = class_getInstanceVariable([object class], name);
+    if (!ivar) return NO;
+    const uint8_t *bytes = (const uint8_t *)(__bridge const void *)object;
+    memcpy(valueOut, bytes + ivar_getOffset(ivar), sizeof(*valueOut));
+    return isfinite(valueOut->x) && isfinite(valueOut->y);
 }
 
 static BOOL ECIsGLNamed(NSString *name) {
