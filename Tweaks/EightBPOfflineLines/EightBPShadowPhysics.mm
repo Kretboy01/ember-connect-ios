@@ -756,7 +756,7 @@ static uintptr_t CanonicalVTable(const CollisionPtr &event) {
 // and the state transitions that suppress zero-time re-hits.
 static bool ResolveEventVirtually(const CollisionPtr &event,
                                   ECEightBPShadowQueryFacade *facade,
-                                  const std::vector<ShadowBall> &shadowBalls,
+                                  std::vector<ShadowBall> &shadowBalls,
                                   intptr_t slide,
                                   char *status) {
     if (!event || !facade) {
