@@ -259,12 +259,24 @@ static bool HasIvarAtOffset(Class cls, ptrdiff_t offset, char requiredType) {
     return found;
 }
 
+static const char *SkipObjCTypeQualifiers(const char *type) {
+    if (!type) return type;
+    // ObjC encodings can prefix const/in/out/byref/etc. before the real type.
+    // tableShape is encoded as r^v, so the first character is 'r', not '^'.
+    while (*type == 'r' || *type == 'n' || *type == 'N' || *type == 'o' ||
+           *type == 'O' || *type == 'R' || *type == 'V') {
+        ++type;
+    }
+    return type;
+}
+
 static bool MethodReturns(Class cls, SEL selector, const char *allowedPrefixes) {
     Method method = class_getInstanceMethod(cls, selector);
     if (!method) return false;
     char returnType[64] = {};
     method_getReturnType(method, returnType, sizeof(returnType));
-    return returnType[0] && std::strchr(allowedPrefixes, returnType[0]) != nullptr;
+    const char *type = SkipObjCTypeQualifiers(returnType);
+    return type && type[0] && std::strchr(allowedPrefixes, type[0]) != nullptr;
 }
 
 static bool NamedIvarUsable(Class cls, const char *name, const char *allowedTypes,
@@ -448,16 +460,34 @@ static bool ValidateInputSurface(NSObject *table, NSObject *cueBall, const void 
     SEL boundsSelector = NSSelectorFromString(@"tableBounds");
     SEL fastSelector = NSSelectorFromString(@"isFastComputationEnabled");
     Class tableClass = NSClassFromString(@"Table");
-    if (!tableClass || ![table isKindOfClass:tableClass] ||
-        ![table respondsToSelector:ballsSelector] || ![table respondsToSelector:shapeSelector] ||
-        ![table respondsToSelector:propertiesSelector] || ![table respondsToSelector:boundsSelector] ||
-        ![table respondsToSelector:fastSelector] ||
-        !MethodReturns([table class], ballsSelector, "@") ||
-        !MethodReturns([table class], shapeSelector, "^") ||
-        !MethodReturns([table class], propertiesSelector, "@") ||
-        !MethodReturns([table class], boundsSelector, "{") ||
+    if (!tableClass || ![table isKindOfClass:tableClass]) {
+        SetStatus(status, "Table class gate failed");
+        return false;
+    }
+    if (![table respondsToSelector:ballsSelector] ||
+        !MethodReturns([table class], ballsSelector, "@")) {
+        SetStatus(status, "Table.balls selector gate failed");
+        return false;
+    }
+    if (![table respondsToSelector:shapeSelector] ||
+        !MethodReturns([table class], shapeSelector, "^")) {
+        SetStatus(status, "Table.tableShape selector gate failed");
+        return false;
+    }
+    if (![table respondsToSelector:propertiesSelector] ||
+        !MethodReturns([table class], propertiesSelector, "@")) {
+        SetStatus(status, "Table.tableProperties selector gate failed");
+        return false;
+    }
+    if (![table respondsToSelector:boundsSelector] ||
+        !MethodReturns([table class], boundsSelector, "{")) {
+        SetStatus(status, "Table.tableBounds selector gate failed");
+        return false;
+    }
+    // Fast-computation is optional; VisualGuide uses it when present.
+    if ([table respondsToSelector:fastSelector] &&
         !MethodReturns([table class], fastSelector, "Bc")) {
-        SetStatus(status, "Table query selector gate failed");
+        SetStatus(status, "Table.isFastComputationEnabled selector gate failed");
         return false;
     }
     NSArray *balls = ((id (*)(id, SEL))objc_msgSend)(table, ballsSelector);
