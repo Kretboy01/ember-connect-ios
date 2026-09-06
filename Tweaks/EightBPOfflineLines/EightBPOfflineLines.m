@@ -1,5 +1,5 @@
-// EightBPOfflineLines.m — native guideline extension for local 8 Ball Pool.
-// Active in Practice, Play Offline, and Pass and Play / hotseat. Network matches stay locked.
+// EightBPOfflineLines.m — native guideline extension for 8 Ball Pool.
+// Local-only lock is temporarily off so networked friendlies can use the same lines.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -311,23 +311,8 @@ static void ECApplyAimValues(void) {
     ECDumpAimIvars(ECFindGameManager(), @"gameManager");
 }
 
-// Network matches stay locked. Pass and Play is isOnLocalGame / hotseat, not
-// isOnOfflineGame, which is why the first build never extended the line.
+// Temporary: allow every match type, including networked friendlies.
 static BOOL ECIsLocalMatch(void) {
-    id manager = ECFindGameManager();
-    if (ECInvokeBool(manager, @"isOnNetworkedGame", NO)) return NO;
-    if (!manager) {
-        // Aim getters only run during a shot. If we cannot read GameManager yet,
-        // allow the extension so Pass and Play is not stuck waiting on onEnter.
-        return YES;
-    }
-    if (ECInvokeBool(manager, @"isOnOfflineGame", NO)) return YES;
-    if (ECInvokeBool(manager, @"isOnPracticeGame", NO)) return YES;
-    if (ECInvokeBool(manager, @"isOnLocalGame", NO)) return YES;
-    if (ECInvokeBool(manager, @"isOnOfflineMode", NO)) return YES;
-    if (ECInvokeBool(manager, @"isOnHotSeatGame", NO)) return YES;
-    if (ECInvokeBool(manager, @"isHotSeat", NO)) return YES;
-    if (ECInvokeBool(manager, @"hotSeat", NO)) return YES;
     return YES;
 }
 
@@ -3203,16 +3188,6 @@ static void ECRequestOverlayRedraw(void) {
     ECWriteStatus(@"setting-changed");
 }
 
-- (void)showOfflineLockedMessage {
-    UIViewController *presenter = [self topViewController];
-    if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Network match"
-        message:@"Extended lines stay locked during online matches. Use Pass and Play, Practice, or Play Offline."
-        preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-    [presenter presentViewController:alert animated:YES completion:nil];
-}
-
 - (void)closePanel {
     [self.panel removeFromSuperview];
     self.panel = nil;
@@ -3229,7 +3204,7 @@ static void ECRequestOverlayRedraw(void) {
     EmberMenuPanel *panel = self.panel;
     if (!panel) return;
     [panel clearRows];
-    [panel setStatus:ECIsLocalMatch() ? @"OFFLINE PHYSICS READY" : @"NETWORK MODE LOCKED"];
+    [panel setStatus:@"PHYSICS READY"];
     [panel setFooter:@"EMBER TOOLKIT  |  8 Ball Pool 56.29.2"];
     [panel addSection:@"SHOT PREDICTION"];
 
@@ -3265,10 +3240,6 @@ static void ECRequestOverlayRedraw(void) {
 
 - (void)tapped {
     ECFindGameManager();
-    if (!ECIsLocalMatch()) {
-        [self showOfflineLockedMessage];
-        return;
-    }
     UIWindow *host = self.hostWindow ?: [self guestWindow];
     if (!host) return;
     [self closePanel];
