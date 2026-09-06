@@ -58,6 +58,15 @@ struct NativeVectorHeader {
 
 using EightBPShadowPointVector = std::vector<NativePoint>;
 
+struct FrictionProperties {
+    double values[7];
+    __unsafe_unretained NSObject *table;
+};
+
+struct Collision;
+using CollisionPtr = std::shared_ptr<Collision>;
+using EightBPShadowCollisionVector = std::vector<CollisionPtr>;
+
 #if EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI
 @interface ECEightBPShadowTableProperties : NSObject {
 @public
@@ -84,7 +93,8 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
     alignas(8) uint8_t _shotResults[232];
     void (*_shotResultsDestructor)(void *);
     BOOL _shotResultsInitialized;
-    BOOL _unexpectedRunnerCall;
+    FrictionProperties _friction;
+    EightBPShadowCollisionVector _collisions;
 }
 - (NSArray *)balls;
 - (BOOL)isFastComputationEnabled;
@@ -94,6 +104,11 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
 - (id)ballPottedCallback;
 - (const EightBPShadowPointVector *)tableShape;
 - (id)tableProperties;
+- (FrictionProperties *)frictionProperties;
+- (id)ballBallCollisionEvent;
+- (id)ballCushionCollisionEvent;
+- (EightBPShadowCollisionVector *)collisions;
+- (void)checkValidCushionShotCollision:(void *)event;
 - (void)addToBallRunner:(id)ball playSound:(BOOL)playSound;
 @end
 
@@ -108,12 +123,20 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
 - (id)ballPottedCallback { return nil; }
 - (const EightBPShadowPointVector *)tableShape { return &_tableShape; }
 - (id)tableProperties { return _properties; }
+- (FrictionProperties *)frictionProperties { return &_friction; }
+- (id)ballBallCollisionEvent { return self; }
+- (id)ballCushionCollisionEvent { return self; }
+- (EightBPShadowCollisionVector *)collisions { return &_collisions; }
+- (void)checkValidCushionShotCollision:(void *)event { (void)event; }
 - (void)addToBallRunner:(id)ball playSound:(BOOL)playSound {
+    // findCollision calls this when a state-2 ball is re-queued. The shadow
+    // world already queries every live clone each frame, so membership is a
+    // no-op — aborting here was discarding legitimate multi-cushion events.
     (void)ball;
     (void)playSound;
-    _unexpectedRunnerCall = YES;
 }
 - (void)dealloc {
+    _collisions.clear();
     if (_shotResultsInitialized && _shotResultsDestructor) {
         _shotResultsDestructor(_shotResults);
         _shotResultsInitialized = NO;
@@ -150,14 +173,9 @@ constexpr uint16_t kMaximumFrames = 3600;
 constexpr uint16_t kMaximumEvents = 512;
 constexpr uint16_t kMaximumZeroTimeEvents = 8;
 constexpr auto kWallTimeLimit = std::chrono::milliseconds(60);
-
-struct FrictionProperties {
-    double values[7];
-    __unsafe_unretained NSObject *table;
-};
-
-struct Collision;
-using CollisionPtr = std::shared_ptr<Collision>;
+// Physics block + classification/state/number. findCollision's state==2 path
+// mutates setState:/stop outside the 0x58 physics bytes.
+constexpr size_t kBallQueryRestoreSpan = 0xB2 - 0x20;
 
 struct NativeGate {
     uintptr_t address;
@@ -722,6 +740,84 @@ static NSObject *EventBall(const CollisionPtr &event, ptrdiff_t offset) {
     return value;
 }
 
+static uintptr_t CanonicalSlid(uintptr_t preferred, intptr_t slide) {
+    constexpr uintptr_t kCanonicalAddressMask = 0x0000FFFFFFFFFFFFULL;
+    return reinterpret_cast<uintptr_t>(SlidAddress(preferred, slide)) & kCanonicalAddressMask;
+}
+
+static uintptr_t CanonicalVTable(const CollisionPtr &event) {
+    constexpr uintptr_t kCanonicalAddressMask = 0x0000FFFFFFFFFFFFULL;
+    return EventVTable(event) & kCanonicalAddressMask;
+}
+
+// Match Table's fixed-step runner at 0x10000d5f8: call the collision event's
+// own virtual resolver (vtable[+0x10]) with the detached table facade. The
+// low-level bounce helpers skip ShotResults bookkeeping, collision history,
+// and the state transitions that suppress zero-time re-hits.
+static bool ResolveEventVirtually(const CollisionPtr &event,
+                                  ECEightBPShadowQueryFacade *facade,
+                                  const std::vector<ShadowBall> &shadowBalls,
+                                  intptr_t slide,
+                                  char *status) {
+    if (!event || !facade) {
+        SetStatus(status, "virtual collision resolve missing event/facade");
+        return false;
+    }
+
+    auto owns = [&shadowBalls](NSObject *candidate) {
+        return candidate && std::any_of(shadowBalls.begin(), shadowBalls.end(),
+            [candidate](const ShadowBall &entry) { return entry.clone == candidate; });
+    };
+
+    const uintptr_t vtable = CanonicalVTable(event);
+    uintptr_t resolver = 0;
+    const bool pocket = vtable == CanonicalSlid(kBallPocketVTable, slide);
+    if (vtable == CanonicalSlid(kBallBallVTable, slide)) {
+        NSObject *a = EventBall(event, 0x28);
+        NSObject *b = EventBall(event, 0x38);
+        if (!owns(a) || !owns(b)) {
+            SetStatus(status, "ball-ball event escaped shadow ownership");
+            return false;
+        }
+        resolver = kBallBallVirtualResolver;
+    } else if (vtable == CanonicalSlid(kBallLineVTable, slide) ||
+               vtable == CanonicalSlid(kBallPointVTable, slide)) {
+        NSObject *ball = EventBall(event, 0x28);
+        if (!owns(ball)) {
+            SetStatus(status, "cushion event escaped shadow ownership");
+            return false;
+        }
+        resolver = (vtable == CanonicalSlid(kBallLineVTable, slide))
+            ? kBallLineVirtualResolver
+            : kBallPointVirtualResolver;
+    } else if (pocket) {
+        NSObject *ball = EventBall(event, 0x28);
+        auto entry = std::find_if(shadowBalls.begin(), shadowBalls.end(),
+            [ball](const ShadowBall &candidate) { return candidate.clone == ball; });
+        if (entry == shadowBalls.end()) {
+            SetStatus(status, "pocket event escaped shadow ownership");
+            return false;
+        }
+        // Full pocket virtual needs a live ballPottedCallback / UI pipeline.
+        // Mirror the physics half: setState:2, clear motion, mark inactive.
+        ((void (*)(id, SEL, int))objc_msgSend)(ball, @selector(setState:), 2);
+        entry->active = false;
+        entry->potted = true;
+        WritePoint(entry->clone, 0x30, {});
+        std::memset(reinterpret_cast<uint8_t *>((__bridge void *)entry->clone) + 0x48,
+                    0, 24);
+        RecordPoint(*entry);
+        return true;
+    } else {
+        SetStatus(status, "unknown collision vtable; prediction aborted");
+        return false;
+    }
+
+    using Resolver = void (*)(void *, id);
+    reinterpret_cast<Resolver>(SlidAddress(resolver, slide))(event.get(), facade);
+    return true;
+}
+
 #endif
 
 } // namespace
@@ -859,6 +955,7 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
         FrictionProperties friction = {};
         std::memcpy(friction.values, frictionValues, sizeof(friction.values));
         friction.table = table;
+        facade->_friction = friction;
 
         const auto started = std::chrono::steady_clock::now();
         uint16_t zeroTimeEvents = 0;
@@ -872,19 +969,21 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
             while (remaining > kEventEpsilon) {
                 CollisionPtr earliest;
                 double earliestTime = remaining + 1.0;
-                std::array<uint8_t, 0x58 * EightBPShadowMaxBalls> beforeQuery = {};
+                std::array<uint8_t, kBallQueryRestoreSpan * EightBPShadowMaxBalls> beforeQuery = {};
                 for (size_t index = 0; index < shadowBalls.size(); ++index) {
                     ShadowBall &ball = shadowBalls[index];
                     if (!ball.active) continue;
-                    uint8_t *physics = reinterpret_cast<uint8_t *>(
+                    uint8_t *native = reinterpret_cast<uint8_t *>(
                         (__bridge void *)ball.clone) + 0x20;
-                    std::memcpy(beforeQuery.data() + index * 0x58, physics, 0x58);
+                    std::memcpy(beforeQuery.data() + index * kBallQueryRestoreSpan,
+                                native, kBallQueryRestoreSpan);
                     CollisionPtr candidate = QueryCollision(facade, ball.clone, remaining, slide);
                     if (!firstQueryCompleted) {
                         firstQueryCompleted = true;
                         SetStatus(prediction->status, "shadow stage 4/4: native collision query returned");
                     }
-                    std::memcpy(physics, beforeQuery.data() + index * 0x58, 0x58);
+                    std::memcpy(native, beforeQuery.data() + index * kBallQueryRestoreSpan,
+                                kBallQueryRestoreSpan);
                     if (!candidate) continue;
                     double time = EventTime(candidate);
                     if (!std::isfinite(time) || time < -kEventEpsilon ||
@@ -924,73 +1023,8 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
                     return false;
                 }
 
-                const uintptr_t vtable = EventVTable(earliest);
-                if (vtable == reinterpret_cast<uintptr_t>(SlidAddress(kBallBallVTable, slide))) {
-                    NSObject *a = EventBall(earliest, 0x28);
-                    NSObject *b = EventBall(earliest, 0x38);
-                    auto owns = [&shadowBalls](NSObject *candidate) {
-                        return std::any_of(shadowBalls.begin(), shadowBalls.end(),
-                            [candidate](const ShadowBall &entry) { return entry.clone == candidate; });
-                    };
-                    if (!owns(a) || !owns(b)) {
-                        SetStatus(prediction->status, "ball-ball event escaped shadow ownership");
-                        return false;
-                    }
-                    using Resolver = void (*)(id, id, FrictionProperties *, bool);
-                    // The real collision-event resolver at 0x100064C74 passes
-                    // true here. Cursor used false, which is the lightweight
-                    // VisualGuide path and skips the live shot's post-impact
-                    // adjustment. That preserved the perfect cue approach but
-                    // sent object-ball destinations down the wrong branches.
-                    reinterpret_cast<Resolver>(SlidAddress(kResolveBallBall, slide))(
-                        a, b, &friction, true);
-                } else if (vtable == reinterpret_cast<uintptr_t>(
-                               SlidAddress(kBallLineVTable, slide)) ||
-                           vtable == reinterpret_cast<uintptr_t>(
-                               SlidAddress(kBallPointVTable, slide))) {
-                    NSObject *ball = EventBall(earliest, 0x28);
-                    double normalAngle = NAN;
-                    if (vtable == reinterpret_cast<uintptr_t>(
-                                      SlidAddress(kBallLineVTable, slide))) {
-                        std::memcpy(&normalAngle,
-                            reinterpret_cast<const uint8_t *>(earliest.get()) + 0x30,
-                            sizeof(normalAngle));
-                    } else {
-                        NativePoint point = {};
-                        std::memcpy(&point,
-                            reinterpret_cast<const uint8_t *>(earliest.get()) + 0x30,
-                            sizeof(point));
-                        NativePoint position = ReadPoint(ball, 0x20);
-                        normalAngle = std::atan2(point.y - position.y, point.x - position.x);
-                    }
-                    if (!ball || !std::isfinite(normalAngle)) {
-                        SetStatus(prediction->status, "invalid cushion collision payload");
-                        return false;
-                    }
-                    using Resolver = void (*)(id, FrictionProperties *, const double *);
-                    reinterpret_cast<Resolver>(SlidAddress(kResolveCushion, slide))(
-                        ball, &friction, &normalAngle);
-                } else if (vtable == reinterpret_cast<uintptr_t>(
-                               SlidAddress(kBallPocketVTable, slide))) {
-                    NSObject *ball = EventBall(earliest, 0x28);
-                    auto entry = std::find_if(shadowBalls.begin(), shadowBalls.end(),
-                        [ball](const ShadowBall &candidate) { return candidate.clone == ball; });
-                    if (entry == shadowBalls.end()) {
-                        SetStatus(prediction->status, "pocket event escaped shadow ownership");
-                        return false;
-                    }
-                    entry->active = false;
-                    entry->potted = true;
-                    WritePoint(entry->clone, 0x30, {});
-                    std::memset(reinterpret_cast<uint8_t *>((__bridge void *)entry->clone) + 0x48,
-                                0, 24);
-                    RecordPoint(*entry);
-                } else {
-                    SetStatus(prediction->status, "unknown collision vtable; prediction aborted");
-                    return false;
-                }
-                if (facade->_unexpectedRunnerCall) {
-                    SetStatus(prediction->status, "native query attempted a table-runner callback");
+                if (!ResolveEventVirtually(earliest, facade, shadowBalls, slide,
+                                           prediction->status)) {
                     return false;
                 }
             }
@@ -998,7 +1032,7 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
             bool moving = false;
             for (ShadowBall &ball : shadowBalls) {
                 if (!ball.active) continue;
-                ApplyFriction(ball.clone, &friction, kLogicalFrameTime, slide);
+                ApplyFriction(ball.clone, &facade->_friction, kLogicalFrameTime, slide);
                 NativePoint velocity = ReadPoint(ball.clone, 0x30);
                 double spin[3] = {};
                 std::memcpy(spin,
