@@ -6,6 +6,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
 #import <math.h>
 #import <string.h>
 #import <stdint.h>
@@ -25,6 +26,9 @@ static BOOL gECOverlayAllowed = NO;
 static BOOL gECOverlayDead = NO;
 static NSInteger gECMultiplier = 8;
 static BOOL gECHooksInstalled = NO;
+static __weak id gECActiveVisualCue = nil;
+static double gECNativeAimDistance = NAN;
+static double gECLastPredictedDistance = NAN;
 
 @class EmberEightBPLineOverlay;
 @class EmberEightBPOfflineLinesController;
@@ -38,6 +42,8 @@ static void ECClearPotted(id ball);
 static int ECSlotForBall(id ball);
 static BOOL ECLooksLikeObject(id object);
 static id ECIvarObject(id object, const char *name);
+static void ECUpdatePhysicsGuideForCue(id visualCue);
+static void ECCaptureNativeCueStats(void);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -85,6 +91,7 @@ static void (*ECOriginalSetHideGuidelinesMode)(id, SEL, BOOL) = NULL;
 static BOOL (*ECOriginalNoGuidelinesOffline)(id, SEL) = NULL;
 static BOOL (*ECOriginalFixedGuidelines)(id, SEL) = NULL;
 static void (*ECOriginalApplyCueStatsForShot)(id, SEL, int, int, int) = NULL;
+static void (*ECOriginalVisualCueSetPower)(id, SEL, const void *) = NULL;
 static void (*ECOriginalSetAimAngle)(id, SEL, double) = NULL;
 static id (*ECOriginalGetCueBall)(id, SEL) = NULL;
 static void (*ECOriginalBallSetPosition)(id, SEL, ECDPoint) = NULL;
@@ -365,6 +372,9 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECInMatch = NO;
     gECOverlayAllowed = NO;
     gECOverlayDead = NO;
+    gECActiveVisualCue = nil;
+    gECNativeAimDistance = NAN;
+    gECLastPredictedDistance = NAN;
     gECCachedAngle = NAN;
     gECAimDir = (ECDPoint){NAN, NAN};
     gECCachedCueBall = nil;
@@ -449,25 +459,12 @@ static void ECSetHideGuidelinesMode(id self, SEL selector, BOOL value) {
     if (ECOriginalSetHideGuidelinesMode) ECOriginalSetHideGuidelinesMode(self, selector, forced);
 }
 
-// 56.29.2 builds guide length from CueStats.aim (IIII = force, aim, spin, time),
-// applied through applyCueStatsForShot:aim:spin:. UserInfo low/high ratios are unused at draw.
-static unsigned int ECTargetCueAim(void) {
-    if (gECMultiplier >= 8) return 1000;
-    if (gECMultiplier >= 4) return 200;
-    if (gECMultiplier >= 2) return 80;
-    return 0;
-}
-
-static ECCueStats ECBoostCueStats(ECCueStats stats, NSString *label, int cueId) {
+static ECCueStats ECObserveCueStats(ECCueStats stats, NSString *label, int cueId) {
     static BOOL logged = NO;
     if (!logged) {
         logged = YES;
         ECLogLine([NSString stringWithFormat:@"%@ id=%d force=%u aim=%u spin=%u time=%u",
                    label, cueId, stats.force, stats.aim, stats.spin, stats.time]);
-    }
-    if (ECExtensionIsActive()) {
-        unsigned int target = ECTargetCueAim();
-        if (target > stats.aim) stats.aim = target;
     }
     return stats;
 }
@@ -475,28 +472,28 @@ static ECCueStats ECBoostCueStats(ECCueStats stats, NSString *label, int cueId) 
 static ECCueStats ECGetCueStats(id self, SEL selector, int cueId) {
     ECCueStats stats = {0, 0, 0, 0};
     if (ECOriginalGetCueStats) stats = ECOriginalGetCueStats(self, selector, cueId);
-    return ECBoostCueStats(stats, @"getCueStats", cueId);
+    return ECObserveCueStats(stats, @"getCueStats", cueId);
 }
 
 static ECCueStats ECGetCueStatsWithBonus(id self, SEL selector, int cueId) {
     ECCueStats stats = {0, 0, 0, 0};
     if (ECOriginalGetCueStatsWithBonus) stats = ECOriginalGetCueStatsWithBonus(self, selector, cueId);
-    return ECBoostCueStats(stats, @"getCueStatsWithBonus", cueId);
+    return ECObserveCueStats(stats, @"getCueStatsWithBonus", cueId);
 }
 
 static void ECApplyCueStatsForShot(id self, SEL selector, int shot, int aim, int spin) {
-    int forcedAim = aim;
-    if (ECExtensionIsActive()) {
-        unsigned int target = ECTargetCueAim();
-        if ((int)target > forcedAim) forcedAim = (int)target;
-        static BOOL logged = NO;
-        if (!logged) {
-            logged = YES;
-            ECLogLine([NSString stringWithFormat:@"applyCueStatsForShot shot=%d aim=%d->%d spin=%d",
-                       shot, aim, forcedAim, spin]);
-        }
-    }
-    if (ECOriginalApplyCueStatsForShot) ECOriginalApplyCueStatsForShot(self, selector, shot, forcedAim, spin);
+    // Preserve the real cue stats. The old implementation replaced `aim` with
+    // an out-of-range value; that made a long line but it was unrelated to the
+    // shot. The native method writes the selected cue's force/aim/spin values
+    // into the physics globals used by both shot execution and VisualGuide.
+    if (ECOriginalApplyCueStatsForShot) ECOriginalApplyCueStatsForShot(self, selector, shot, aim, spin);
+    ECCaptureNativeCueStats();
+}
+
+static void ECVisualCueSetPower(id self, SEL selector, const void *powerValue) {
+    if (ECOriginalVisualCueSetPower) ECOriginalVisualCueSetPower(self, selector, powerValue);
+    gECActiveVisualCue = self;
+    ECUpdatePhysicsGuideForCue(self);
 }
 
 static BOOL ECShowCueBallTrajectory(id self, SEL selector) {
@@ -1145,6 +1142,8 @@ static void ECInstallHooks(void) {
         Class visualCue = NSClassFromString(@"VisualCue");
         Class table = NSClassFromString(@"Table");
         Class ball = NSClassFromString(@"Ball");
+        BOOL powerOK = ECHookIMP(visualCue, NSSelectorFromString(@"setPower:"),
+                                 (IMP)ECVisualCueSetPower, (IMP *)&ECOriginalVisualCueSetPower);
         BOOL aimOK = NO;
         BOOL cueBallOK = ECHookIMP(table, NSSelectorFromString(@"getCueBall"),
                                   (IMP)ECGetCueBallHook, (IMP *)&ECOriginalGetCueBall);
@@ -1198,9 +1197,9 @@ static void ECInstallHooks(void) {
                                  (IMP)ECFixedGuidelines, (IMP *)&ECOriginalFixedGuidelines)) break;
         }
 
-        gECHooksInstalled = lowOK && highOK && (statsOK || applyOK);
-        ECLogLine([NSString stringWithFormat:@"hook enter=%d exit=%d low=%d high=%d setLow=%d setHigh=%d stats=%d bonus=%d apply=%d gm=%@ user=%@",
-                   enterOK, exitOK, lowOK, highOK, setLowOK, setHighOK, statsOK, bonusOK, applyOK, gameManager, userInfo]);
+        gECHooksInstalled = lowOK && highOK && powerOK && applyOK;
+        ECLogLine([NSString stringWithFormat:@"hook enter=%d exit=%d low=%d high=%d setLow=%d setHigh=%d stats=%d bonus=%d apply=%d power=%d gm=%@ user=%@",
+                   enterOK, exitOK, lowOK, highOK, setLowOK, setHighOK, statsOK, bonusOK, applyOK, powerOK, gameManager, userInfo]);
         ECWriteStatus(gECHooksInstalled ? @"hooks-installed" : @"incompatible-runtime");
     });
 }
@@ -1315,6 +1314,137 @@ static id ECIvarObject(id object, const char *name) {
     const char *type = ivar_getTypeEncoding(ivar);
     if (!type || type[0] != '@') return nil;
     return object_getIvar(object, ivar);
+}
+
+// 56.29.2 preferred addresses. These are not guessed rendering constants:
+// applyCueStatsForShot writes the selected cue's live force/aim/spin values at
+// these locations, and the real shot code reads the force value before it
+// applies velocity to the cue ball. ASLR is resolved from GameManager's image.
+#define EC_GAME_FORCE_ADDRESS ((uintptr_t)0x10451A7F8ULL)
+#define EC_GAME_AIM_ADDRESS ((uintptr_t)0x10451A808ULL)
+#define EC_VISUAL_GUIDE_REFRESH_ADDRESS ((uintptr_t)0x100185B24ULL)
+#define EC_VISUAL_GUIDE_REFRESH_OPCODE ((uint32_t)0x3940C008U)
+
+static intptr_t ECGameImageSlide(void) {
+    static intptr_t slide = 0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *gameImage = class_getImageName(NSClassFromString(@"GameManager"));
+        uint32_t count = _dyld_image_count();
+        for (uint32_t i = 0; i < count; i++) {
+            const char *candidate = _dyld_get_image_name(i);
+            if (gameImage && candidate && strcmp(gameImage, candidate) == 0) {
+                slide = _dyld_get_image_vmaddr_slide(i);
+                return;
+            }
+        }
+        if (count > 0) slide = _dyld_get_image_vmaddr_slide(0);
+    });
+    return slide;
+}
+
+static void *ECGameAddress(uintptr_t preferredAddress) {
+    return (void *)(preferredAddress + (uintptr_t)ECGameImageSlide());
+}
+
+static BOOL ECNativePhysicsSurfaceValid(void) {
+    uint32_t *refresh = ECGameAddress(EC_VISUAL_GUIDE_REFRESH_ADDRESS);
+    return refresh && *refresh == EC_VISUAL_GUIDE_REFRESH_OPCODE;
+}
+
+static BOOL ECReadDoubleIvar(id object, const char *name, double *valueOut) {
+    if (!object || !name || !valueOut) return NO;
+    Ivar ivar = class_getInstanceVariable([object class], name);
+    if (!ivar) return NO;
+    const char *type = ivar_getTypeEncoding(ivar) ?: "";
+    if (type[0] != 'd' && !strstr(type, "MCNumber")) return NO;
+    const uint8_t *bytes = (const uint8_t *)(__bridge const void *)object;
+    memcpy(valueOut, bytes + ivar_getOffset(ivar), sizeof(*valueOut));
+    return isfinite(*valueOut);
+}
+
+static void *ECRawPointerIvar(id object, const char *name) {
+    if (!object || !name) return NULL;
+    Ivar ivar = class_getInstanceVariable([object class], name);
+    if (!ivar) return NULL;
+    const uint8_t *bytes = (const uint8_t *)(__bridge const void *)object;
+    void *pointer = NULL;
+    memcpy(&pointer, bytes + ivar_getOffset(ivar), sizeof(pointer));
+    return pointer;
+}
+
+static void ECCaptureNativeCueStats(void) {
+    if (!ECNativePhysicsSurfaceValid()) return;
+    double value = *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS);
+    // The game's 56.29.2 aim table spans roughly 10.3–23.3 world units.
+    // Keep only sane values written by the original stats method, never one of
+    // our prediction values from an earlier frame.
+    if (isfinite(value) && value > 0.0 && value < 64.0) gECNativeAimDistance = value;
+}
+
+static double ECPhysicsStoppingDistance(double speed, const double *friction) {
+    if (!friction || !isfinite(speed) || speed <= 0.0) return 0.0;
+
+    // FrictionProperties is constructed by the game as:
+    //   +0x18 timeOfequilibriumFactor
+    //   +0x20 velocityReductionSlidingFactor
+    //   +0x28 velocityReductionRollingFactor
+    // These are the exact precomputed factors consumed by the table physics.
+    double equilibriumFactor = friction[3];
+    double slidingReduction = friction[4];
+    double rollingReduction = friction[5];
+    if (!isfinite(equilibriumFactor) || equilibriumFactor <= 0.0 ||
+        !isfinite(slidingReduction) || slidingReduction <= 0.0 ||
+        !isfinite(rollingReduction) || rollingReduction <= 0.0) return NAN;
+
+    // A centre cue strike begins in sliding state, reaches pure roll at the
+    // engine's equilibrium time, then decelerates under rolling friction.
+    double slideTime = speed * equilibriumFactor;
+    double rollingSpeed = fmax(0.0, speed - slidingReduction * slideTime);
+    double slidingDistance = 0.5 * (speed + rollingSpeed) * slideTime;
+    double rollingDistance = (rollingSpeed * rollingSpeed) / (2.0 * rollingReduction);
+    return slidingDistance + rollingDistance;
+}
+
+static void ECUpdatePhysicsGuideForCue(id visualCue) {
+    if (!visualCue || !ECExtensionIsActive() || !ECNativePhysicsSurfaceValid()) return;
+
+    double cuePower = 0.0;
+    if (!ECReadDoubleIvar(visualCue, "mPower", &cuePower)) return;
+    id table = ECIvarObject(visualCue, "mTable");
+    if (!table) table = gECCachedTable;
+    if (!table) return;
+
+    Ivar frictionIvar = class_getInstanceVariable([table class], "_frictionProperties");
+    if (!frictionIvar) return;
+    const uint8_t *tableBytes = (const uint8_t *)(__bridge const void *)table;
+    const double *friction = (const double *)(tableBytes + ivar_getOffset(frictionIvar));
+    double cueForce = *(double *)ECGameAddress(EC_GAME_FORCE_ADDRESS);
+    if (!isfinite(cueForce) || cueForce <= 0.0) return;
+
+    double initialSpeed = cuePower * cueForce;
+    double predictedDistance = ECPhysicsStoppingDistance(initialSpeed, friction);
+    if (!isfinite(predictedDistance) || predictedDistance < 0.0) return;
+
+    *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = predictedDistance;
+
+    void *guide = ECRawPointerIvar(visualCue, "mVisualGuide");
+    if (guide) {
+        void (*refresh)(void *) = (void (*)(void *))ECGameAddress(EC_VISUAL_GUIDE_REFRESH_ADDRESS);
+        refresh(guide);
+    }
+
+    static CFTimeInterval lastLogTime = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (!isfinite(gECLastPredictedDistance) || now - lastLogTime > 0.35 ||
+        fabs(predictedDistance - gECLastPredictedDistance) > 40.0) {
+        lastLogTime = now;
+        ECLogLine([NSString stringWithFormat:
+            @"physics-guide power=%.5f cueForce=%.3f speed=%.3f distance=%.3f eq=%.8f slide=%.3f roll=%.3f nativeAim=%.3f",
+            cuePower, cueForce, initialSpeed, predictedDistance,
+            friction[3], friction[4], friction[5], gECNativeAimDistance]);
+    }
+    gECLastPredictedDistance = predictedDistance;
 }
 
 // Read a CGPoint value ivar without treating it as an Objective-C object.
@@ -1770,6 +1900,10 @@ static void ECRequestOverlayRedraw(void) {
     gECMultiplier = multiplier;
     [NSUserDefaults.standardUserDefaults setInteger:multiplier forKey:ECMultiplierKey];
     ECRefreshNativeGuide();
+    id cue = gECActiveVisualCue;
+    if (!cue) cue = ECIvarObject(ECFindGameManager(), "mVisualCue");
+    if (!cue) cue = ECIvarObject(ECFindGameManager(), "_visualCue");
+    ECUpdatePhysicsGuideForCue(cue);
     [self updateButton];
     ECWriteStatus(@"setting-changed");
 }
@@ -1792,16 +1926,17 @@ static void ECRequestOverlayRedraw(void) {
     }
     UIViewController *presenter = [self topViewController];
     if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Extended lines"
-        message:@"Longer native aim line for Pass and Play / practice. Off in online matches."
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Physics guideline"
+        message:@"Uses the live cue force and this table's sliding/rolling physics to predict shot travel. Offline modes only."
         preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
-    for (NSNumber *value in @[@1, @2, @4, @8]) {
-        NSInteger multiplier = value.integerValue;
-        NSString *label = multiplier == 1 ? @"Off" : [NSString stringWithFormat:@"%ldx length%@", (long)multiplier,
-            multiplier == gECMultiplier ? @"  ✓" : @""];
+    for (NSNumber *value in @[@1, @8]) {
+        NSInteger mode = value.integerValue;
+        BOOL selected = (mode == 1) == (gECMultiplier <= 1);
+        NSString *label = [NSString stringWithFormat:@"%@%@",
+            mode == 1 ? @"Off" : @"Physics prediction", selected ? @"  ✓" : @""];
         [menu addAction:[UIAlertAction actionWithTitle:label style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            [weakSelf saveMultiplier:multiplier];
+            [weakSelf saveMultiplier:mode];
         }]];
     }
     [menu addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
@@ -1834,13 +1969,13 @@ static void ECRequestOverlayRedraw(void) {
     NSString *title;
     UIColor *color;
     if (!local) {
-        title = @"LINES 🔒";
+        title = @"GUIDE 🔒";
         color = [UIColor colorWithWhite:0.18 alpha:0.88];
     } else if (gECMultiplier <= 1) {
-        title = @"LINES Off";
+        title = @"GUIDE Off";
         color = [UIColor colorWithRed:0.55 green:0.25 blue:0.08 alpha:0.9];
     } else {
-        title = [NSString stringWithFormat:@"LINES %ldx", (long)gECMultiplier];
+        title = @"GUIDE Auto";
         color = [UIColor colorWithRed:0.08 green:0.42 blue:0.25 alpha:0.92];
     }
     [button setTitle:title forState:UIControlStateNormal];
@@ -1878,7 +2013,7 @@ static void ECRequestOverlayRedraw(void) {
     button.layer.shadowRadius = 4;
     [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
-    button.accessibilityLabel = @"Extended aim lines";
+    button.accessibilityLabel = @"Physics-based aiming guideline";
     [button addTarget:self action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragged:)];
