@@ -267,30 +267,58 @@ static bool MethodReturns(Class cls, SEL selector, const char *allowedPrefixes) 
     return returnType[0] && std::strchr(allowedPrefixes, returnType[0]) != nullptr;
 }
 
-static bool ValidateBallLayout(Class ballClass, intptr_t slide) {
-    if (!ballClass || class_getInstanceSize(ballClass) < 0xB2) return false;
+static bool NamedIvarUsable(Class cls, const char *name, const char *allowedTypes,
+                            ptrdiff_t *offsetOut) {
+    Ivar ivar = class_getInstanceVariable(cls, name);
+    if (!ivar) return false;
+    const char *type = ivar_getTypeEncoding(ivar);
+    if (!type || !type[0] || !std::strchr(allowedTypes, type[0])) return false;
+    if (offsetOut) *offsetOut = ivar_getOffset(ivar);
+    return true;
+}
+
+static bool ValidateBallLayout(Class ballClass, intptr_t slide, char *status) {
+    if (!ballClass) {
+        SetStatus(status, "Ball class missing");
+        return false;
+    }
+    const size_t instanceSize = class_getInstanceSize(ballClass);
+    if (instanceSize < 0xB0) {
+        SetStatus(status, "Ball instance size gate failed");
+        return false;
+    }
     Method initializer = class_getInstanceMethod(
         ballClass, NSSelectorFromString(@"initWithNumber:radius:classification:initialPosition:initialVelocity:"));
     Method move = class_getInstanceMethod(ballClass, NSSelectorFromString(@"move:"));
-    if (!initializer || !move) return false;
-    if (reinterpret_cast<void *>(method_getImplementation(initializer)) !=
-            SlidAddress(kBallInitializer, slide) ||
-        reinterpret_cast<void *>(method_getImplementation(move)) !=
-            SlidAddress(kBallMove, slide)) return false;
-    const char *encoding = method_getTypeEncoding(initializer);
-    if (!encoding || !std::strstr(encoding, "I16") ||
-        !std::strstr(encoding, "MCNumber") || !std::strstr(encoding, "MCNumberPoint")) {
+    if (!initializer || !move) {
+        SetStatus(status, "Ball initializer/move: selectors missing");
         return false;
     }
-
-    return HasIvarAtOffset(ballClass, 0x18, '@') &&
-           HasIvarAtOffset(ballClass, 0x20, '{') &&
-           IvarMatches(ballClass, "classification", 0xA0, "i") &&
-           IvarMatches(ballClass, "state", 0xA4, "i") &&
-           IvarMatches(ballClass, "number", 0xA8, "I") &&
-           HasIvarAtOffset(ballClass, 0xAC, 'I') &&
-           HasIvarAtOffset(ballClass, 0xB0, 'B') &&
-           HasIvarAtOffset(ballClass, 0xB1, 'B');
+    ptrdiff_t visual = 0, physics = 0, classification = 0, state = 0, number = 0;
+    if (!NamedIvarUsable(ballClass, "visualBall", "@", &visual) ||
+        !NamedIvarUsable(ballClass, "classification", "iIqQ", &classification) ||
+        !NamedIvarUsable(ballClass, "state", "iIqQ", &state) ||
+        !NamedIvarUsable(ballClass, "number", "iIqQ", &number)) {
+        SetStatus(status, "Ball named ivar gate failed");
+        return false;
+    }
+    if (!HasIvarAtOffset(ballClass, 0x20, '{') &&
+        !NamedIvarUsable(ballClass, "_physicsProperties", "{", &physics)) {
+        SetStatus(status, "Ball physics block gate failed");
+        return false;
+    }
+    (void)slide;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        char detail[EightBPShadowStatusCapacity];
+        std::snprintf(detail, sizeof(detail),
+                      "Ball layout ok size=%zu vis=%ld class=%ld state=%ld num=%ld",
+                      instanceSize, (long)visual, (long)classification, (long)state,
+                      (long)number);
+        SetStatus(status, detail);
+    }
+    return true;
 }
 
 static bool ValidateVTables(intptr_t slide) {
@@ -371,10 +399,11 @@ static bool ValidateInputSurface(NSObject *table, NSObject *cueBall, const void 
         return false;
     }
     Class ballClass = NSClassFromString(@"Ball");
-    if (![cueBall isKindOfClass:ballClass] || !ValidateBallLayout(ballClass, slide)) {
-        SetStatus(status, "56.29.2 Ball class/ivar/IMP gate failed");
+    if (![cueBall isKindOfClass:ballClass]) {
+        SetStatus(status, "cached cue ball is not a Ball");
         return false;
     }
+    if (!ValidateBallLayout(ballClass, slide, status)) return false;
     if (!ValidateVTables(slide)) {
         SetStatus(status, "56.29.2 collision vtable gate failed");
         return false;
