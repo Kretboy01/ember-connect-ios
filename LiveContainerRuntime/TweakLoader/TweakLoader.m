@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include "utils.h"
 
@@ -86,8 +87,42 @@ static void showDlerrAlert(NSString *error) {
     objc_setAssociatedObject(alert, @"window", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+static void EmberNopReceiptStart(id self, SEL sel) {
+    (void)sel;
+    if ([self respondsToSelector:@selector(cancel)]) {
+        ((void (*)(id, SEL))objc_msgSend)(self, @selector(cancel));
+    }
+}
+
+static void EmberNopRestore(id self, SEL sel) {
+    (void)self;
+    (void)sel;
+}
+
+static void EmberNopRestoreUser(id self, SEL sel, id username) {
+    (void)self;
+    (void)sel;
+    (void)username;
+}
+
+static void EmberSuppressAppleIDPrompts(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class receiptRequest = NSClassFromString(@"SKReceiptRefreshRequest");
+        Method startMethod = receiptRequest ? class_getInstanceMethod(receiptRequest, @selector(start)) : NULL;
+        if (startMethod) method_setImplementation(startMethod, (IMP)EmberNopReceiptStart);
+        Class paymentQueue = NSClassFromString(@"SKPaymentQueue");
+        Method restore = paymentQueue ? class_getInstanceMethod(paymentQueue, @selector(restoreCompletedTransactions)) : NULL;
+        if (restore) method_setImplementation(restore, (IMP)EmberNopRestore);
+        Method restoreUser = paymentQueue ? class_getInstanceMethod(paymentQueue, @selector(restoreCompletedTransactionsWithApplicationUsername:)) : NULL;
+        if (restoreUser) method_setImplementation(restoreUser, (IMP)EmberNopRestoreUser);
+        NSLog(@"[TweakLoader] StoreKit Apple ID prompts suppressed");
+    });
+}
+
  __attribute__((constructor))
 static void TweakLoaderConstructor() {
+    EmberSuppressAppleIDPrompts();
     const char *tweakFolderC = getenv("LC_GLOBAL_TWEAKS_FOLDER");
     NSString *globalTweakFolder = @(tweakFolderC);
     unsetenv("LC_GLOBAL_TWEAKS_FOLDER");

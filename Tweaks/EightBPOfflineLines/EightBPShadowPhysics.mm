@@ -450,12 +450,13 @@ static void WritePoint(NSObject *object, ptrdiff_t offset, NativePoint value) {
 }
 
 static bool ValidateInputSurface(NSObject *table, NSObject *cueBall, const void *guide,
-                                 const double friction[7], char *status, intptr_t *slideOut) {
+                                 const double friction[7], char *status, intptr_t *slideOut,
+                                 bool requireGuide) {
     if (![NSThread isMainThread]) {
         SetStatus(status, "shadow physics requires the main thread");
         return false;
     }
-    if (!table || !cueBall || !guide || !friction) {
+    if (!table || !cueBall || !friction || (requireGuide && !guide)) {
         SetStatus(status, "shadow physics received a null input");
         return false;
     }
@@ -490,26 +491,28 @@ static bool ValidateInputSurface(NSObject *table, NSObject *cueBall, const void 
         return false;
     }
 
-    const auto *guideBytes = static_cast<const uint8_t *>(guide);
-    __unsafe_unretained NSObject *guideTable = nil;
-    __unsafe_unretained NSObject *temporaryCue = nil;
-    __unsafe_unretained NSObject *temporaryObject = nil;
-    std::memcpy(&guideTable, guideBytes + 0x00, sizeof(guideTable));
-    std::memcpy(&temporaryCue, guideBytes + 0x08, sizeof(temporaryCue));
-    std::memcpy(&temporaryObject, guideBytes + 0x10, sizeof(temporaryObject));
-    if (guideTable != table || ![temporaryCue isKindOfClass:ballClass] ||
-        ![temporaryObject isKindOfClass:ballClass] ||
-        ReadInt32(temporaryCue, 0xA0) != 9 || ReadInt32(temporaryObject, 0xA0) != 9) {
-        SetStatus(status, "VisualGuide ownership/classification gate failed");
-        return false;
-    }
-    __unsafe_unretained NSObject *temporaryVisual = nil;
-    std::memcpy(&temporaryVisual,
-                reinterpret_cast<const uint8_t *>((__bridge const void *)temporaryCue) + 0x18,
-                sizeof(temporaryVisual));
-    if (temporaryVisual) {
-        SetStatus(status, "VisualGuide temporary Ball unexpectedly has a visualBall");
-        return false;
+    if (requireGuide) {
+        const auto *guideBytes = static_cast<const uint8_t *>(guide);
+        __unsafe_unretained NSObject *guideTable = nil;
+        __unsafe_unretained NSObject *temporaryCue = nil;
+        __unsafe_unretained NSObject *temporaryObject = nil;
+        std::memcpy(&guideTable, guideBytes + 0x00, sizeof(guideTable));
+        std::memcpy(&temporaryCue, guideBytes + 0x08, sizeof(temporaryCue));
+        std::memcpy(&temporaryObject, guideBytes + 0x10, sizeof(temporaryObject));
+        if (guideTable != table || ![temporaryCue isKindOfClass:ballClass] ||
+            ![temporaryObject isKindOfClass:ballClass] ||
+            ReadInt32(temporaryCue, 0xA0) != 9 || ReadInt32(temporaryObject, 0xA0) != 9) {
+            SetStatus(status, "VisualGuide ownership/classification gate failed");
+            return false;
+        }
+        __unsafe_unretained NSObject *temporaryVisual = nil;
+        std::memcpy(&temporaryVisual,
+                    reinterpret_cast<const uint8_t *>((__bridge const void *)temporaryCue) + 0x18,
+                    sizeof(temporaryVisual));
+        if (temporaryVisual) {
+            SetStatus(status, "VisualGuide temporary Ball unexpectedly has a visualBall");
+            return false;
+        }
     }
 
     SEL ballsSelector = NSSelectorFromString(@"balls");
@@ -619,6 +622,19 @@ static NSObject *ConstructClone(NSObject *live, Class ballClass) {
     std::memcpy(reinterpret_cast<uint8_t *>((__bridge void *)clone) + 0xA0,
                 reinterpret_cast<const uint8_t *>((__bridge const void *)live) + 0xA0, 0x12);
     return clone;
+}
+
+static bool BallIsMoving(NSObject *ball) {
+    if (!ball) return false;
+    NativePoint velocity = ReadPoint(ball, 0x30);
+    double spin[3] = {};
+    std::memcpy(spin,
+        reinterpret_cast<const uint8_t *>((__bridge const void *)ball) + 0x48,
+        sizeof(spin));
+    return std::hypot(velocity.x, velocity.y) > kRestSpeed ||
+           std::fabs(spin[0]) > kRestSpeed ||
+           std::fabs(spin[1]) > kRestSpeed ||
+           std::fabs(spin[2]) > kRestSpeed;
 }
 
 static void RecordPoint(ShadowBall &ball) {
@@ -845,7 +861,7 @@ bool EightBPShadowValidateRuntime(NSObject *table, NSObject *cueBall, const void
                                   const double friction[7],
                                   char status[EightBPShadowStatusCapacity]) {
     intptr_t slide = 0;
-    if (!ValidateInputSurface(table, cueBall, visualGuide, friction, status, &slide)) return false;
+    if (!ValidateInputSurface(table, cueBall, visualGuide, friction, status, &slide, true)) return false;
 #if EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI
     SetStatus(status, "56.29.2 shadow-physics gates passed");
     return true;
@@ -855,9 +871,9 @@ bool EightBPShadowValidateRuntime(NSObject *table, NSObject *cueBall, const void
 #endif
 }
 
-bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visualGuide,
-                         double initialSpeed, const double frictionValues[7],
-                         EightBPShadowPrediction *prediction) {
+static bool PredictShadow(NSObject *table, NSObject *cueBall, const void *visualGuide,
+                          double initialSpeed, const double frictionValues[7],
+                          EightBPShadowPrediction *prediction, bool applyAim) {
     if (!prediction) {
         SetStatus(nullptr, "shadow physics received a null prediction output");
         return false;
@@ -865,9 +881,10 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
     std::memset(prediction, 0, sizeof(*prediction));
     intptr_t slide = 0;
     if (!ValidateInputSurface(table, cueBall, visualGuide, frictionValues, prediction->status,
-                              &slide)) return false;
+                              &slide, applyAim)) return false;
     SetStatus(prediction->status, "shadow stage 1/4: input surface validated");
-    if (!std::isfinite(initialSpeed) || initialSpeed <= 0.0 || initialSpeed > 100000.0) {
+    if (applyAim &&
+        (!std::isfinite(initialSpeed) || initialSpeed <= 0.0 || initialSpeed > 100000.0)) {
         SetStatus(prediction->status, "invalid initial speed");
         return false;
     }
@@ -913,27 +930,29 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
             SetStatus(prediction->status, "cue Ball was not cloned");
             return false;
         }
-        const auto *guideBytes = static_cast<const uint8_t *>(visualGuide);
-        NativePoint start = {}, end = {};
-        std::memcpy(&start, guideBytes + 0xB0, sizeof(start));
-        std::memcpy(&end, guideBytes + 0xC0, sizeof(end));
-        const double length = std::hypot(end.x - start.x, end.y - start.y);
-        if (!FinitePoint(start) || !FinitePoint(end) || length <= kEventEpsilon) {
-            SetStatus(prediction->status, "VisualGuide direction gate failed");
-            return false;
-        }
-        WritePoint(cueIterator->clone, 0x30,
-                   {(end.x - start.x) * initialSpeed / length,
-                    (end.y - start.y) * initialSpeed / length});
-        // VisualGuide's temporary cue ball carries the English selected for the
-        // pending shot. Copy its angular state; the live cue ball is still at
-        // rest while aiming and therefore cannot supply this shot input.
-        __unsafe_unretained NSObject *temporaryCue = nil;
-        std::memcpy(&temporaryCue, guideBytes + 0x08, sizeof(temporaryCue));
-        if (temporaryCue) {
-            std::memcpy(reinterpret_cast<uint8_t *>((__bridge void *)cueIterator->clone) + 0x48,
-                        reinterpret_cast<const uint8_t *>((__bridge const void *)temporaryCue) + 0x48,
-                        24);
+        if (applyAim) {
+            const auto *guideBytes = static_cast<const uint8_t *>(visualGuide);
+            NativePoint start = {}, end = {};
+            std::memcpy(&start, guideBytes + 0xB0, sizeof(start));
+            std::memcpy(&end, guideBytes + 0xC0, sizeof(end));
+            const double length = std::hypot(end.x - start.x, end.y - start.y);
+            if (!FinitePoint(start) || !FinitePoint(end) || length <= kEventEpsilon) {
+                SetStatus(prediction->status, "VisualGuide direction gate failed");
+                return false;
+            }
+            WritePoint(cueIterator->clone, 0x30,
+                       {(end.x - start.x) * initialSpeed / length,
+                        (end.y - start.y) * initialSpeed / length});
+            // VisualGuide's temporary cue ball carries the English selected for the
+            // pending shot. Copy its angular state; the live cue ball is still at
+            // rest while aiming and therefore cannot supply this shot input.
+            __unsafe_unretained NSObject *temporaryCue = nil;
+            std::memcpy(&temporaryCue, guideBytes + 0x08, sizeof(temporaryCue));
+            if (temporaryCue) {
+                std::memcpy(reinterpret_cast<uint8_t *>((__bridge void *)cueIterator->clone) + 0x48,
+                            reinterpret_cast<const uint8_t *>((__bridge const void *)temporaryCue) + 0x48,
+                            24);
+            }
         }
 
         ECEightBPShadowQueryFacade *facade = [ECEightBPShadowQueryFacade new];
@@ -988,6 +1007,10 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
                 for (size_t index = 0; index < shadowBalls.size(); ++index) {
                     ShadowBall &ball = shadowBalls[index];
                     if (!ball.active) continue;
+                    // Live follow-up uses the real runner rule: only moving
+                    // balls are queried. Aim-time still queries everyone so
+                    // the first contact matches the native guide.
+                    if (!applyAim && !BallIsMoving(ball.clone)) continue;
                     uint8_t *native = reinterpret_cast<uint8_t *>(
                         (__bridge void *)ball.clone) + 0x20;
                     std::memcpy(beforeQuery.data() + index * kBallQueryRestoreSpan,
@@ -1089,4 +1112,17 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
         return true;
     }
 #endif
+}
+
+bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visualGuide,
+                         double initialSpeed, const double frictionValues[7],
+                         EightBPShadowPrediction *prediction) {
+    return PredictShadow(table, cueBall, visualGuide, initialSpeed, frictionValues,
+                         prediction, true);
+}
+
+bool EightBPShadowPredictLive(NSObject *table, NSObject *cueBall,
+                              const double frictionValues[7],
+                              EightBPShadowPrediction *prediction) {
+    return PredictShadow(table, cueBall, nullptr, 0.0, frictionValues, prediction, false);
 }

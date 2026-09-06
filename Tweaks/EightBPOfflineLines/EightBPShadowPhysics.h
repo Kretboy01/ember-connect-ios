@@ -59,6 +59,13 @@ bool EightBPShadowPredict(NSObject *table,
                          double initialSpeed,
                          const double friction[7],
                          EightBPShadowPrediction *prediction);
+
+// Re-simulate from the live table: keep current velocities, do not apply
+// a new cue impulse. Used while the real shot is still moving.
+bool EightBPShadowPredictLive(NSObject *table,
+                              NSObject *cueBall,
+                              const double friction[7],
+                              EightBPShadowPrediction *prediction);
 #endif
 
 #ifdef __cplusplus

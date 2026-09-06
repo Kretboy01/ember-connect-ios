@@ -37,6 +37,10 @@ static double gECLastPredictedDistance = NAN;
 static BOOL gECShowRebounds = YES;
 static BOOL gECShowLandingRings = YES;
 static BOOL gECShowTableOverlay = YES;
+static double gECLastFriction[7];
+static BOOL gECHasLastFriction = NO;
+static BOOL gECTableThemed = NO;
+static id gECTableLogo = nil;
 
 @class EmberEightBPLineOverlay;
 @class EmberEightBPOfflineLinesController;
@@ -57,6 +61,9 @@ static void ECHideReachedLandingMarker(id ball);
 static void ECClearTableOverlay(void);
 static void ECSyncTableOverlay(void);
 static void ECClearAimContactMarker(void);
+static void ECRefreshLivePrediction(void);
+static void ECApplyTableTheme(void);
+static void ECSuppressAppleIDPrompts(void);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -416,6 +423,9 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECCachedTable = nil;
     gECHasShadowPrediction = NO;
     gECShadowShotMoving = NO;
+    gECHasLastFriction = NO;
+    gECTableThemed = NO;
+    gECTableLogo = nil;
     memset(&gECLastShadowPrediction, 0, sizeof(gECLastShadowPrediction));
     memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
     memset(gECShadowPathSamples, 0, sizeof(gECShadowPathSamples));
@@ -817,6 +827,11 @@ static void ECRemoveBallMarkers(void) {
     ECClearPredictionVisuals();
     ECClearTableOverlay();
     ECClearAimContactMarker();
+    if (gECTableLogo && [gECTableLogo respondsToSelector:@selector(removeFromParent)]) {
+        ((void (*)(id, SEL))objc_msgSend)(gECTableLogo, @selector(removeFromParent));
+    }
+    gECTableLogo = nil;
+    gECTableThemed = NO;
     for (int i = 0; i < 20; i++) {
         id ball = gECCachedBalls[i];
         if (!ball) continue;
@@ -1140,6 +1155,7 @@ static void ECUpdateVisualBall(id self, SEL selector) {
     @try {
         ECSyncCocosMarker(self, YES);
         ECHideReachedLandingMarker(self);
+        ECApplyTableTheme();
         ECSyncTableOverlay();
         ECLogRingSnapshot();
         ECObserveShadowParity();
@@ -2636,6 +2652,7 @@ static void ECObserveShadowParity(void) {
     }
     if (anyMoving) {
         gECShadowShotMoving = YES;
+        ECRefreshLivePrediction();
         // Ball visuals are not guaranteed to receive one final update after
         // the physics runner stops. Schedule one bounded follow-up check so
         // the old shot's paths cannot survive into the next turn.
@@ -2680,6 +2697,165 @@ static void ECObserveShadowParity(void) {
     gECShadowShotMoving = NO;
     gECHasShadowPrediction = NO;
     ECClearPredictionVisuals();
+}
+
+static void ECRefreshLivePrediction(void) {
+    static CFTimeInterval lastLive = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastLive < 0.10) return;
+    if (!gECHasLastFriction || !gECCachedTable || !gECCachedCueBall) return;
+    if (!gECShowRebounds && !gECShowLandingRings) return;
+    lastLive = now;
+    EightBPShadowPrediction prediction = {0};
+    BOOL ok = NO;
+    @try {
+        ok = EightBPShadowPredictLive(gECCachedTable, gECCachedCueBall,
+                                      gECLastFriction, &prediction);
+    } @catch (NSException *exception) {
+        ECLogLine([NSString stringWithFormat:@"shadow-live exception %@: %@",
+                   exception.name, exception.reason ?: @"unknown"]);
+        return;
+    }
+    if (!ok || !prediction.valid) return;
+    ECLogLine([NSString stringWithFormat:
+        @"shadow-live ok frames=%u events=%u balls=%u status=%s",
+        prediction.simulatedFrames, prediction.resolvedEvents,
+        prediction.ballCount, prediction.status]);
+    ECRenderShadowPrediction(&prediction);
+}
+
+static void ECTintNodeIfTableArt(id node, int depth) {
+    if (!ECLooksLikeObject(node) || depth > 6) return;
+    NSString *name = NSStringFromClass([node class]);
+    if ([name containsString:@"ProjectedSphere"] || [name containsString:@"Ball"]) return;
+    if (node == gECAimContactMarker || node == gECTableLogo) return;
+    CGSize size = CGSizeZero;
+    if ([node respondsToSelector:@selector(contentSize)]) {
+        size = ((CGSize (*)(id, SEL))objc_msgSend)(node, @selector(contentSize));
+    }
+    BOOL large = size.width > 80.0 && size.height > 40.0;
+    if (large && [node respondsToSelector:@selector(setColor:)]) {
+        ECccColor3B felt = {42, 18, 16};
+        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(node, @selector(setColor:), felt);
+    }
+    id children = ECInvokeId(node, @"children");
+    if (![children isKindOfClass:NSArray.class]) return;
+    for (id child in (NSArray *)children) {
+        ECTintNodeIfTableArt(child, depth + 1);
+    }
+}
+
+static id ECEmberLogoTexture(void) {
+    static id texture = nil;
+    if (texture) return texture;
+    Class texCls = NSClassFromString(@"CCTexture2D");
+    if (!texCls) return nil;
+    const int n = 256;
+    uint32_t *pixels = calloc((size_t)n * n, sizeof(uint32_t));
+    if (!pixels) return nil;
+    float cx = (n - 1) * 0.5f;
+    for (int y = 0; y < n; y++) {
+        for (int x = 0; x < n; x++) {
+            float dx = ((float)x - cx) / cx;
+            float dy = ((float)y - cx) / cx;
+            float r = hypotf(dx, dy);
+            if (r > 0.92f) continue;
+            float flame = fmaxf(0.0f, 0.78f - (dy + 0.15f) * (dy + 0.15f) * 1.6f - fabsf(dx) * 0.55f);
+            float ring = fabsf(r - 0.78f) < 0.06f ? 1.0f : 0.0f;
+            float a = fminf(1.0f, flame * 1.4f + ring);
+            if (a <= 0.02f) continue;
+            uint32_t v = (uint32_t)(a * 255.0f);
+            pixels[y * n + x] = (v << 24) | (v << 16) | (v << 8) | v;
+        }
+    }
+    SEL initSel = @selector(initWithData:pixelFormat:pixelsWide:pixelsHigh:contentSize:);
+    static const int formats[] = {1, 0, 2, 3, 6, 7, 8};
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        id tex = ((id (*)(id, SEL))objc_msgSend)(texCls, @selector(alloc));
+        if (![tex respondsToSelector:initSel]) break;
+        tex = ((id (*)(id, SEL, const void *, int, unsigned long, unsigned long, CGSize))objc_msgSend)(
+            tex, initSel, pixels, formats[i], (unsigned long)n, (unsigned long)n, CGSizeMake(n, n));
+        if (!ECLooksLikeObject(tex)) continue;
+        unsigned long bits = [tex respondsToSelector:@selector(bitsPerPixelForFormat)]
+            ? ((unsigned long (*)(id, SEL))objc_msgSend)(tex, @selector(bitsPerPixelForFormat)) : 0;
+        if (bits == 32) {
+            texture = tex;
+            break;
+        }
+    }
+    free(pixels);
+    return texture;
+}
+
+static void ECApplyTableTheme(void) {
+    if (gECTableThemed || !gECInMatch || !gECCachedTable) return;
+    id cloth = ECIvarObject(gECCachedTable, "_clothClippingNode");
+    if (!ECLooksLikeObject(cloth)) cloth = ECIvarObject(gECCachedTable, "mClothClippingNode");
+    if (!ECLooksLikeObject(cloth)) cloth = gECCachedTable;
+    ECTintNodeIfTableArt(cloth, 0);
+    id reference = gECCachedCueBall;
+    id sphere = ECVisualSphere(reference);
+    id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : cloth;
+    if (!ECLooksLikeObject(parent)) parent = cloth;
+    id texture = ECEmberLogoTexture();
+    Class spriteClass = NSClassFromString(@"CCSprite");
+    if (texture && spriteClass && ECLooksLikeObject(parent) && !ECLooksLikeObject(gECTableLogo)) {
+        id logo = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
+        logo = ((id (*)(id, SEL, id))objc_msgSend)(logo, @selector(initWithTexture:), texture);
+        if (ECLooksLikeObject(logo)) {
+            CGPoint center = ECVisualPointForWorld((ECDPoint){0, 0}, reference);
+            if ([logo respondsToSelector:@selector(setPosition:)]) {
+                ((void (*)(id, SEL, CGPoint))objc_msgSend)(logo, @selector(setPosition:), center);
+            }
+            if ([logo respondsToSelector:@selector(setColor:)]) {
+                ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(logo, @selector(setColor:),
+                                                              (ECccColor3B){255, 94, 58});
+            }
+            if ([logo respondsToSelector:@selector(setOpacity:)]) {
+                ((void (*)(id, SEL, unsigned char))objc_msgSend)(logo, @selector(setOpacity:), 80);
+            }
+            if ([logo respondsToSelector:@selector(setScale:)]) {
+                ((void (*)(id, SEL, float))objc_msgSend)(logo, @selector(setScale:), 1.15f);
+            }
+            if ([parent respondsToSelector:@selector(addChild:z:)]) {
+                ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), logo, 0);
+            }
+            gECTableLogo = logo;
+        }
+    }
+    gECTableThemed = YES;
+    ECLogLine(@"table-theme ember felt + centre logo");
+}
+
+static void ECSuppressAppleIDPrompts(void) {
+    static uint8_t mask = 0;
+    if (mask == 0x7) return;
+    Class receiptRequest = NSClassFromString(@"SKReceiptRefreshRequest");
+    SEL start = @selector(start);
+    Method startMethod = receiptRequest ? class_getInstanceMethod(receiptRequest, start) : NULL;
+    if (!(mask & 0x1) && startMethod) {
+        IMP replacement = imp_implementationWithBlock(^(id request) {
+            if ([request respondsToSelector:@selector(cancel)]) [request cancel];
+            ECLogLine(@"suppressed StoreKit receipt refresh");
+        });
+        class_replaceMethod(receiptRequest, start, replacement, method_getTypeEncoding(startMethod));
+        mask |= 0x1;
+    }
+    Class paymentQueue = NSClassFromString(@"SKPaymentQueue");
+    NSArray *restoreNames = @[@"restoreCompletedTransactions",
+                              @"restoreCompletedTransactionsWithApplicationUsername:"];
+    for (NSUInteger index = 0; index < restoreNames.count; index++) {
+        uint8_t bit = (uint8_t)(0x2 << index);
+        if (mask & bit) continue;
+        SEL selector = NSSelectorFromString(restoreNames[index]);
+        Method method = paymentQueue ? class_getInstanceMethod(paymentQueue, selector) : NULL;
+        if (!method) continue;
+        IMP replacement = [restoreNames[index] hasSuffix:@":"]
+            ? imp_implementationWithBlock(^(id queue, id username) { (void)queue; (void)username; })
+            : imp_implementationWithBlock(^(id queue) { (void)queue; });
+        class_replaceMethod(paymentQueue, selector, replacement, method_getTypeEncoding(method));
+        mask |= bit;
+    }
 }
 
 #if 0
@@ -2977,6 +3153,8 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     double effectiveSliding = NAN;
     double effectiveRolling = NAN;
     if (!ECEffectiveFrictionFactors((double *)friction, &effectiveSliding, &effectiveRolling)) return;
+    memcpy(gECLastFriction, friction, sizeof(gECLastFriction));
+    gECHasLastFriction = YES;
 
     double initialSpeed = ECShotSpeedForCuePower(cuePower, cueForce);
     double predictedDistance = ECPhysicsStoppingDistance(
@@ -3775,6 +3953,7 @@ static void EmberEightBPOfflineLinesBoot(void) {
     gECShowTableOverlay = [defaults objectForKey:ECTableOverlayKey] == nil
         ? YES : [defaults boolForKey:ECTableOverlayKey];
     EightBPShadowSetLogCallback(ECShadowLogCallback, NULL);
+    ECSuppressAppleIDPrompts();
     ECInstallHooks();
     EmberEightBPOfflineLinesController *controller = [EmberEightBPOfflineLinesController sharedController];
     [controller start];
