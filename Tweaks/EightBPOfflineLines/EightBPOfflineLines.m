@@ -133,6 +133,9 @@ static const void *kECMarkerKey = &kECMarkerKey;
 #define EC_RING_BAND 9.0
 #define EC_RING_OUTER_FRACTION ((EC_RING_TEXTURE_SIZE * 0.5 - EC_RING_INSET) / (EC_RING_TEXTURE_SIZE * 0.5))
 #define EC_RING_PADDING 1.18
+// Visual-only floor for an unpowered cue. Shot speed and collision reach still
+// use the real physical distance.
+#define EC_MIN_GUIDE_DISTANCE 40.0
 
 typedef struct {
     unsigned int force;
@@ -1590,8 +1593,10 @@ static double ECShotSpeedForCuePower(double cuePower, double cueForce) {
 }
 
 static BOOL ECTrimNativeGuideToStoppingDistance(void *guide, double stoppingDistance,
+                                                double displayDistance,
                                                 double *nativeHitDistanceOut) {
-    if (!guide || !isfinite(stoppingDistance) || stoppingDistance < 0.0) return NO;
+    if (!guide || !isfinite(stoppingDistance) || stoppingDistance < 0.0 ||
+        !isfinite(displayDistance) || displayDistance < stoppingDistance) return NO;
 
     // VisualGuide 56.29.2 stores the distance returned by Table's native
     // collision raycast at +0x48 and the corresponding rendered start/end
@@ -1611,13 +1616,16 @@ static BOOL ECTrimNativeGuideToStoppingDistance(void *guide, double stoppingDist
         !ECPointValid(start) || !ECPointValid(end) ||
         stoppingDistance >= hitDistance) return NO;
 
-    double fraction = fmax(0.0, fmin(1.0, stoppingDistance / hitDistance));
+    // The minimum affects only what is visible. Collision branches remain
+    // suppressed until the real shot distance can reach the contact.
+    double visibleDistance = fmin(hitDistance, displayDistance);
+    double fraction = fmax(0.0, fmin(1.0, visibleDistance / hitDistance));
     ECDPoint physicalEnd = {
         start.x + (end.x - start.x) * fraction,
         start.y + (end.y - start.y) * fraction,
     };
     memcpy(bytes + 0xc0, &physicalEnd, sizeof(physicalEnd));
-    memcpy(bytes + 0x48, &stoppingDistance, sizeof(stoppingDistance));
+    memcpy(bytes + 0x48, &visibleDistance, sizeof(visibleDistance));
 
     // The collision lies beyond the cue ball's physical stopping point, so
     // suppress the native collision marker and outgoing ball/cue paths while
@@ -2048,6 +2056,89 @@ static void ECSyncLandingMarker(int index, id parent, ECSimBall *ball,
     ECSetMarkerVisible(marker, YES);
 }
 
+static void ECSyncNativeObjectLandingRing(void *guide, BOOL collisionReachable) {
+    id marker = gECPredictionMarkers[0];
+    if (!guide || !collisionReachable || !gECShowLandingRings) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+
+    uint8_t *bytes = (uint8_t *)guide;
+    if (bytes[0x98] != 1 || bytes[0x9a] != 1) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+    uint8_t *active = NULL;
+    memcpy(&active, bytes + 0x218, sizeof(active));
+    if (active != bytes + 0x118 && active != bytes + 0x158 &&
+        active != bytes + 0x198 && active != bytes + 0x1d8) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+
+    // The native guide owns two outgoing branches. Match each branch's start
+    // against the exact rendered object-ball positions; this identifies the
+    // struck ball without guessing which temporary-ball slot is the object.
+    id targetBall = nil;
+    ECDPoint targetEnd = {NAN, NAN};
+    double bestDistance = INFINITY;
+    for (int path = 0; path < 2; path++) {
+        ECDPoint start = {NAN, NAN};
+        ECDPoint end = {NAN, NAN};
+        size_t offset = (size_t)path * 0x20;
+        memcpy(&start, active + offset, sizeof(start));
+        memcpy(&end, active + offset + 0x10, sizeof(end));
+        if (!ECPointValid(start) || !ECPointValid(end)) continue;
+        for (int slot = 0; slot < gECCachedSnapCount; slot++) {
+            id ball = gECCachedBalls[slot];
+            if (!ball || ball == gECCachedCueBall || ECBallIsPotted(ball)) continue;
+            id sphere = ECVisualSphere(ball);
+            if (!ECLooksLikeObject(sphere) ||
+                ![sphere respondsToSelector:@selector(position)]) continue;
+            CGPoint position =
+                ((CGPoint (*)(id, SEL))objc_msgSend)(sphere, @selector(position));
+            double distance = hypot(start.x - position.x, start.y - position.y);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                targetBall = ball;
+                targetEnd = end;
+            }
+        }
+    }
+    if (!targetBall || !ECPointValid(targetEnd) || bestDistance > 30.0) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+
+    CGPoint origin = CGPointMake(NAN, NAN);
+    if (!ECReadPointIvar(targetBall, "mVisualTableOrigin", &origin)) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+    double visualScale =
+        gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+    ECSimBall landing = {
+        .source = targetBall,
+        .number = ECBallNumber(targetBall),
+        .pos = {(targetEnd.x - origin.x) / visualScale,
+                (targetEnd.y - origin.y) / visualScale},
+        .radius = ECBallLiveRadius(targetBall),
+        .active = YES,
+        .moved = YES,
+    };
+    id sphere = ECVisualSphere(targetBall);
+    id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+    long long z = 2;
+    if (ECLooksLikeObject(sphere) && [sphere respondsToSelector:@selector(zOrder)]) {
+        z = ((long long (*)(id, SEL))objc_msgSend)(sphere, @selector(zOrder)) + 2;
+    }
+    if (!ECLooksLikeObject(parent)) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+    ECSyncLandingMarker(0, parent, &landing, targetBall, z);
+}
+
 static void ECRunFullTablePrediction(void *guide, double initialSpeed,
                                      const double *friction,
                                      double slidingReduction, double rollingReduction) {
@@ -2263,6 +2354,7 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     double predictedDistance = ECPhysicsStoppingDistance(
         initialSpeed, friction, effectiveSliding, effectiveRolling);
     if (!isfinite(predictedDistance) || predictedDistance < 0.0) return;
+    double displayDistance = fmax(predictedDistance, EC_MIN_GUIDE_DISTANCE);
     updating = YES;
 
     void *guide = ECRawPointerIvar(visualCue, "mVisualGuide");
@@ -2278,10 +2370,10 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         // First let the game resolve the real first ball/cushion intersection.
         // Its stock guide always draws that whole segment, regardless of cue
         // power; the physics distance is applied to that exact native ray below.
-        *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = predictedDistance;
+        *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = displayDistance;
         refresh(guide);
         stoppedBeforeCollision = ECTrimNativeGuideToStoppingDistance(
-            guide, predictedDistance, &nativeHitDistance);
+            guide, predictedDistance, displayDistance, &nativeHitDistance);
 
         if (!stoppedBeforeCollision && isfinite(nativeHitDistance) &&
             nativeHitDistance >= 0.0) {
@@ -2298,10 +2390,11 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         }
     }
 
-    // Keep the proven native guide path isolated while the full-table
-    // simulator is validated. The simulator currently terminates the guest as
-    // soon as non-zero shot power reaches it.
-    ECClearPredictionVisuals();
+    // Use only the already-resolved native post-contact branch for the object
+    // ball's landing ring. The unstable independent simulator stays isolated.
+    BOOL collisionReachable = !stoppedBeforeCollision &&
+        isfinite(nativeHitDistance) && predictedDistance >= nativeHitDistance;
+    ECSyncNativeObjectLandingRing(guide, collisionReachable);
 
     static CFTimeInterval lastLogTime = 0;
     CFTimeInterval now = CACurrentMediaTime();
