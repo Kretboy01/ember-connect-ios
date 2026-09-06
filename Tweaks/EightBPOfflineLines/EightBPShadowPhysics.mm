@@ -78,6 +78,7 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
     NSArray *_shadowBalls;
     EightBPShadowPointVector _tableShape;
     NativeRect _bounds;
+    double _combinedBallRadiusSquared;
     BOOL _fast;
     ECEightBPShadowTableProperties *_properties;
     BOOL _unexpectedRunnerCall;
@@ -85,6 +86,7 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
 - (NSArray *)balls;
 - (BOOL)isFastComputationEnabled;
 - (NativeRect)tableBounds;
+- (NativeNumber)combinedBallRadiusSquared;
 - (const EightBPShadowPointVector *)tableShape;
 - (id)tableProperties;
 - (void)addToBallRunner:(id)ball playSound:(BOOL)playSound;
@@ -94,6 +96,9 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
 - (NSArray *)balls { return _shadowBalls; }
 - (BOOL)isFastComputationEnabled { return _fast; }
 - (NativeRect)tableBounds { return _bounds; }
+- (NativeNumber)combinedBallRadiusSquared {
+    return NativeNumber(_combinedBallRadiusSquared);
+}
 - (const EightBPShadowPointVector *)tableShape { return &_tableShape; }
 - (id)tableProperties { return _properties; }
 - (void)addToBallRunner:(id)ball playSound:(BOOL)playSound {
@@ -650,7 +655,18 @@ static bool SnapshotGeometry(NSObject *table, ECEightBPShadowQueryFacade *facade
     if (!boundsMethod) return false;
     InvokeNativeSret(table, boundsSelector, &facade->_bounds,
                      method_getImplementation(boundsMethod));
-    return FinitePoint(facade->_bounds.origin) && FinitePoint(facade->_bounds.size);
+    if (!FinitePoint(facade->_bounds.origin) || !FinitePoint(facade->_bounds.size)) return false;
+
+    SEL combinedSelector = NSSelectorFromString(@"combinedBallRadiusSquared");
+    Method combinedMethod = class_getInstanceMethod([table class], combinedSelector);
+    if (!combinedMethod) return false;
+    NativeNumber combined;
+    InvokeNativeSret(table, combinedSelector, &combined,
+                     method_getImplementation(combinedMethod));
+    if (!std::isfinite(combined.value) || combined.value <= 0.0 ||
+        combined.value > 10000.0) return false;
+    facade->_combinedBallRadiusSquared = combined.value;
+    return true;
 }
 
 static CollisionPtr QueryCollision(NSObject *facade, NSObject *ball, double horizon,
