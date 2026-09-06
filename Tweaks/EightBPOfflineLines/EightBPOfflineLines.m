@@ -718,8 +718,17 @@ static id ECCircleTexture(void) {
 }
 
 static int ECBallNumber(id ball) {
-    if (!ball || ![ball respondsToSelector:@selector(number)]) return ball == gECCachedCueBall ? 0 : -1;
-    return ((int (*)(id, SEL))objc_msgSend)(ball, @selector(number));
+    if (!ball) return -1;
+    if (ball == gECCachedCueBall) return 0;
+    // Ball exposes `number` as an ivar in this build, not as an Objective-C
+    // getter. Read the runtime-resolved offset instead of falling back to white.
+    Ivar ivar = class_getInstanceVariable([ball class], "number");
+    if (!ivar) return -1;
+    unsigned int number = 0;
+    memcpy(&number,
+           (const uint8_t *)(__bridge const void *)ball + ivar_getOffset(ivar),
+           sizeof(number));
+    return number <= 15 ? (int)number : -1;
 }
 
 static ECccColor3B ECColorForBallNumber(int number) {
@@ -2050,8 +2059,11 @@ static void ECRunFullTablePrediction(void *guide, double initialSpeed,
     id parent = ECPredictionParent();
     if (!table || !cueBall || !parent) return;
 
+    // The game's large tableBounds struct return and private C++ cushion
+    // vectors are not ABI-safe to call/read from injected Objective-C. They
+    // caused the first powered prediction to terminate the guest. The verified
+    // 254 x 127 physics box is stable for this table/version.
     ECDBox bounds = ECDefaultTableBox();
-    ECReadNativeTableBox(table, &bounds);
     gECTableBox = bounds;
 
     uint8_t *guideBytes = (uint8_t *)guide;
@@ -2081,8 +2093,7 @@ static void ECRunFullTablePrediction(void *guide, double initialSpeed,
     balls[cueIndex].slidingTime = initialSpeed * friction[3];
 
     ECSimCushion cushions[EC_SIM_MAX_CUSHIONS] = {0};
-    int cushionCount = ECSnapshotNativeCushions(
-        table, bounds, cushions, EC_SIM_MAX_CUSHIONS);
+    int cushionCount = 0;
 
     const double dt = 1.0 / 120.0;
     const int maxSteps = 7800;
