@@ -276,8 +276,8 @@ static void ECDumpAimIvars(id object, NSString *label) {
 // UserInfo lowAimRatio / highAimRatio are the selected cue's real aim stat
 // (observed 8 / 14). The 2017 iOSGods span (-900 / 1300) freezes cue rotation
 // on 56.29.2 — the player can still shoot and place ball-in-hand, but the cue
-// will not turn. Guide length comes from CueStats.aim instead, so leave the
-// aim stats completely alone.
+// will not turn. The physics guide uses the native shot velocity and table
+// friction instead, so leave the aim stats completely alone.
 static void ECApplyAimValues(void) {
     static BOOL dumped = NO;
     if (dumped || !ECExtensionIsActive()) return;
@@ -1406,6 +1406,18 @@ static double ECPhysicsStoppingDistance(double speed, const double *friction) {
     return slidingDistance + rollingDistance;
 }
 
+static double ECShotSpeedForCuePower(double cuePower, double cueForce) {
+    if (!isfinite(cuePower) || !isfinite(cueForce) || cueForce <= 0.0) return NAN;
+
+    // This is the transfer function in the real 56.29.2 shot routine at
+    // 0x10000c318..0x10000c328. The normalized VisualCue power is not applied
+    // linearly: the engine turns it into ball velocity before setting the
+    // cue-ball velocity vector. Using cuePower * cueForce makes weak pulls
+    // nearly twice as fast as the shot the game will actually take.
+    double normalizedPower = fmin(1.0, fmax(0.0, cuePower));
+    return cueForce * (1.0 - sqrt(1.0 - normalizedPower));
+}
+
 static void ECUpdatePhysicsGuideForCue(id visualCue) {
     if (!visualCue || !ECExtensionIsActive() || !ECNativePhysicsSurfaceValid()) return;
 
@@ -1422,7 +1434,7 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     double cueForce = *(double *)ECGameAddress(EC_GAME_FORCE_ADDRESS);
     if (!isfinite(cueForce) || cueForce <= 0.0) return;
 
-    double initialSpeed = cuePower * cueForce;
+    double initialSpeed = ECShotSpeedForCuePower(cuePower, cueForce);
     double predictedDistance = ECPhysicsStoppingDistance(initialSpeed, friction);
     if (!isfinite(predictedDistance) || predictedDistance < 0.0) return;
 
