@@ -2390,11 +2390,9 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         }
     }
 
-    // Use only the already-resolved native post-contact branch for the object
-    // ball's landing ring. The unstable independent simulator stays isolated.
-    BOOL collisionReachable = !stoppedBeforeCollision &&
-        isfinite(nativeHitDistance) && predictedDistance >= nativeHitDistance;
-    ECSyncNativeObjectLandingRing(guide, collisionReachable);
+    // Prediction visuals are fail-closed until the detached native shadow
+    // world passes its runtime ABI and event-parity gates.
+    ECClearPredictionVisuals();
 
     static CFTimeInterval lastLogTime = 0;
     CFTimeInterval now = CACurrentMediaTime();
