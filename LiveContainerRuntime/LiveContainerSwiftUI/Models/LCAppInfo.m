@@ -79,18 +79,22 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
     // find all url schemes
     NSMutableArray* urlSchemes = [[NSMutableArray alloc] init];
     int nowSchemeCount = 0;
-    if (_infoPlist[@"CFBundleURLTypes"]) {
-        NSMutableArray* urlTypes = _infoPlist[@"CFBundleURLTypes"];
-
-        for(int i = 0; i < [urlTypes count]; ++i) {
-            NSMutableDictionary* nowUrlType = [urlTypes objectAtIndex:i];
-            if (!nowUrlType[@"CFBundleURLSchemes"]){
+    id urlTypesValue = _infoPlist[@"CFBundleURLTypes"];
+    if ([urlTypesValue isKindOfClass:NSArray.class]) {
+        NSArray *urlTypes = urlTypesValue;
+        for (id nowUrlType in urlTypes) {
+            if (![nowUrlType isKindOfClass:NSDictionary.class]) {
                 continue;
             }
-            NSMutableArray *schemes = nowUrlType[@"CFBundleURLSchemes"];
-            for(int j = 0; j < [schemes count]; ++j) {
-                [urlSchemes insertObject:[schemes objectAtIndex:j] atIndex:nowSchemeCount];
-                ++nowSchemeCount;
+            id schemesValue = nowUrlType[@"CFBundleURLSchemes"];
+            if (![schemesValue isKindOfClass:NSArray.class]) {
+                continue;
+            }
+            for (id scheme in (NSArray *)schemesValue) {
+                if ([scheme isKindOfClass:NSString.class]) {
+                    [urlSchemes insertObject:scheme atIndex:nowSchemeCount];
+                    ++nowSchemeCount;
+                }
             }
         }
     }
@@ -632,7 +636,26 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
 }
 
 - (NSArray<NSDictionary*>* )containerInfo {
-    return _info[@"LCContainers"];
+    id containers = _info[@"LCContainers"];
+    if ([containers isKindOfClass:NSArray.class]) {
+        return containers;
+    }
+    // A leftover dict here used to crash host UI: Swift treats this
+    // property as NSArray and calls objectAtIndex: during the cast.
+    if ([containers isKindOfClass:NSDictionary.class]) {
+        NSMutableArray *upgraded = [NSMutableArray array];
+        [(NSDictionary *)containers enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+            if ([obj isKindOfClass:NSString.class]) {
+                [upgraded addObject:@{@"folderName": obj, @"name": obj}];
+            } else if ([obj isKindOfClass:NSDictionary.class]) {
+                [upgraded addObject:obj];
+            }
+        }];
+        _info[@"LCContainers"] = upgraded;
+        [self save];
+        return upgraded;
+    }
+    return @[];
 }
 
 - (void)setContainerInfo:(NSArray<NSDictionary *> *)containerInfo {

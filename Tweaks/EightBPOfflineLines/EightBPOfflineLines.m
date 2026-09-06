@@ -2683,8 +2683,8 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
             ? hypot(shadowDirection.x - lastShadowDirection.x,
                     shadowDirection.y - lastShadowDirection.y)
             : INFINITY;
-        if (shadowNow - lastShadow >= 0.12 || !isfinite(lastShadowSpeed) ||
-            fabs(initialSpeed - lastShadowSpeed) >= 8.0 || directionDelta >= 0.008) {
+        if (shadowNow - lastShadow >= 0.05 || !isfinite(lastShadowSpeed) ||
+            fabs(initialSpeed - lastShadowSpeed) >= 1.25 || directionDelta >= 0.004) {
             lastShadow = shadowNow;
             lastShadowSpeed = initialSpeed;
             lastShadowDirection = shadowDirection;
@@ -2700,9 +2700,9 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
             }
             if (predictionSucceeded) {
                 ECLogLine([NSString stringWithFormat:
-                    @"shadow-predict ok frames=%u events=%u balls=%u status=%s",
+                    @"shadow-predict ok frames=%u events=%u balls=%u speed=%.3f status=%s",
                     prediction.simulatedFrames, prediction.resolvedEvents,
-                    prediction.ballCount, prediction.status]);
+                    prediction.ballCount, initialSpeed, prediction.status]);
                 ECRenderShadowPrediction(&prediction);
             } else {
                 ECLogLine([NSString stringWithFormat:@"shadow-predict fail %s",

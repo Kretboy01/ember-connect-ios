@@ -954,7 +954,11 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
         SetStatus(prediction->status, "shadow stage 3/4: table geometry copied");
         FrictionProperties friction = {};
         std::memcpy(friction.values, frictionValues, sizeof(friction.values));
-        friction.table = table;
+        // Later friction / virtual resolvers ask this pointer for balls and
+        // table properties. Pointing at the live Table made the first contact
+        // look right (clones still had the aim-time pose) then leaked live
+        // positions into every rebound after that.
+        friction.table = facade;
         facade->_friction = friction;
 
         const auto started = std::chrono::steady_clock::now();
@@ -970,6 +974,7 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
                 CollisionPtr earliest;
                 double earliestTime = remaining + 1.0;
                 std::array<uint8_t, kBallQueryRestoreSpan * EightBPShadowMaxBalls> beforeQuery = {};
+                const size_t committedCollisions = facade->_collisions.size();
                 for (size_t index = 0; index < shadowBalls.size(); ++index) {
                     ShadowBall &ball = shadowBalls[index];
                     if (!ball.active) continue;
@@ -995,6 +1000,12 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
                         earliestTime = std::max(0.0, time);
                         earliest = std::move(candidate);
                     }
+                }
+                // findCollision appends scratch candidates while searching.
+                // Keep only events the virtual resolver has already committed
+                // or the first contact stays accurate and later cushions drift.
+                if (facade->_collisions.size() > committedCollisions) {
+                    facade->_collisions.resize(committedCollisions);
                 }
                 if (!earliest) {
                     for (ShadowBall &ball : shadowBalls) {
