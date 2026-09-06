@@ -112,11 +112,13 @@ jobs:
             -fblocks \
             -dynamiclib \
             Tweaks/Shared/EmberMenu.m \
+            Tweaks/EightBPOfflineLines/EightBPShadowPhysics.mm \
             Tweaks/EightBPOfflineLines/EightBPOfflineLines.m \
             -framework Foundation \
             -framework UIKit \
             -framework QuartzCore \
             -framework CoreGraphics \
+            -lc++ \
             -install_name @rpath/EightBPOfflineLines.dylib \
             -o BuiltTweaks/EightBPOfflineLines.dylib
 

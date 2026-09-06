@@ -12,6 +12,7 @@
 #import <stdint.h>
 #import <stdlib.h>
 #import "../Shared/EmberMenu.h"
+#import "EightBPShadowPhysics.h"
 
 #define EC_LINES_BUTTON_TAG 0x8B901
 #define EC_LINE_OVERLAY_TAG 0x8B902
@@ -49,6 +50,7 @@ static BOOL ECLooksLikeObject(id object);
 static id ECIvarObject(id object, const char *name);
 static void ECUpdatePhysicsGuideForCue(id visualCue);
 static void ECCaptureNativeCueStats(void);
+static void ECObserveShadowParity(void);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -121,6 +123,11 @@ static id gECRingTexture = nil;
 static id gECLineTexture = nil;
 static id gECPredictionMarkers[20];
 static NSMutableArray *gECReboundSprites = nil;
+static EightBPShadowPrediction gECLastShadowPrediction;
+static BOOL gECHasShadowPrediction = NO;
+static BOOL gECShadowShotMoving = NO;
+static double gECShadowMaxPathError[EightBPShadowMaxBalls];
+static unsigned int gECShadowPathSamples[EightBPShadowMaxBalls];
 static int gECVisualLog = 0;
 static int gECReparentLog = 0;
 static int gECHiddenLog = 0;
@@ -408,6 +415,11 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECReparentLog = 0;
     gECHiddenLog = 0;
     gECCachedTable = nil;
+    gECHasShadowPrediction = NO;
+    gECShadowShotMoving = NO;
+    memset(&gECLastShadowPrediction, 0, sizeof(gECLastShadowPrediction));
+    memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
+    memset(gECShadowPathSamples, 0, sizeof(gECShadowPathSamples));
     memset(gECHasWindow, 0, sizeof(gECHasWindow));
     memset(gECPotted, 0, sizeof(gECPotted));
     ECRemoveBallMarkers();
@@ -421,6 +433,8 @@ static void ECStartHotSeatGame(id self, SEL selector) {
     gECInMatch = YES;
     // A fresh rack puts every ball back in play.
     memset(gECPotted, 0, sizeof(gECPotted));
+    gECHasShadowPrediction = NO;
+    gECShadowShotMoving = NO;
     dispatch_async(dispatch_get_main_queue(), ^{
         gECOverlayAllowed = YES;
         ECRefreshNativeGuide();
@@ -1121,6 +1135,7 @@ static void ECUpdateVisualBall(id self, SEL selector) {
     @try {
         ECSyncCocosMarker(self, YES);
         ECLogRingSnapshot();
+        ECObserveShadowParity();
     } @catch (NSException *exception) {
         ECLogLine([NSString stringWithFormat:@"cocos-marker %@", exception]);
     }
@@ -2056,6 +2071,190 @@ static void ECSyncLandingMarker(int index, id parent, ECSimBall *ball,
     ECSetMarkerVisible(marker, YES);
 }
 
+static void ECShadowLogCallback(const char *message, void *context) {
+    (void)context;
+    if (!message || !message[0]) return;
+    ECLogLine([NSString stringWithFormat:@"shadow %s", message]);
+}
+
+static void ECRenderShadowPrediction(const EightBPShadowPrediction *prediction) {
+    if (!prediction || !prediction->valid) {
+        ECClearPredictionVisuals();
+        return;
+    }
+
+    gECLastShadowPrediction = *prediction;
+    gECHasShadowPrediction = YES;
+    if (!gECShadowShotMoving) {
+        memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
+        memset(gECShadowPathSamples, 0, sizeof(gECShadowPathSamples));
+    }
+
+    BOOL usedMarkers[20] = {NO};
+    ECResetReboundSprites();
+    for (int index = 0;
+         index < prediction->ballCount && index < EightBPShadowMaxBalls;
+         index++) {
+        const EightBPShadowBallPrediction *source = &prediction->balls[index];
+        if (!source->valid || !source->liveBall) continue;
+
+        id ball = nil;
+        int slot = -1;
+        for (int cached = 0; cached < gECCachedSnapCount; cached++) {
+            if ((__bridge const void *)gECCachedBalls[cached] == source->liveBall) {
+                ball = gECCachedBalls[cached];
+                slot = cached;
+                break;
+            }
+        }
+        if (!ball || slot < 0 || slot >= 20) continue;
+        usedMarkers[slot] = YES;
+
+        ECDPoint start = source->pathPointCount > 0
+            ? (ECDPoint){source->path[0].x, source->path[0].y}
+            : ECBallLivePosition(ball);
+        BOOL moved = hypot(source->finalPosition.x - start.x,
+                           source->finalPosition.y - start.y) > 0.25;
+        if (source->potted || !gECShowLandingRings || !moved) {
+            ECSetMarkerVisible(gECPredictionMarkers[slot], NO);
+        } else {
+            id sphere = ECVisualSphere(ball);
+            id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+            if (ECLooksLikeObject(parent)) {
+                long long z = 2;
+                if ([sphere respondsToSelector:@selector(zOrder)]) {
+                    z = ((long long (*)(id, SEL))objc_msgSend)(
+                        sphere, @selector(zOrder)) + 2;
+                }
+                ECSimBall landing = {
+                    .source = ball,
+                    .number = (int)source->number,
+                    .pos = {source->finalPosition.x, source->finalPosition.y},
+                    .radius = ECBallLiveRadius(ball),
+                    .active = YES,
+                    .moved = YES,
+                };
+                ECSyncLandingMarker(slot, parent, &landing, ball, z);
+            }
+        }
+
+        if (!gECShowRebounds || source->pathPointCount < 2) continue;
+        id sphere = ECVisualSphere(ball);
+        id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+        if (!ECLooksLikeObject(parent)) continue;
+        long long z = 2;
+        if ([sphere respondsToSelector:@selector(zOrder)]) {
+            z = ((long long (*)(id, SEL))objc_msgSend)(
+                sphere, @selector(zOrder)) + 2;
+        }
+        ECccColor3B color = ECColorForBallNumber((int)source->number);
+        for (int point = 1;
+             point < source->pathPointCount && point < EightBPShadowMaxPathPoints;
+             point++) {
+            ECDPoint from = {source->path[point - 1].x, source->path[point - 1].y};
+            ECDPoint to = {source->path[point].x, source->path[point].y};
+            ECAddReboundSprite(parent, from, to, color, ball, z);
+        }
+    }
+    for (int slot = 0; slot < 20; slot++) {
+        if (!usedMarkers[slot]) ECSetMarkerVisible(gECPredictionMarkers[slot], NO);
+    }
+}
+
+static double ECDistanceToShadowPath(ECDPoint point,
+                                     const EightBPShadowBallPrediction *prediction) {
+    if (!prediction || prediction->pathPointCount == 0) return INFINITY;
+    double best = INFINITY;
+    for (int index = 0; index < prediction->pathPointCount; index++) {
+        ECDPoint a = {prediction->path[index].x, prediction->path[index].y};
+        if (!ECPointValid(a)) continue;
+        if (index == 0) {
+            best = fmin(best, hypot(point.x - a.x, point.y - a.y));
+            continue;
+        }
+        ECDPoint b = a;
+        a = (ECDPoint){prediction->path[index - 1].x,
+                       prediction->path[index - 1].y};
+        double dx = b.x - a.x;
+        double dy = b.y - a.y;
+        double lengthSquared = dx * dx + dy * dy;
+        double fraction = lengthSquared > 1e-12
+            ? ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared
+            : 0.0;
+        fraction = fmax(0.0, fmin(1.0, fraction));
+        ECDPoint nearest = {a.x + dx * fraction, a.y + dy * fraction};
+        best = fmin(best, hypot(point.x - nearest.x, point.y - nearest.y));
+    }
+    return best;
+}
+
+static void ECObserveShadowParity(void) {
+    if (!gECHasShadowPrediction || !gECLastShadowPrediction.valid) return;
+    BOOL anyMoving = NO;
+    for (int index = 0;
+         index < gECLastShadowPrediction.ballCount &&
+         index < EightBPShadowMaxBalls;
+         index++) {
+        const EightBPShadowBallPrediction *prediction =
+            &gECLastShadowPrediction.balls[index];
+        if (!prediction->valid || !prediction->liveBall) continue;
+        id ball = nil;
+        for (int slot = 0; slot < gECCachedSnapCount; slot++) {
+            if ((__bridge const void *)gECCachedBalls[slot] == prediction->liveBall) {
+                ball = gECCachedBalls[slot];
+                break;
+            }
+        }
+        if (!ball) continue;
+        BOOL moving = [ball respondsToSelector:@selector(isMovingOrSpinning)] &&
+            ((BOOL (*)(id, SEL))objc_msgSend)(ball, @selector(isMovingOrSpinning));
+        anyMoving = anyMoving || moving;
+        if (moving) {
+            ECDPoint position = ECBallLivePosition(ball);
+            double pathError = ECDistanceToShadowPath(position, prediction);
+            if (isfinite(pathError)) {
+                gECShadowMaxPathError[index] =
+                    fmax(gECShadowMaxPathError[index], pathError);
+                gECShadowPathSamples[index]++;
+            }
+        }
+    }
+    if (anyMoving) {
+        gECShadowShotMoving = YES;
+        return;
+    }
+    if (!gECShadowShotMoving) return;
+
+    for (int index = 0;
+         index < gECLastShadowPrediction.ballCount &&
+         index < EightBPShadowMaxBalls;
+         index++) {
+        const EightBPShadowBallPrediction *prediction =
+            &gECLastShadowPrediction.balls[index];
+        if (!prediction->valid || !prediction->liveBall) continue;
+        id ball = nil;
+        for (int slot = 0; slot < gECCachedSnapCount; slot++) {
+            if ((__bridge const void *)gECCachedBalls[slot] == prediction->liveBall) {
+                ball = gECCachedBalls[slot];
+                break;
+            }
+        }
+        if (!ball) continue;
+        ECDPoint actual = ECBallLivePosition(ball);
+        double finalError = prediction->potted || !ECPointValid(actual)
+            ? NAN : hypot(actual.x - prediction->finalPosition.x,
+                          actual.y - prediction->finalPosition.y);
+        ECLogLine([NSString stringWithFormat:
+            @"shadow-parity ball=%u predictedPotted=%d actualPotted=%d finalError=%.5f pathMax=%.5f samples=%u",
+            prediction->number, prediction->potted, ECBallIsPotted(ball),
+            finalError, gECShadowMaxPathError[index],
+            gECShadowPathSamples[index]]);
+    }
+    gECShadowShotMoving = NO;
+    gECHasShadowPrediction = NO;
+}
+
+#if 0
 static void ECSyncNativeObjectLandingRing(void *guide, BOOL collisionReachable) {
     id marker = gECPredictionMarkers[0];
     if (!guide || !collisionReachable || !gECShowLandingRings) {
@@ -2327,6 +2526,7 @@ static void ECRunFullTablePrediction(void *guide, double initialSpeed,
             bounds.minX, bounds.minY, bounds.maxX, bounds.maxY]);
     }
 }
+#endif
 
 static void ECUpdatePhysicsGuideForCue(id visualCue) {
     static BOOL updating = NO;
@@ -2390,9 +2590,53 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         }
     }
 
-    // Prediction visuals are fail-closed until the detached native shadow
-    // world passes its runtime ABI and event-parity gates.
-    ECClearPredictionVisuals();
+    // Prediction is detached from the live table. Any failed version, ABI,
+    // geometry, ownership, or event gate clears the overlay rather than
+    // presenting an approximate endpoint.
+    if (guide && initialSpeed > 0.1 &&
+        (gECShowRebounds || gECShowLandingRings)) {
+        static CFTimeInterval lastShadow = 0;
+        static double lastShadowSpeed = NAN;
+        static ECDPoint lastShadowDirection = {NAN, NAN};
+        CFTimeInterval shadowNow = CACurrentMediaTime();
+        ECDPoint shadowDirection = {NAN, NAN};
+        if (guide) {
+            ECDPoint start = {NAN, NAN};
+            ECDPoint end = {NAN, NAN};
+            memcpy(&start, (uint8_t *)guide + 0xb0, sizeof(start));
+            memcpy(&end, (uint8_t *)guide + 0xc0, sizeof(end));
+            shadowDirection = ECNorm((ECDPoint){end.x - start.x, end.y - start.y});
+        }
+        double directionDelta = isfinite(lastShadowDirection.x)
+            ? hypot(shadowDirection.x - lastShadowDirection.x,
+                    shadowDirection.y - lastShadowDirection.y)
+            : INFINITY;
+        if (shadowNow - lastShadow < 0.12 && isfinite(lastShadowSpeed) &&
+            fabs(initialSpeed - lastShadowSpeed) < 8.0 && directionDelta < 0.008) {
+            // Keep the last successful overlay while the player is only
+            // making tiny power adjustments.
+        } else {
+            lastShadow = shadowNow;
+            lastShadowSpeed = initialSpeed;
+            lastShadowDirection = shadowDirection;
+            EightBPShadowPrediction prediction = {0};
+            if (EightBPShadowPredict(table, gECCachedCueBall, guide, initialSpeed,
+                                     friction, &prediction)) {
+                ECLogLine([NSString stringWithFormat:
+                    @"shadow-predict ok frames=%u events=%u balls=%u status=%s",
+                    prediction.simulatedFrames, prediction.resolvedEvents,
+                    prediction.ballCount, prediction.status]);
+                ECRenderShadowPrediction(&prediction);
+            } else {
+                ECLogLine([NSString stringWithFormat:@"shadow-predict fail %s",
+                           prediction.status[0] ? prediction.status
+                                                : EightBPShadowLastStatus()]);
+                ECClearPredictionVisuals();
+            }
+        }
+    } else {
+        ECClearPredictionVisuals();
+    }
 
     static CFTimeInterval lastLogTime = 0;
     CFTimeInterval now = CACurrentMediaTime();
@@ -3084,6 +3328,7 @@ static void EmberEightBPOfflineLinesBoot(void) {
         ? YES : [defaults boolForKey:ECReboundsKey];
     gECShowLandingRings = [defaults objectForKey:ECLandingRingsKey] == nil
         ? YES : [defaults boolForKey:ECLandingRingsKey];
+    EightBPShadowSetLogCallback(ECShadowLogCallback, NULL);
     ECInstallHooks();
     EmberEightBPOfflineLinesController *controller = [EmberEightBPOfflineLinesController sharedController];
     [controller start];
