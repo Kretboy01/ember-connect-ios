@@ -12,6 +12,7 @@
 #import <stdint.h>
 #import <stdlib.h>
 #import "../Shared/EmberMenu.h"
+#import "EightBPShadowPhysics.h"
 
 #define EC_LINES_BUTTON_TAG 0x8B901
 #define EC_LINE_OVERLAY_TAG 0x8B902
@@ -20,6 +21,8 @@ static NSString *const ECBundleIdentifier = @"com.miniclip.8ballpoolmult";
 static NSString *const ECMultiplierKey = @"EmberEightBPOfflineLines.multiplier";
 static NSString *const ECButtonXKey = @"EmberEightBPOfflineLines.buttonX";
 static NSString *const ECButtonYKey = @"EmberEightBPOfflineLines.buttonY";
+static NSString *const ECReboundsKey = @"EmberEightBPOfflineLines.rebounds";
+static NSString *const ECLandingRingsKey = @"EmberEightBPOfflineLines.landingRings";
 
 static id gECGameManager = nil;
 static BOOL gECInMatch = NO;
@@ -30,6 +33,8 @@ static BOOL gECHooksInstalled = NO;
 static __weak id gECActiveVisualCue = nil;
 static double gECNativeAimDistance = NAN;
 static double gECLastPredictedDistance = NAN;
+static BOOL gECShowRebounds = YES;
+static BOOL gECShowLandingRings = YES;
 
 @class EmberEightBPLineOverlay;
 @class EmberEightBPOfflineLinesController;
@@ -45,6 +50,8 @@ static BOOL ECLooksLikeObject(id object);
 static id ECIvarObject(id object, const char *name);
 static void ECUpdatePhysicsGuideForCue(id visualCue);
 static void ECCaptureNativeCueStats(void);
+static void ECObserveShadowParity(void);
+static void ECHideReachedLandingMarker(id ball);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -114,6 +121,15 @@ static BOOL gECPotted[20];
 static int gECWindowHits = 0;
 static __weak UIView *gECGLView = nil;
 static id gECRingTexture = nil;
+static id gECLineTexture = nil;
+static id gECPredictionMarkers[20];
+static NSMutableArray *gECReboundSprites = nil;
+static EightBPShadowPrediction gECLastShadowPrediction;
+static BOOL gECHasShadowPrediction = NO;
+static BOOL gECShadowShotMoving = NO;
+static CFTimeInterval gECShadowArmedAt = 0;
+static double gECShadowMaxPathError[EightBPShadowMaxBalls];
+static unsigned int gECShadowPathSamples[EightBPShadowMaxBalls];
 static int gECVisualLog = 0;
 static int gECReparentLog = 0;
 static int gECHiddenLog = 0;
@@ -401,6 +417,11 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECReparentLog = 0;
     gECHiddenLog = 0;
     gECCachedTable = nil;
+    gECHasShadowPrediction = NO;
+    gECShadowShotMoving = NO;
+    memset(&gECLastShadowPrediction, 0, sizeof(gECLastShadowPrediction));
+    memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
+    memset(gECShadowPathSamples, 0, sizeof(gECShadowPathSamples));
     memset(gECHasWindow, 0, sizeof(gECHasWindow));
     memset(gECPotted, 0, sizeof(gECPotted));
     ECRemoveBallMarkers();
@@ -414,6 +435,8 @@ static void ECStartHotSeatGame(id self, SEL selector) {
     gECInMatch = YES;
     // A fresh rack puts every ball back in play.
     memset(gECPotted, 0, sizeof(gECPotted));
+    gECHasShadowPrediction = NO;
+    gECShadowShotMoving = NO;
     dispatch_async(dispatch_get_main_queue(), ^{
         gECOverlayAllowed = YES;
         ECRefreshNativeGuide();
@@ -743,8 +766,57 @@ static ECccColor3B ECColorForBallNumber(int number) {
     }
 }
 
+static id ECSolidLineTexture(void) {
+    if (gECLineTexture) return gECLineTexture;
+    Class texCls = NSClassFromString(@"CCTexture2D");
+    if (!texCls) return nil;
+    SEL initSel = @selector(initWithData:pixelFormat:pixelsWide:pixelsHigh:contentSize:);
+    enum { width = 16, height = 4 };
+    uint32_t pixels[width * height];
+    for (int i = 0; i < width * height; i++) pixels[i] = 0xffffffffu;
+    static const int formats[] = {1, 0, 2, 3, 6, 7, 8, 4, 5};
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        id tex = ((id (*)(id, SEL))objc_msgSend)(texCls, @selector(alloc));
+        if (![tex respondsToSelector:initSel]) break;
+        tex = ((id (*)(id, SEL, const void *, int, unsigned long, unsigned long, CGSize))objc_msgSend)(
+            tex, initSel, pixels, formats[i], (unsigned long)width, (unsigned long)height,
+            CGSizeMake(width, height));
+        if (!ECLooksLikeObject(tex)) continue;
+        unsigned long bits = [tex respondsToSelector:@selector(bitsPerPixelForFormat)]
+            ? ((unsigned long (*)(id, SEL))objc_msgSend)(tex, @selector(bitsPerPixelForFormat)) : 0;
+        if (bits == 32) {
+            gECLineTexture = tex;
+            break;
+        }
+    }
+    if (gECLineTexture && [gECLineTexture respondsToSelector:@selector(setHasPremultipliedAlpha:)]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(gECLineTexture,
+                                                @selector(setHasPremultipliedAlpha:), YES);
+    }
+    return gECLineTexture;
+}
+
+static void ECClearPredictionVisuals(void) {
+    for (int i = 0; i < 20; i++) {
+        id marker = gECPredictionMarkers[i];
+        if (marker && [marker respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
+        }
+        gECPredictionMarkers[i] = nil;
+    }
+    for (id sprite in gECReboundSprites.copy) {
+        if ([sprite respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(sprite, @selector(removeFromParent));
+        }
+    }
+    [gECReboundSprites removeAllObjects];
+    gECHasShadowPrediction = NO;
+    gECShadowShotMoving = NO;
+    gECShadowArmedAt = 0;
+}
 
 static void ECRemoveBallMarkers(void) {
+    ECClearPredictionVisuals();
     for (int i = 0; i < 20; i++) {
         id ball = gECCachedBalls[i];
         if (!ball) continue;
@@ -1067,7 +1139,9 @@ static void ECUpdateVisualBall(id self, SEL selector) {
     if (!gECInMatch) return;
     @try {
         ECSyncCocosMarker(self, YES);
+        ECHideReachedLandingMarker(self);
         ECLogRingSnapshot();
+        ECObserveShadowParity();
     } @catch (NSException *exception) {
         ECLogLine([NSString stringWithFormat:@"cocos-marker %@", exception]);
     }
@@ -1420,7 +1494,7 @@ static BOOL ECNativePhysicsSurfaceValid(void) {
 #if defined(__arm64__)
 // The game's C++ MCNumber return ABI writes the eight-byte result through x8.
 // Bridge a normal C call (object/result/function in x0/x1/x2) into that ABI so
-// guide friction uses the same modifier-aware getters as Ball physics.
+// prediction uses the same modifier-aware friction getters as Ball physics.
 __attribute__((naked, noinline))
 static void ECInvokeMCNumberGetter(void *object, double *result, void *function) {
     __asm__ volatile(
@@ -1670,6 +1744,837 @@ static ECCollisionGuideResult ECScaleCollisionGuidePathsToPhysics(
     return result;
 }
 
+#define EC_SIM_MAX_BALLS 20
+#define EC_SIM_MAX_POINTS 24
+
+typedef struct {
+    id source;
+    int number;
+    ECDPoint start;
+    ECDPoint pos;
+    ECDPoint velocity;
+    double radius;
+    double slidingTime;
+    BOOL active;
+    BOOL moved;
+    BOOL hasRebounded;
+    int pointCount;
+    ECDPoint points[EC_SIM_MAX_POINTS];
+} ECSimBall;
+
+typedef struct { ECDPoint origin; ECDPoint size; } ECRawTableRect;
+typedef struct { const ECDPoint *begin, *end, *capacity; } ECPointVector;
+typedef struct { int16_t first, second; } ECShortPair;
+typedef struct { const ECShortPair *begin, *end, *capacity; } ECShortPairVector;
+typedef struct {
+    ECDPoint start;
+    ECDPoint end;
+    ECDPoint inward;
+} ECSimCushion;
+
+#define EC_SIM_MAX_CUSHIONS 64
+
+static BOOL ECReadNativeTableBox(id table, ECDBox *boxOut) {
+    if (!table || !boxOut) return NO;
+    SEL selector = @selector(tableBounds);
+    Method method = class_getInstanceMethod([table class], selector);
+    if (!method) return NO;
+    ECRawTableRect (*implementation)(id, SEL) =
+        (ECRawTableRect (*)(id, SEL))method_getImplementation(method);
+    if (!implementation) return NO;
+    ECRawTableRect rect = implementation(table, selector);
+    if (!ECPointValid(rect.origin) || !ECPointValid(rect.size) ||
+        rect.size.x < 100.0 || rect.size.y < 40.0 ||
+        rect.size.x > 1000.0 || rect.size.y > 1000.0) return NO;
+    *boxOut = (ECDBox){rect.origin.x, rect.origin.y,
+                      rect.origin.x + rect.size.x, rect.origin.y + rect.size.y};
+    return YES;
+}
+
+static BOOL ECSimBallInPocket(id table, ECSimBall *ball) {
+    if (!table || !ball || !ball->source) return NO;
+    SEL selector = NSSelectorFromString(@"isBallOverlappingAnyPocket:position:");
+    if (![table respondsToSelector:selector]) return NO;
+    return ((BOOL (*)(id, SEL, id, ECDPoint))objc_msgSend)(
+        table, selector, ball->source, ball->pos);
+}
+
+static int ECSnapshotNativeCushions(id table, ECDBox bounds,
+                                    ECSimCushion *segments, int capacity) {
+    if (!table || !segments || capacity <= 0) return 0;
+    Ivar shapeIvar = class_getInstanceVariable([table class], "mTableShape");
+    if (!shapeIvar) return 0;
+    const uint8_t *tableBytes = (const uint8_t *)(__bridge const void *)table;
+    const ECPointVector *shape = (const ECPointVector *)(tableBytes + ivar_getOffset(shapeIvar));
+    if (!shape->begin || !shape->end || shape->end < shape->begin) return 0;
+    ptrdiff_t pointCount = shape->end - shape->begin;
+    if (pointCount < 4 || pointCount > 256) return 0;
+
+    id cushions = nil;
+    if ([table respondsToSelector:@selector(getActiveCushions)]) {
+        cushions = ((id (*)(id, SEL))objc_msgSend)(table, @selector(getActiveCushions));
+    }
+    if (![cushions isKindOfClass:NSArray.class]) {
+        cushions = ECIvarObject(table, "_tableCushions");
+    }
+    if (![cushions isKindOfClass:NSArray.class]) return 0;
+
+    ECDPoint center = {(bounds.minX + bounds.maxX) * 0.5,
+                       (bounds.minY + bounds.maxY) * 0.5};
+    int count = 0;
+    for (id cushion in (NSArray *)cushions) {
+        if (count >= capacity || !ECLooksLikeObject(cushion)) break;
+        if ([cushion respondsToSelector:@selector(cushionActive)] &&
+            !((BOOL (*)(id, SEL))objc_msgSend)(cushion, @selector(cushionActive))) continue;
+        Ivar linesIvar = class_getInstanceVariable([cushion class], "_cushionLines");
+        if (!linesIvar) continue;
+        const uint8_t *cushionBytes = (const uint8_t *)(__bridge const void *)cushion;
+        const ECShortPairVector *lines =
+            (const ECShortPairVector *)(cushionBytes + ivar_getOffset(linesIvar));
+        if (!lines->begin || !lines->end || lines->end < lines->begin) continue;
+        ptrdiff_t lineCount = lines->end - lines->begin;
+        if (lineCount < 0 || lineCount > 64) continue;
+        for (ptrdiff_t index = 0; index < lineCount && count < capacity; index++) {
+            int first = lines->begin[index].first;
+            int second = lines->begin[index].second;
+            if (first < 0 || second < 0 || first >= pointCount || second >= pointCount ||
+                first == second) continue;
+            ECDPoint start = shape->begin[first];
+            ECDPoint end = shape->begin[second];
+            if (!ECPointValid(start) || !ECPointValid(end)) continue;
+            double dx = end.x - start.x;
+            double dy = end.y - start.y;
+            double length = hypot(dx, dy);
+            if (length < 0.1 || length > 1000.0) continue;
+            ECDPoint inward = {-dy / length, dx / length};
+            ECDPoint midpoint = {(start.x + end.x) * 0.5, (start.y + end.y) * 0.5};
+            if ((center.x - midpoint.x) * inward.x +
+                (center.y - midpoint.y) * inward.y < 0.0) {
+                inward.x = -inward.x;
+                inward.y = -inward.y;
+            }
+            segments[count++] = (ECSimCushion){
+                .start = start, .end = end, .inward = inward,
+            };
+        }
+    }
+    return count;
+}
+
+static BOOL ECResolveNativeCushion(ECSimBall *ball,
+                                   const ECSimCushion *segments, int count) {
+    if (!ball || !segments || count <= 0) return NO;
+    int best = -1;
+    double bestPenetration = 0.0;
+    ECDPoint bestNormal = {0.0, 0.0};
+    for (int index = 0; index < count; index++) {
+        ECDPoint start = segments[index].start;
+        ECDPoint end = segments[index].end;
+        double sx = end.x - start.x;
+        double sy = end.y - start.y;
+        double lengthSquared = sx * sx + sy * sy;
+        if (lengthSquared <= 1e-8) continue;
+        double projection = ((ball->pos.x - start.x) * sx +
+                             (ball->pos.y - start.y) * sy) / lengthSquared;
+        projection = fmax(0.0, fmin(1.0, projection));
+        ECDPoint nearest = {start.x + sx * projection, start.y + sy * projection};
+        double dx = ball->pos.x - nearest.x;
+        double dy = ball->pos.y - nearest.y;
+        double distance = hypot(dx, dy);
+        if (!isfinite(distance) || distance >= ball->radius) continue;
+
+        ECDPoint normal = distance > 1e-6
+            ? (ECDPoint){dx / distance, dy / distance}
+            : segments[index].inward;
+        if (normal.x * segments[index].inward.x +
+            normal.y * segments[index].inward.y < 0.0) {
+            normal = segments[index].inward;
+        }
+        double towardCushion = ball->velocity.x * normal.x +
+                               ball->velocity.y * normal.y;
+        if (towardCushion >= 0.0) continue;
+        double penetration = ball->radius - distance;
+        if (penetration > bestPenetration) {
+            best = index;
+            bestPenetration = penetration;
+            bestNormal = normal;
+        }
+    }
+    if (best < 0) return NO;
+    ball->pos.x += bestNormal.x * bestPenetration;
+    ball->pos.y += bestNormal.y * bestPenetration;
+    double normalVelocity = ball->velocity.x * bestNormal.x +
+                            ball->velocity.y * bestNormal.y;
+    ball->velocity.x -= 2.0 * normalVelocity * bestNormal.x;
+    ball->velocity.y -= 2.0 * normalVelocity * bestNormal.y;
+    return YES;
+}
+
+static void ECRecordSimPoint(ECSimBall *ball, ECDPoint point) {
+    if (!ball || !ECPointValid(point) || ball->pointCount >= EC_SIM_MAX_POINTS) return;
+    if (ball->pointCount > 0) {
+        ECDPoint previous = ball->points[ball->pointCount - 1];
+        if (hypot(point.x - previous.x, point.y - previous.y) < 0.2) return;
+    }
+    ball->points[ball->pointCount++] = point;
+}
+
+static int ECSnapshotSimulationBalls(ECSimBall *balls, int capacity) {
+    if (!balls || capacity <= 0) return 0;
+    int count = 0;
+    for (int i = 0; i < gECCachedSnapCount && count < capacity; i++) {
+        id ball = gECCachedBalls[i];
+        if (!ECLooksLikeObject(ball) || ECBallIsPotted(ball)) continue;
+        ECDPoint position = ECBallLivePosition(ball);
+        double radius = ECBallLiveRadius(ball);
+        if (!ECPointValid(position) || radius <= 0.0) continue;
+        balls[count] = (ECSimBall){
+            .source = ball,
+            .number = ball == gECCachedCueBall ? 0 : ECBallNumber(ball),
+            .start = position,
+            .pos = position,
+            .velocity = {0.0, 0.0},
+            .radius = radius,
+            .slidingTime = 0.0,
+            .active = YES,
+        };
+        count++;
+    }
+    return count;
+}
+
+static CGPoint ECVisualPointForWorld(ECDPoint world, id referenceBall) {
+    CGPoint origin = gECCachedVisualOrigin;
+    CGPoint ownOrigin = CGPointMake(NAN, NAN);
+    if (referenceBall && ECReadPointIvar(referenceBall, "mVisualTableOrigin", &ownOrigin)) {
+        origin = ownOrigin;
+    }
+    double scale = gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+    return CGPointMake(origin.x + world.x * scale, origin.y + world.y * scale);
+}
+
+static id ECPredictionParent(void) {
+    id sphere = ECVisualSphere(gECCachedCueBall);
+    id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+    return ECLooksLikeObject(parent) ? parent : gECCachedTable;
+}
+
+static long long ECPredictionZ(void) {
+    id sphere = ECVisualSphere(gECCachedCueBall);
+    if (ECLooksLikeObject(sphere) && [sphere respondsToSelector:@selector(zOrder)]) {
+        return ((long long (*)(id, SEL))objc_msgSend)(sphere, @selector(zOrder)) + 2;
+    }
+    return 2;
+}
+
+static void ECResetReboundSprites(void) {
+    if (!gECReboundSprites) gECReboundSprites = [NSMutableArray array];
+    for (id sprite in gECReboundSprites.copy) {
+        if ([sprite respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(sprite, @selector(removeFromParent));
+        }
+    }
+    [gECReboundSprites removeAllObjects];
+}
+
+static void ECAddReboundSprite(id parent, ECDPoint from, ECDPoint to,
+                               ECccColor3B color, id referenceBall, long long z) {
+    if (!parent || !ECPointValid(from) || !ECPointValid(to)) return;
+    CGPoint start = ECVisualPointForWorld(from, referenceBall);
+    CGPoint end = ECVisualPointForWorld(to, referenceBall);
+    double dx = end.x - start.x;
+    double dy = end.y - start.y;
+    double length = hypot(dx, dy);
+    if (!isfinite(length) || length < 1.0) return;
+    id texture = ECSolidLineTexture();
+    Class spriteClass = NSClassFromString(@"CCSprite");
+    if (!texture || !spriteClass) return;
+    id sprite = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
+    sprite = ((id (*)(id, SEL, id))objc_msgSend)(sprite, @selector(initWithTexture:), texture);
+    if (!ECLooksLikeObject(sprite)) return;
+    CGSize size = [sprite respondsToSelector:@selector(contentSize)]
+        ? ((CGSize (*)(id, SEL))objc_msgSend)(sprite, @selector(contentSize)) : CGSizeMake(1, 1);
+    if ([sprite respondsToSelector:@selector(setAnchorPoint:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(sprite, @selector(setAnchorPoint:), CGPointMake(0, 0.5));
+    }
+    if ([sprite respondsToSelector:@selector(setPosition:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(sprite, @selector(setPosition:), start);
+    }
+    if ([sprite respondsToSelector:@selector(setRotation:)]) {
+        float degrees = (float)(-atan2(dy, dx) * 180.0 / M_PI);
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setRotation:), degrees);
+    }
+    if ([sprite respondsToSelector:@selector(setScaleX:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setScaleX:),
+                                                 (float)(length / MAX(1.0, size.width)));
+    }
+    if ([sprite respondsToSelector:@selector(setScaleY:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setScaleY:),
+                                                 (float)(1.6 / MAX(1.0, size.height)));
+    }
+    if ([sprite respondsToSelector:@selector(setColor:)]) {
+        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(sprite, @selector(setColor:), color);
+    }
+    if ([sprite respondsToSelector:@selector(setOpacity:)]) {
+        ((void (*)(id, SEL, unsigned char))objc_msgSend)(sprite, @selector(setOpacity:), 190);
+    }
+    if ([parent respondsToSelector:@selector(addChild:z:)]) {
+        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), sprite, z);
+    } else if ([parent respondsToSelector:@selector(addChild:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), sprite);
+    }
+    [gECReboundSprites addObject:sprite];
+}
+
+static void ECSyncLandingMarker(int index, id parent, ECSimBall *ball,
+                                id referenceBall, long long z) {
+    if (index < 0 || index >= 20 || !ball) return;
+    id marker = gECPredictionMarkers[index];
+    if (!gECShowLandingRings || !ball->active || !ball->moved) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+    if (!ECLooksLikeObject(marker)) {
+        id texture = ECCircleTexture();
+        Class spriteClass = NSClassFromString(@"CCSprite");
+        if (!texture || !spriteClass) return;
+        marker = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
+        marker = ((id (*)(id, SEL, id))objc_msgSend)(marker, @selector(initWithTexture:), texture);
+        if (!ECLooksLikeObject(marker)) return;
+        if ([marker respondsToSelector:@selector(setOpacity:)]) {
+            ((void (*)(id, SEL, unsigned char))objc_msgSend)(marker, @selector(setOpacity:), 150);
+        }
+        if ([parent respondsToSelector:@selector(addChild:z:)]) {
+            ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, z);
+        } else if ([parent respondsToSelector:@selector(addChild:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), marker);
+        }
+        gECPredictionMarkers[index] = marker;
+    }
+    id markerParent = ECInvokeId(marker, @"parent");
+    if (markerParent != parent && [parent respondsToSelector:@selector(addChild:z:)]) {
+        if ([marker respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
+        }
+        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, z);
+    }
+    ECccColor3B color = ECColorForBallNumber(ball->number);
+    if ([marker respondsToSelector:@selector(setColor:)]) {
+        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(marker, @selector(setColor:), color);
+    }
+    if ([marker respondsToSelector:@selector(setPosition:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(marker, @selector(setPosition:),
+                                                   ECVisualPointForWorld(ball->pos, referenceBall));
+    }
+    CGSize size = [marker respondsToSelector:@selector(contentSize)]
+        ? ((CGSize (*)(id, SEL))objc_msgSend)(marker, @selector(contentSize)) : CGSizeZero;
+    double visualScale = gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+    double wanted = ball->radius * visualScale * 2.0 * EC_RING_PADDING / EC_RING_OUTER_FRACTION;
+    if (size.width > 1.0 && [marker respondsToSelector:@selector(setScale:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:),
+                                                 (float)(wanted / size.width));
+    }
+    ECSetMarkerVisible(marker, YES);
+}
+
+static void ECShadowLogCallback(const char *message, void *context) {
+    (void)context;
+    if (!message || !message[0]) return;
+    ECLogLine([NSString stringWithFormat:@"shadow %s", message]);
+}
+
+static void ECRenderShadowPrediction(const EightBPShadowPrediction *prediction) {
+    if (!prediction || !prediction->valid) {
+        ECClearPredictionVisuals();
+        return;
+    }
+
+    gECLastShadowPrediction = *prediction;
+    gECHasShadowPrediction = YES;
+    gECShadowArmedAt = CACurrentMediaTime();
+    if (!gECShadowShotMoving) {
+        memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
+        memset(gECShadowPathSamples, 0, sizeof(gECShadowPathSamples));
+    }
+
+    BOOL usedMarkers[20] = {NO};
+    ECResetReboundSprites();
+    for (int index = 0;
+         index < prediction->ballCount && index < EightBPShadowMaxBalls;
+         index++) {
+        const EightBPShadowBallPrediction *source = &prediction->balls[index];
+        if (!source->valid || !source->liveBall) continue;
+
+        id ball = nil;
+        int slot = -1;
+        for (int cached = 0; cached < gECCachedSnapCount; cached++) {
+            if ((__bridge const void *)gECCachedBalls[cached] == source->liveBall) {
+                ball = gECCachedBalls[cached];
+                slot = cached;
+                break;
+            }
+        }
+        if (!ball || slot < 0 || slot >= 20) continue;
+        usedMarkers[slot] = YES;
+
+        ECDPoint start = source->pathPointCount > 0
+            ? (ECDPoint){source->path[0].x, source->path[0].y}
+            : ECBallLivePosition(ball);
+        BOOL moved = hypot(source->finalPosition.x - start.x,
+                           source->finalPosition.y - start.y) > 0.25;
+        if (source->potted || !gECShowLandingRings || !moved) {
+            ECSetMarkerVisible(gECPredictionMarkers[slot], NO);
+        } else {
+            id sphere = ECVisualSphere(ball);
+            id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+            if (ECLooksLikeObject(parent)) {
+                long long z = 2;
+                if ([sphere respondsToSelector:@selector(zOrder)]) {
+                    z = ((long long (*)(id, SEL))objc_msgSend)(
+                        sphere, @selector(zOrder)) + 2;
+                }
+                ECSimBall landing = {
+                    .source = ball,
+                    .number = (int)source->number,
+                    .pos = {source->finalPosition.x, source->finalPosition.y},
+                    .radius = ECBallLiveRadius(ball),
+                    .active = YES,
+                    .moved = YES,
+                };
+                ECSyncLandingMarker(slot, parent, &landing, ball, z);
+            }
+        }
+
+        if (!gECShowRebounds || source->pathPointCount < 2) continue;
+        id sphere = ECVisualSphere(ball);
+        id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+        if (!ECLooksLikeObject(parent)) continue;
+        long long z = 2;
+        if ([sphere respondsToSelector:@selector(zOrder)]) {
+            z = ((long long (*)(id, SEL))objc_msgSend)(
+                sphere, @selector(zOrder)) + 2;
+        }
+        ECccColor3B color = ECColorForBallNumber((int)source->number);
+        for (int point = 1;
+             point < source->pathPointCount && point < EightBPShadowMaxPathPoints;
+             point++) {
+            ECDPoint from = {source->path[point - 1].x, source->path[point - 1].y};
+            ECDPoint to = {source->path[point].x, source->path[point].y};
+            ECAddReboundSprite(parent, from, to, color, ball, z);
+        }
+    }
+    for (int slot = 0; slot < 20; slot++) {
+        if (!usedMarkers[slot]) ECSetMarkerVisible(gECPredictionMarkers[slot], NO);
+    }
+}
+
+static double ECDistanceToShadowPath(ECDPoint point,
+                                     const EightBPShadowBallPrediction *prediction) {
+    if (!prediction || prediction->pathPointCount == 0) return INFINITY;
+    double best = INFINITY;
+    for (int index = 0; index < prediction->pathPointCount; index++) {
+        ECDPoint a = {prediction->path[index].x, prediction->path[index].y};
+        if (!ECPointValid(a)) continue;
+        if (index == 0) {
+            best = fmin(best, hypot(point.x - a.x, point.y - a.y));
+            continue;
+        }
+        ECDPoint b = a;
+        a = (ECDPoint){prediction->path[index - 1].x,
+                       prediction->path[index - 1].y};
+        double dx = b.x - a.x;
+        double dy = b.y - a.y;
+        double lengthSquared = dx * dx + dy * dy;
+        double fraction = lengthSquared > 1e-12
+            ? ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared
+            : 0.0;
+        fraction = fmax(0.0, fmin(1.0, fraction));
+        ECDPoint nearest = {a.x + dx * fraction, a.y + dy * fraction};
+        best = fmin(best, hypot(point.x - nearest.x, point.y - nearest.y));
+    }
+    return best;
+}
+
+static void ECHideReachedLandingMarker(id ball) {
+    if (!ball || !gECHasShadowPrediction || !gECLastShadowPrediction.valid) return;
+    int slot = -1;
+    for (int cached = 0; cached < gECCachedSnapCount; cached++) {
+        if (gECCachedBalls[cached] == ball) {
+            slot = cached;
+            break;
+        }
+    }
+    if (slot < 0 || slot >= 20 || !gECPredictionMarkers[slot]) return;
+
+    const EightBPShadowBallPrediction *prediction = NULL;
+    for (int index = 0;
+         index < gECLastShadowPrediction.ballCount && index < EightBPShadowMaxBalls;
+         index++) {
+        const EightBPShadowBallPrediction *candidate = &gECLastShadowPrediction.balls[index];
+        if (candidate->valid && candidate->liveBall == (__bridge const void *)ball) {
+            prediction = candidate;
+            break;
+        }
+    }
+    if (!prediction || prediction->potted) {
+        ECSetMarkerVisible(gECPredictionMarkers[slot], NO);
+        return;
+    }
+    ECDPoint actual = ECBallLivePosition(ball);
+    if (!ECPointValid(actual)) return;
+    double radius = ECBallLiveRadius(ball);
+    double hitRadius = fmax(0.35, radius * 0.85);
+    if (hypot(actual.x - prediction->finalPosition.x,
+              actual.y - prediction->finalPosition.y) <= hitRadius) {
+        ECSetMarkerVisible(gECPredictionMarkers[slot], NO);
+    }
+}
+
+static void ECObserveShadowParity(void) {
+    if (!gECHasShadowPrediction || !gECLastShadowPrediction.valid) return;
+    static CFTimeInterval lastObservation = 0;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastObservation < (1.0 / 60.0)) return;
+    lastObservation = now;
+    BOOL anyMoving = NO;
+    for (int index = 0;
+         index < gECLastShadowPrediction.ballCount &&
+         index < EightBPShadowMaxBalls;
+         index++) {
+        const EightBPShadowBallPrediction *prediction =
+            &gECLastShadowPrediction.balls[index];
+        if (!prediction->valid || !prediction->liveBall) continue;
+        id ball = nil;
+        for (int slot = 0; slot < gECCachedSnapCount; slot++) {
+            if ((__bridge const void *)gECCachedBalls[slot] == prediction->liveBall) {
+                ball = gECCachedBalls[slot];
+                break;
+            }
+        }
+        if (!ball) continue;
+        BOOL moving = [ball respondsToSelector:@selector(isMovingOrSpinning)] &&
+            ((BOOL (*)(id, SEL))objc_msgSend)(ball, @selector(isMovingOrSpinning));
+        anyMoving = anyMoving || moving;
+        if (moving) {
+            ECDPoint position = ECBallLivePosition(ball);
+            double pathError = ECDistanceToShadowPath(position, prediction);
+            if (isfinite(pathError)) {
+                gECShadowMaxPathError[index] =
+                    fmax(gECShadowMaxPathError[index], pathError);
+                gECShadowPathSamples[index]++;
+            }
+        }
+    }
+    if (anyMoving) {
+        gECShadowShotMoving = YES;
+        return;
+    }
+    if (!gECShadowShotMoving) return;
+
+    for (int index = 0;
+         index < gECLastShadowPrediction.ballCount &&
+         index < EightBPShadowMaxBalls;
+         index++) {
+        const EightBPShadowBallPrediction *prediction =
+            &gECLastShadowPrediction.balls[index];
+        if (!prediction->valid || !prediction->liveBall) continue;
+        id ball = nil;
+        for (int slot = 0; slot < gECCachedSnapCount; slot++) {
+            if ((__bridge const void *)gECCachedBalls[slot] == prediction->liveBall) {
+                ball = gECCachedBalls[slot];
+                break;
+            }
+        }
+        if (!ball) continue;
+        ECDPoint actual = ECBallLivePosition(ball);
+        double finalError = prediction->potted || !ECPointValid(actual)
+            ? NAN : hypot(actual.x - prediction->finalPosition.x,
+                          actual.y - prediction->finalPosition.y);
+        ECLogLine([NSString stringWithFormat:
+            @"shadow-parity ball=%u predictedPotted=%d actualPotted=%d finalError=%.5f pathMax=%.5f samples=%u",
+            prediction->number, prediction->potted, ECBallIsPotted(ball),
+            finalError, gECShadowMaxPathError[index],
+            gECShadowPathSamples[index]]);
+    }
+    gECShadowShotMoving = NO;
+    gECHasShadowPrediction = NO;
+    ECClearPredictionVisuals();
+}
+
+#if 0
+static void ECSyncNativeObjectLandingRing(void *guide, BOOL collisionReachable) {
+    id marker = gECPredictionMarkers[0];
+    if (!guide || !collisionReachable || !gECShowLandingRings) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+
+    uint8_t *bytes = (uint8_t *)guide;
+    if (bytes[0x98] != 1 || bytes[0x9a] != 1) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+    uint8_t *active = NULL;
+    memcpy(&active, bytes + 0x218, sizeof(active));
+    if (active != bytes + 0x118 && active != bytes + 0x158 &&
+        active != bytes + 0x198 && active != bytes + 0x1d8) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+
+    // The native guide owns two outgoing branches. Match each branch's start
+    // against the exact rendered object-ball positions; this identifies the
+    // struck ball without guessing which temporary-ball slot is the object.
+    id targetBall = nil;
+    ECDPoint targetEnd = {NAN, NAN};
+    double bestDistance = INFINITY;
+    for (int path = 0; path < 2; path++) {
+        ECDPoint start = {NAN, NAN};
+        ECDPoint end = {NAN, NAN};
+        size_t offset = (size_t)path * 0x20;
+        memcpy(&start, active + offset, sizeof(start));
+        memcpy(&end, active + offset + 0x10, sizeof(end));
+        if (!ECPointValid(start) || !ECPointValid(end)) continue;
+        for (int slot = 0; slot < gECCachedSnapCount; slot++) {
+            id ball = gECCachedBalls[slot];
+            if (!ball || ball == gECCachedCueBall || ECBallIsPotted(ball)) continue;
+            id sphere = ECVisualSphere(ball);
+            if (!ECLooksLikeObject(sphere) ||
+                ![sphere respondsToSelector:@selector(position)]) continue;
+            CGPoint position =
+                ((CGPoint (*)(id, SEL))objc_msgSend)(sphere, @selector(position));
+            double distance = hypot(start.x - position.x, start.y - position.y);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                targetBall = ball;
+                targetEnd = end;
+            }
+        }
+    }
+    if (!targetBall || !ECPointValid(targetEnd) || bestDistance > 30.0) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+
+    CGPoint origin = CGPointMake(NAN, NAN);
+    if (!ECReadPointIvar(targetBall, "mVisualTableOrigin", &origin)) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+    double visualScale =
+        gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+    ECSimBall landing = {
+        .source = targetBall,
+        .number = ECBallNumber(targetBall),
+        .pos = {(targetEnd.x - origin.x) / visualScale,
+                (targetEnd.y - origin.y) / visualScale},
+        .radius = ECBallLiveRadius(targetBall),
+        .active = YES,
+        .moved = YES,
+    };
+    id sphere = ECVisualSphere(targetBall);
+    id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+    long long z = 2;
+    if (ECLooksLikeObject(sphere) && [sphere respondsToSelector:@selector(zOrder)]) {
+        z = ((long long (*)(id, SEL))objc_msgSend)(sphere, @selector(zOrder)) + 2;
+    }
+    if (!ECLooksLikeObject(parent)) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+    ECSyncLandingMarker(0, parent, &landing, targetBall, z);
+}
+
+static void ECRunFullTablePrediction(void *guide, double initialSpeed,
+                                     const double *friction,
+                                     double slidingReduction, double rollingReduction) {
+    static CFTimeInterval lastRun = 0;
+    static double lastSpeed = NAN;
+    static ECDPoint lastDirection = {NAN, NAN};
+    CFTimeInterval now = CACurrentMediaTime();
+
+    if (!guide || initialSpeed <= 0.1 || (!gECShowRebounds && !gECShowLandingRings)) {
+        ECClearPredictionVisuals();
+        return;
+    }
+    id table = gECCachedTable;
+    id cueBall = gECCachedCueBall;
+    id parent = ECPredictionParent();
+    if (!table || !cueBall || !parent) return;
+
+    // The game's large tableBounds struct return and private C++ cushion
+    // vectors are not ABI-safe to call/read from injected Objective-C. They
+    // caused the first powered prediction to terminate the guest. The verified
+    // 254 x 127 physics box is stable for this table/version.
+    ECDBox bounds = ECDefaultTableBox();
+    gECTableBox = bounds;
+
+    uint8_t *guideBytes = (uint8_t *)guide;
+    ECDPoint primaryStart = {NAN, NAN};
+    ECDPoint primaryEnd = {NAN, NAN};
+    memcpy(&primaryStart, guideBytes + 0xb0, sizeof(primaryStart));
+    memcpy(&primaryEnd, guideBytes + 0xc0, sizeof(primaryEnd));
+    ECDPoint direction = ECNorm((ECDPoint){primaryEnd.x - primaryStart.x,
+                                           primaryEnd.y - primaryStart.y});
+    if (!ECPointValid(direction) || hypot(direction.x, direction.y) < 0.5) return;
+    double directionDelta = isfinite(lastDirection.x)
+        ? hypot(direction.x - lastDirection.x, direction.y - lastDirection.y) : INFINITY;
+    if (now - lastRun < 0.10 && isfinite(lastSpeed) &&
+        fabs(initialSpeed - lastSpeed) < 5.0 && directionDelta < 0.002) return;
+    lastRun = now;
+    lastSpeed = initialSpeed;
+    lastDirection = direction;
+
+    ECSimBall balls[EC_SIM_MAX_BALLS] = {0};
+    int count = ECSnapshotSimulationBalls(balls, EC_SIM_MAX_BALLS);
+    int cueIndex = -1;
+    for (int i = 0; i < count; i++) {
+        if (balls[i].source == cueBall) { cueIndex = i; break; }
+    }
+    if (cueIndex < 0) return;
+    balls[cueIndex].velocity = (ECDPoint){direction.x * initialSpeed, direction.y * initialSpeed};
+    balls[cueIndex].slidingTime = initialSpeed * friction[3];
+
+    ECSimCushion cushions[EC_SIM_MAX_CUSHIONS] = {0};
+    int cushionCount = 0;
+
+    const double dt = 1.0 / 120.0;
+    const int maxSteps = 7800;
+    for (int step = 0; step < maxSteps; step++) {
+        BOOL anyMoving = NO;
+        for (int i = 0; i < count; i++) {
+            ECSimBall *ball = &balls[i];
+            if (!ball->active) continue;
+            double speed = hypot(ball->velocity.x, ball->velocity.y);
+            if (speed < 0.04) {
+                ball->velocity = (ECDPoint){0, 0};
+                continue;
+            }
+            anyMoving = YES;
+            ball->moved = ball->moved || hypot(ball->pos.x - ball->start.x,
+                                               ball->pos.y - ball->start.y) > 0.25;
+            ball->pos.x += ball->velocity.x * dt;
+            ball->pos.y += ball->velocity.y * dt;
+
+            if (ECSimBallInPocket(table, ball)) {
+                if (ball->hasRebounded) ECRecordSimPoint(ball, ball->pos);
+                ball->active = NO;
+                ball->velocity = (ECDPoint){0, 0};
+                continue;
+            }
+
+            BOOL rebound = ECResolveNativeCushion(ball, cushions, cushionCount);
+            if (!rebound && cushionCount == 0) {
+                // Defensive fallback for an unsupported table implementation.
+                double left = bounds.minX + ball->radius;
+                double right = bounds.maxX - ball->radius;
+                double bottom = bounds.minY + ball->radius;
+                double top = bounds.maxY - ball->radius;
+                if (ball->pos.x < left && ball->velocity.x < 0) {
+                    ball->pos.x = left + (left - ball->pos.x);
+                    ball->velocity.x = -ball->velocity.x;
+                    rebound = YES;
+                } else if (ball->pos.x > right && ball->velocity.x > 0) {
+                    ball->pos.x = right - (ball->pos.x - right);
+                    ball->velocity.x = -ball->velocity.x;
+                    rebound = YES;
+                }
+                if (ball->pos.y < bottom && ball->velocity.y < 0) {
+                    ball->pos.y = bottom + (bottom - ball->pos.y);
+                    ball->velocity.y = -ball->velocity.y;
+                    rebound = YES;
+                } else if (ball->pos.y > top && ball->velocity.y > 0) {
+                    ball->pos.y = top - (ball->pos.y - top);
+                    ball->velocity.y = -ball->velocity.y;
+                    rebound = YES;
+                }
+            }
+            if (rebound) {
+                if (!ball->hasRebounded) ball->hasRebounded = YES;
+                ECRecordSimPoint(ball, ball->pos);
+            }
+        }
+
+        for (int i = 0; i < count; i++) {
+            if (!balls[i].active) continue;
+            for (int j = i + 1; j < count; j++) {
+                if (!balls[j].active) continue;
+                double dx = balls[j].pos.x - balls[i].pos.x;
+                double dy = balls[j].pos.y - balls[i].pos.y;
+                double distance = hypot(dx, dy);
+                double contact = balls[i].radius + balls[j].radius;
+                if (!isfinite(distance) || distance <= 1e-8 || distance >= contact) continue;
+                ECDPoint normal = {dx / distance, dy / distance};
+                double relative = (balls[i].velocity.x - balls[j].velocity.x) * normal.x +
+                                  (balls[i].velocity.y - balls[j].velocity.y) * normal.y;
+                double overlap = contact - distance;
+                balls[i].pos.x -= normal.x * overlap * 0.5;
+                balls[i].pos.y -= normal.y * overlap * 0.5;
+                balls[j].pos.x += normal.x * overlap * 0.5;
+                balls[j].pos.y += normal.y * overlap * 0.5;
+                if (relative <= 0.0) continue;
+                balls[i].velocity.x -= normal.x * relative;
+                balls[i].velocity.y -= normal.y * relative;
+                balls[j].velocity.x += normal.x * relative;
+                balls[j].velocity.y += normal.y * relative;
+                double speedI = hypot(balls[i].velocity.x, balls[i].velocity.y);
+                double speedJ = hypot(balls[j].velocity.x, balls[j].velocity.y);
+                balls[i].slidingTime = MAX(balls[i].slidingTime, speedI * friction[3]);
+                balls[j].slidingTime = MAX(balls[j].slidingTime, speedJ * friction[3]);
+                balls[i].moved = balls[j].moved = YES;
+                if (balls[i].hasRebounded) ECRecordSimPoint(&balls[i], balls[i].pos);
+                if (balls[j].hasRebounded) ECRecordSimPoint(&balls[j], balls[j].pos);
+            }
+        }
+
+        for (int i = 0; i < count; i++) {
+            ECSimBall *ball = &balls[i];
+            if (!ball->active) continue;
+            double speed = hypot(ball->velocity.x, ball->velocity.y);
+            if (speed <= 0.0) continue;
+            double reduction = ball->slidingTime > 0.0 ? slidingReduction : rollingReduction;
+            double nextSpeed = fmax(0.0, speed - reduction * dt);
+            double ratio = nextSpeed / speed;
+            ball->velocity.x *= ratio;
+            ball->velocity.y *= ratio;
+            ball->slidingTime = fmax(0.0, ball->slidingTime - dt);
+        }
+        if (!anyMoving) break;
+    }
+
+    ECResetReboundSprites();
+    long long z = ECPredictionZ();
+    for (int i = 0; i < count; i++) {
+        ECSimBall *ball = &balls[i];
+        if (ball->hasRebounded && ball->active) ECRecordSimPoint(ball, ball->pos);
+        if (gECShowRebounds && ball->pointCount >= 2) {
+            ECccColor3B color = ECColorForBallNumber(ball->number);
+            for (int point = 1; point < ball->pointCount; point++) {
+                ECAddReboundSprite(parent, ball->points[point - 1], ball->points[point],
+                                   color, cueBall, z);
+            }
+        }
+        ECSyncLandingMarker(i, parent, ball, cueBall, z + 1);
+    }
+    for (int i = count; i < 20; i++) ECSetMarkerVisible(gECPredictionMarkers[i], NO);
+
+    static CFTimeInterval lastLog = 0;
+    if (now - lastLog > 0.75) {
+        lastLog = now;
+        int moved = 0, potted = 0, reboundLines = 0;
+        for (int i = 0; i < count; i++) {
+            if (balls[i].moved) moved++;
+            if (!balls[i].active) potted++;
+            reboundLines += MAX(0, balls[i].pointCount - 1);
+        }
+        ECLogLine([NSString stringWithFormat:
+            @"full-prediction balls=%d moved=%d potted=%d rebounds=%d cushions=%d bounds=%.2f,%.2f..%.2f,%.2f",
+            count, moved, potted, reboundLines, cushionCount,
+            bounds.minX, bounds.minY, bounds.maxX, bounds.maxY]);
+    }
+}
+#endif
+
 static void ECUpdatePhysicsGuideForCue(id visualCue) {
     static BOOL updating = NO;
     if (updating) return;
@@ -1730,6 +2635,63 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
                 guide, initialSpeed, nativeHitDistance, friction,
                 effectiveSliding, effectiveRolling);
         }
+    }
+
+    // Prediction is detached from the live table. Any failed version, ABI,
+    // geometry, ownership, or event gate clears the overlay rather than
+    // presenting an approximate endpoint.
+    if (guide && initialSpeed > 0.1 &&
+        (gECShowRebounds || gECShowLandingRings)) {
+        static CFTimeInterval lastShadow = 0;
+        static double lastShadowSpeed = NAN;
+        static ECDPoint lastShadowDirection = {NAN, NAN};
+        CFTimeInterval shadowNow = CACurrentMediaTime();
+        ECDPoint shadowDirection = {NAN, NAN};
+        ECDPoint start = {NAN, NAN};
+        ECDPoint end = {NAN, NAN};
+        memcpy(&start, (uint8_t *)guide + 0xb0, sizeof(start));
+        memcpy(&end, (uint8_t *)guide + 0xc0, sizeof(end));
+        shadowDirection = ECNorm((ECDPoint){end.x - start.x, end.y - start.y});
+        double directionDelta = isfinite(lastShadowDirection.x)
+            ? hypot(shadowDirection.x - lastShadowDirection.x,
+                    shadowDirection.y - lastShadowDirection.y)
+            : INFINITY;
+        if (shadowNow - lastShadow >= 0.12 || !isfinite(lastShadowSpeed) ||
+            fabs(initialSpeed - lastShadowSpeed) >= 8.0 || directionDelta >= 0.008) {
+            lastShadow = shadowNow;
+            lastShadowSpeed = initialSpeed;
+            lastShadowDirection = shadowDirection;
+            EightBPShadowPrediction prediction = {0};
+            BOOL predictionSucceeded = NO;
+            @try {
+                predictionSucceeded = EightBPShadowPredict(
+                    table, gECCachedCueBall, guide, initialSpeed, friction, &prediction);
+            } @catch (NSException *exception) {
+                ECLogLine([NSString stringWithFormat:
+                    @"shadow-predict Objective-C exception %@: %@",
+                    exception.name, exception.reason ?: @"unknown"]);
+            }
+            if (predictionSucceeded) {
+                ECLogLine([NSString stringWithFormat:
+                    @"shadow-predict ok frames=%u events=%u balls=%u status=%s",
+                    prediction.simulatedFrames, prediction.resolvedEvents,
+                    prediction.ballCount, prediction.status]);
+                ECRenderShadowPrediction(&prediction);
+            } else {
+                ECLogLine([NSString stringWithFormat:@"shadow-predict fail %s",
+                           prediction.status[0] ? prediction.status
+                                                : EightBPShadowLastStatus()]);
+                ECClearPredictionVisuals();
+            }
+        }
+    } else {
+        // Releasing the power control starts the real shot. Preserve the last
+        // prediction while the balls begin moving; updateVisualBall removes
+        // each destination ring on arrival and clears the remaining paths when
+        // the table settles. A cancelled pull expires after a short grace time.
+        BOOL waitingForShot = gECHasShadowPrediction && !gECShadowShotMoving &&
+            CACurrentMediaTime() - gECShadowArmedAt < 1.25;
+        if (!gECShadowShotMoving && !waitingForShot) ECClearPredictionVisuals();
     }
 
     static CFTimeInterval lastLogTime = 0;
@@ -2229,13 +3191,20 @@ static void ECRequestOverlayRedraw(void) {
     self.panel = nil;
 }
 
+- (void)refreshPrediction {
+    id cue = gECActiveVisualCue;
+    if (!cue) cue = ECIvarObject(ECFindGameManager(), "mVisualCue");
+    if (!cue) cue = ECIvarObject(ECFindGameManager(), "_visualCue");
+    ECUpdatePhysicsGuideForCue(cue);
+}
+
 - (void)renderMenu {
     EmberMenuPanel *panel = self.panel;
     if (!panel) return;
     [panel clearRows];
-    [panel setStatus:ECIsLocalMatch() ? @"OFFLINE GUIDE READY" : @"NETWORK MODE LOCKED"];
+    [panel setStatus:ECIsLocalMatch() ? @"OFFLINE PHYSICS READY" : @"NETWORK MODE LOCKED"];
     [panel setFooter:@"EMBER TOOLKIT  |  8 Ball Pool 56.29.2"];
-    [panel addSection:@"AIM GUIDE"];
+    [panel addSection:@"SHOT PREDICTION"];
 
     __weak typeof(self) weakSelf = self;
     [panel addToggle:@"PHYSICS GUIDE"
@@ -2243,6 +3212,25 @@ static void ECRequestOverlayRedraw(void) {
              enabled:gECMultiplier > 1
              handler:^(BOOL enabled) {
         [weakSelf saveMultiplier:enabled ? 8 : 1];
+        if (!enabled) ECClearPredictionVisuals();
+    }];
+    [panel addToggle:@"CUSHION REBOUNDS"
+              detail:@"Continue predicted paths after cushion contacts"
+             enabled:gECShowRebounds
+             handler:^(BOOL enabled) {
+        gECShowRebounds = enabled;
+        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:ECReboundsKey];
+        if (!enabled && !gECShowLandingRings) ECClearPredictionVisuals();
+        [weakSelf refreshPrediction];
+    }];
+    [panel addToggle:@"LANDING RINGS"
+              detail:@"Show each moving ball's predicted resting position"
+             enabled:gECShowLandingRings
+             handler:^(BOOL enabled) {
+        gECShowLandingRings = enabled;
+        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:ECLandingRingsKey];
+        if (!enabled && !gECShowRebounds) ECClearPredictionVisuals();
+        [weakSelf refreshPrediction];
     }];
 
     [panel addSection:@"RINGS FOLLOW EACH BALL'S COLOUR"];
@@ -2262,7 +3250,7 @@ static void ECRequestOverlayRedraw(void) {
         accentColor:[UIColor colorWithRed:0.95 green:0.72 blue:0.12 alpha:1.0]];
     __weak typeof(self) weakSelf = self;
     panel.onClose = ^{ [weakSelf closePanel]; };
-    [panel setTabs:@[@"Guide"] activeTab:0 handler:^(NSInteger index) {
+    [panel setTabs:@[@"Prediction"] activeTab:0 handler:^(NSInteger index) {
         [weakSelf renderMenu];
     }];
     self.panel = panel;
@@ -2391,6 +3379,12 @@ static void EmberEightBPOfflineLinesBoot(void) {
     }
     NSInteger saved = [NSUserDefaults.standardUserDefaults integerForKey:ECMultiplierKey];
     gECMultiplier = (saved == 1 || saved == 2 || saved == 4 || saved == 8) ? saved : 8;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    gECShowRebounds = [defaults objectForKey:ECReboundsKey] == nil
+        ? YES : [defaults boolForKey:ECReboundsKey];
+    gECShowLandingRings = [defaults objectForKey:ECLandingRingsKey] == nil
+        ? YES : [defaults boolForKey:ECLandingRingsKey];
+    EightBPShadowSetLogCallback(ECShadowLogCallback, NULL);
     ECInstallHooks();
     EmberEightBPOfflineLinesController *controller = [EmberEightBPOfflineLinesController sharedController];
     [controller start];

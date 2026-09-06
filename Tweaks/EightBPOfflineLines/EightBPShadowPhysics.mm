@@ -20,13 +20,10 @@
 #error EightBPShadowPhysics requires arm64
 #endif
 
-// The query-facade return ABI is reconstructed from static analysis but has not
-// yet passed the passive on-device parity stages. Keep execution fail-closed.
+// The query facade mirrors the private ABI used by 56.29.2. Keep every entry
+// behind the version/opcode/layout gates below.
 #ifndef EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI
-// Keep the full native query/simulation path disabled until ConstructClone /
-// SnapshotGeometry / QueryCollision survive an on-device dry-run without killing
-// the guest. Validation helpers can still be exercised offline.
-#define EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI 0
+#define EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI 1
 #endif
 
 struct NativePoint {
@@ -45,6 +42,12 @@ struct NativeNumber {
 struct NativeRect {
     NativePoint origin;
     NativePoint size;
+    // MCRect contains non-trivial MCNumber members and is returned indirectly
+    // through x8. Without these methods clang treats this as a four-double HFA
+    // and returns it in d0-d3, leaving the native caller's x8 buffer unwritten.
+    NativeRect() : origin{}, size{} {}
+    NativeRect(const NativeRect &other) : origin(other.origin), size(other.size) {}
+    ~NativeRect() {}
 };
 
 struct NativeVectorHeader {
@@ -346,8 +349,14 @@ static bool ValidateVTables(intptr_t slide) {
     };
     for (const VTableGate &gate : gates) {
         const auto *addressPoint = static_cast<const uintptr_t *>(SlidAddress(gate.vtable, slide));
-        if (!addressPoint || addressPoint[2] != reinterpret_cast<uintptr_t>(
-                SlidAddress(gate.resolver, slide))) return false;
+        if (!addressPoint) return false;
+        // arm64e dyld fixups may sign the function pointer stored in the
+        // vtable. Compare canonical address bits rather than the PAC payload.
+        constexpr uintptr_t kCanonicalAddressMask = 0x0000FFFFFFFFFFFFULL;
+        uintptr_t actual = addressPoint[2] & kCanonicalAddressMask;
+        uintptr_t expected = reinterpret_cast<uintptr_t>(
+            SlidAddress(gate.resolver, slide)) & kCanonicalAddressMask;
+        if (actual != expected) return false;
     }
     return true;
 }
@@ -575,6 +584,27 @@ static void RecordPoint(ShadowBall &ball) {
         EightBPShadowPoint last = output.path[output.pathPointCount - 1];
         if (std::fabs(last.x - point.x) <= 1.0e-8 && std::fabs(last.y - point.y) <= 1.0e-8) return;
     }
+    // Friction changes speed, not direction. Coalesce points on the same ray so
+    // the fixed-step loop cannot fill the path buffer before the first cushion.
+    // Direction changes caused by ball/cushion events remain as real vertices.
+    if (output.pathPointCount >= 2) {
+        EightBPShadowPoint a = output.path[output.pathPointCount - 2];
+        EightBPShadowPoint b = output.path[output.pathPointCount - 1];
+        double abx = b.x - a.x;
+        double aby = b.y - a.y;
+        double bpx = point.x - b.x;
+        double bpy = point.y - b.y;
+        double abLength = std::hypot(abx, aby);
+        double bpLength = std::hypot(bpx, bpy);
+        if (abLength > 1.0e-9 && bpLength > 1.0e-9) {
+            double cross = std::fabs(abx * bpy - aby * bpx) / (abLength * bpLength);
+            double dot = (abx * bpx + aby * bpy) / (abLength * bpLength);
+            if (cross < 1.0e-6 && dot > 0.999999) {
+                output.path[output.pathPointCount - 1] = {point.x, point.y};
+                return;
+            }
+        }
+    }
     if (output.pathPointCount < EightBPShadowMaxPathPoints) {
         output.path[output.pathPointCount++] = {point.x, point.y};
     }
@@ -701,6 +731,7 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
     intptr_t slide = 0;
     if (!ValidateInputSurface(table, cueBall, visualGuide, frictionValues, prediction->status,
                               &slide)) return false;
+    SetStatus(prediction->status, "shadow stage 1/4: input surface validated");
     if (!std::isfinite(initialSpeed) || initialSpeed <= 0.0 || initialSpeed > 100000.0) {
         SetStatus(prediction->status, "invalid initial speed");
         return false;
@@ -739,6 +770,7 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
             shadowBalls.push_back(std::move(state));
             RecordPoint(shadowBalls.back());
         }
+        SetStatus(prediction->status, "shadow stage 2/4: detached balls cloned");
 
         auto cueIterator = std::find_if(shadowBalls.begin(), shadowBalls.end(),
             [cueBall](const ShadowBall &entry) { return entry.live == cueBall; });
@@ -758,21 +790,34 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
         WritePoint(cueIterator->clone, 0x30,
                    {(end.x - start.x) * initialSpeed / length,
                     (end.y - start.y) * initialSpeed / length});
+        // VisualGuide's temporary cue ball carries the English selected for the
+        // pending shot. Copy its angular state; the live cue ball is still at
+        // rest while aiming and therefore cannot supply this shot input.
+        __unsafe_unretained NSObject *temporaryCue = nil;
+        std::memcpy(&temporaryCue, guideBytes + 0x08, sizeof(temporaryCue));
+        if (temporaryCue) {
+            std::memcpy(reinterpret_cast<uint8_t *>((__bridge void *)cueIterator->clone) + 0x48,
+                        reinterpret_cast<const uint8_t *>((__bridge const void *)temporaryCue) + 0x48,
+                        24);
+        }
 
         ECEightBPShadowQueryFacade *facade = [ECEightBPShadowQueryFacade new];
         facade->_shadowBalls = [clones copy];
-        facade->_fast = ((BOOL (*)(id, SEL))objc_msgSend)(
-            table, NSSelectorFromString(@"isFastComputationEnabled"));
+        // Use the full query path. The fast path depends on mutable runner
+        // bookkeeping that intentionally is not copied into the detached world.
+        facade->_fast = NO;
         if (!SnapshotGeometry(table, facade)) {
             SetStatus(prediction->status, "detached table geometry snapshot gate failed");
             return false;
         }
+        SetStatus(prediction->status, "shadow stage 3/4: table geometry copied");
         FrictionProperties friction = {};
         std::memcpy(friction.values, frictionValues, sizeof(friction.values));
         friction.table = table;
 
         const auto started = std::chrono::steady_clock::now();
         uint16_t zeroTimeEvents = 0;
+        bool firstQueryCompleted = false;
         for (uint16_t frame = 0; frame < kMaximumFrames; ++frame) {
             if (std::chrono::steady_clock::now() - started > kWallTimeLimit) {
                 SetStatus(prediction->status, "shadow simulation wall-time limit reached");
@@ -790,6 +835,10 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
                         (__bridge void *)ball.clone) + 0x20;
                     std::memcpy(beforeQuery.data() + index * 0x58, physics, 0x58);
                     CollisionPtr candidate = QueryCollision(facade, ball.clone, remaining, slide);
+                    if (!firstQueryCompleted) {
+                        firstQueryCompleted = true;
+                        SetStatus(prediction->status, "shadow stage 4/4: native collision query returned");
+                    }
                     std::memcpy(physics, beforeQuery.data() + index * 0x58, 0x58);
                     if (!candidate) continue;
                     double time = EventTime(candidate);

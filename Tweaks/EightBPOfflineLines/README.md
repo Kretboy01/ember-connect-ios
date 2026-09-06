@@ -1,39 +1,33 @@
 # 8BP Offline Lines
 
-Ember Connect tweak for 8 Ball Pool (`com.miniclip.8ballpoolmult`) **56.29.2 / build 5324**.
+An Ember Connect tweak for 8 Ball Pool (`com.miniclip.8ballpoolmult`) **56.29.2 / build 5324**.
 
 ## Active features
 
-- Colored Cocos `CCSprite` rings on each ball (identity from Ball `number` ivar)
-- Extended native VisualGuide aim lines scaled from cue force + table friction
-- Offline / Practice / Pass and Play only (`isOnNetworkedGame` stays locked)
-
-## Paused
-
-Multi-cushion rebound prediction and landing rings are **not** in the shipping
-dylib. Sources and resume notes live in `paused/` and in `E:\Cli\HANDOFF.md`.
+- Persistent Cocos ball rings tinted from each Ball's real number
+- Native VisualGuide length derived from cue force, pull power, collision transfer, and table friction
+- Detached native-physics prediction for ball collisions, cushion rebounds, pockets, and final positions
+- Same-colour destination rings that disappear when the real ball arrives
+- Shared Ember menu toggles for guide, rebounds, and destination rings
 
 ## Local-match guard
 
-Effective guide stays off when `GameManager` reports `isOnNetworkedGame`. Pass
-and Play / hotseat is `isOnLocalGame`. Practice and Play Offline stay enabled.
+The feature is disabled whenever `GameManager` reports `isOnNetworkedGame`.
+Pass and Play / hotseat, Practice, and Play Offline remain enabled.
 
-Diagnostics: guest `Documents/EmberEightBallLines.log` and
-`Library/Caches/EmberConnect/EightBPOfflineLinesStatus.plist`.
+Runtime diagnostics are written to `Documents/EmberEightBallLines.log` and
+`Library/Caches/EmberConnect/EightBPOfflineLinesStatus.plist` in the guest container.
 
-## Pack / install
+## Build
 
-Bake the dylib into the decrypted IPA by rewriting the last `LC_LOAD_DYLIB`
-(libloader → EightBPOfflineLines):
-
-```text
-E:\Cli\build_artifacts\8bp-56.29.2\pack_8ball_lines.py
+```sh
+xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=15.0 \
+  -fobjc-arc -fblocks -dynamiclib \
+  Tweaks/Shared/EmberMenu.m \
+  Tweaks/EightBPOfflineLines/EightBPShadowPhysics.mm \
+  Tweaks/EightBPOfflineLines/EightBPOfflineLines.m \
+  -framework Foundation -framework UIKit -framework QuartzCore \
+  -framework CoreGraphics -lc++ \
+  -install_name @rpath/EightBPOfflineLines.dylib \
+  -o EightBPOfflineLines.dylib
 ```
-
-After every IPA replace, restore save UUID
-`4079AF90-387F-42D5-9499-2FE794B62770` in `LCAppInfo.plist`.
-
-## Build (CI)
-
-Compiled from `EmberMenu.m` + `EightBPOfflineLines.m` in
-`.github/workflows/build-ios.yml` (no C++ / no shadow module).
