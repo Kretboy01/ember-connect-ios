@@ -143,19 +143,6 @@ using EightBPShadowCollisionVector = std::vector<CollisionPtr>;
     }
     return nil;
 }
-- (BOOL)respondsToSelector:(SEL)aSelector {
-    if ([super respondsToSelector:aSelector]) return YES;
-    return _liveTable && [_liveTable respondsToSelector:aSelector];
-}
-- (id)forwardingTargetForSelector:(SEL)aSelector {
-    // Friction / later resolvers ask friction.table for constants. Keep
-    // balls/geometry on this facade; unknown read-only selectors go to the
-    // live Table so a missing method cannot wipe the overlay.
-    if (_liveTable && [_liveTable respondsToSelector:aSelector]) {
-        return _liveTable;
-    }
-    return [super forwardingTargetForSelector:aSelector];
-}
 - (void)dealloc {
     _collisions.clear();
     if (_shotResultsInitialized && _shotResultsDestructor) {
@@ -976,11 +963,12 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
         SetStatus(prediction->status, "shadow stage 3/4: table geometry copied");
         FrictionProperties friction = {};
         std::memcpy(friction.values, frictionValues, sizeof(friction.values));
-        // Later friction reads friction.table. Using the live Table after the
-        // first contact pulls rest-pose balls back in and the path drifts a
-        // bit. The facade now implements ruleset and forwards the rest.
+        // Friction's table pointer is only used for ruleset / constants.
+        // Keep the live Table here: pointing the whole facade at it made
+        // [table ruleset] throw and cleared the overlay. Collision queries
+        // already run against the facade, which now forwards ruleset.
         facade->_liveTable = table;
-        friction.table = facade;
+        friction.table = table;
         facade->_friction = friction;
 
         const auto started = std::chrono::steady_clock::now();

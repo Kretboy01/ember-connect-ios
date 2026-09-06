@@ -129,11 +129,6 @@ static BOOL gECHasShadowPrediction = NO;
 static BOOL gECShadowShotMoving = NO;
 static BOOL gECShadowSettleCheckScheduled = NO;
 static CFTimeInterval gECShadowArmedAt = 0;
-static CFTimeInterval gECLastShadowAt = 0;
-static double gECLastShadowSpeed = NAN;
-static double gECLastShadowSpin = NAN;
-static ECDPoint gECLastShadowDirection = {NAN, NAN};
-static ECDPoint gECLastShadowHit = {NAN, NAN};
 static double gECShadowMaxPathError[EightBPShadowMaxBalls];
 static unsigned int gECShadowPathSamples[EightBPShadowMaxBalls];
 static int gECVisualLog = 0;
@@ -820,11 +815,6 @@ static void ECClearPredictionVisuals(void) {
     gECShadowShotMoving = NO;
     gECShadowSettleCheckScheduled = NO;
     gECShadowArmedAt = 0;
-    gECLastShadowAt = 0;
-    gECLastShadowSpeed = NAN;
-    gECLastShadowSpin = NAN;
-    gECLastShadowDirection = (ECDPoint){NAN, NAN};
-    gECLastShadowHit = (ECDPoint){NAN, NAN};
 }
 
 static void ECRemoveBallMarkers(void) {
@@ -2648,8 +2638,6 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         .transfer = {NAN, NAN}, .distance = {NAN, NAN},
         .nativeWorldLength = {NAN, NAN}, .applied = NO,
     };
-    ECDPoint incomingStart = {NAN, NAN};
-    ECDPoint incomingEnd = {NAN, NAN};
     if (guide) {
         void (*refresh)(void *) = (void (*)(void *))ECGameAddress(EC_VISUAL_GUIDE_REFRESH_ADDRESS);
 
@@ -2658,8 +2646,6 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         // power; the physics distance is applied to that exact native ray below.
         *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = displayDistance;
         refresh(guide);
-        memcpy(&incomingStart, (uint8_t *)guide + 0xb0, sizeof(incomingStart));
-        memcpy(&incomingEnd, (uint8_t *)guide + 0xc0, sizeof(incomingEnd));
         stoppedBeforeCollision = ECTrimNativeGuideToStoppingDistance(
             guide, predictedDistance, displayDistance, &nativeHitDistance);
 
@@ -2683,49 +2669,25 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     // presenting an approximate endpoint.
     if (guide && initialSpeed > 0.1 &&
         (gECShowRebounds || gECShowLandingRings)) {
+        static CFTimeInterval lastShadow = 0;
+        static double lastShadowSpeed = NAN;
+        static ECDPoint lastShadowDirection = {NAN, NAN};
         CFTimeInterval shadowNow = CACurrentMediaTime();
-        ECDPoint start = incomingStart;
-        ECDPoint end = incomingEnd;
-        if (!ECPointValid(start) || !ECPointValid(end)) {
-            memcpy(&start, (uint8_t *)guide + 0xb0, sizeof(start));
-            memcpy(&end, (uint8_t *)guide + 0xc0, sizeof(end));
-        }
-        ECDPoint shadowDirection = ECNorm((ECDPoint){end.x - start.x, end.y - start.y});
-        double directionDelta = isfinite(gECLastShadowDirection.x)
-            ? hypot(shadowDirection.x - gECLastShadowDirection.x,
-                    shadowDirection.y - gECLastShadowDirection.y)
+        ECDPoint shadowDirection = {NAN, NAN};
+        ECDPoint start = {NAN, NAN};
+        ECDPoint end = {NAN, NAN};
+        memcpy(&start, (uint8_t *)guide + 0xb0, sizeof(start));
+        memcpy(&end, (uint8_t *)guide + 0xc0, sizeof(end));
+        shadowDirection = ECNorm((ECDPoint){end.x - start.x, end.y - start.y});
+        double directionDelta = isfinite(lastShadowDirection.x)
+            ? hypot(shadowDirection.x - lastShadowDirection.x,
+                    shadowDirection.y - lastShadowDirection.y)
             : INFINITY;
-        double hitDelta = isfinite(gECLastShadowHit.x)
-            ? hypot(end.x - gECLastShadowHit.x, end.y - gECLastShadowHit.y)
-            : INFINITY;
-        double currentSpin = 0.0;
-        void *temporaryCue = NULL;
-        memcpy(&temporaryCue, (uint8_t *)guide + 0x08, sizeof(temporaryCue));
-        if (temporaryCue) {
-            double spin[3] = {0};
-            memcpy(spin, (uint8_t *)temporaryCue + 0x48, sizeof(spin));
-            currentSpin = hypot(spin[0], hypot(spin[1], spin[2]));
-        }
-        double spinDelta = isfinite(gECLastShadowSpin)
-            ? fabs(currentSpin - gECLastShadowSpin) : INFINITY;
-        if (shadowNow - gECLastShadowAt >= 0.05 || !isfinite(gECLastShadowSpeed) ||
-            fabs(initialSpeed - gECLastShadowSpeed) >= 1.25 ||
-            directionDelta >= 0.004 || hitDelta >= 0.35 || spinDelta >= 0.25) {
-            gECLastShadowAt = shadowNow;
-            gECLastShadowSpeed = initialSpeed;
-            gECLastShadowDirection = shadowDirection;
-            gECLastShadowHit = end;
-            gECLastShadowSpin = currentSpin;
-            ECDPoint savedStart = {NAN, NAN};
-            ECDPoint savedEnd = {NAN, NAN};
-            memcpy(&savedStart, (uint8_t *)guide + 0xb0, sizeof(savedStart));
-            memcpy(&savedEnd, (uint8_t *)guide + 0xc0, sizeof(savedEnd));
-            if (ECPointValid(incomingStart) && ECPointValid(incomingEnd) &&
-                hypot(incomingEnd.x - incomingStart.x,
-                      incomingEnd.y - incomingStart.y) > 1e-8) {
-                memcpy((uint8_t *)guide + 0xb0, &incomingStart, sizeof(incomingStart));
-                memcpy((uint8_t *)guide + 0xc0, &incomingEnd, sizeof(incomingEnd));
-            }
+        if (shadowNow - lastShadow >= 0.05 || !isfinite(lastShadowSpeed) ||
+            fabs(initialSpeed - lastShadowSpeed) >= 1.25 || directionDelta >= 0.004) {
+            lastShadow = shadowNow;
+            lastShadowSpeed = initialSpeed;
+            lastShadowDirection = shadowDirection;
             EightBPShadowPrediction prediction = {0};
             BOOL predictionSucceeded = NO;
             @try {
@@ -2736,8 +2698,6 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
                     @"shadow-predict Objective-C exception %@: %@",
                     exception.name, exception.reason ?: @"unknown"]);
             }
-            memcpy((uint8_t *)guide + 0xb0, &savedStart, sizeof(savedStart));
-            memcpy((uint8_t *)guide + 0xc0, &savedEnd, sizeof(savedEnd));
             if (predictionSucceeded) {
                 ECLogLine([NSString stringWithFormat:
                     @"shadow-predict ok frames=%u events=%u balls=%u speed=%.3f status=%s",
