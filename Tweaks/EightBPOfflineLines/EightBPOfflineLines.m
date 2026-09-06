@@ -56,6 +56,8 @@ static void ECObserveShadowParity(void);
 static void ECHideReachedLandingMarker(id ball);
 static void ECClearTableOverlay(void);
 static void ECSyncTableOverlay(void);
+static void ECClearAimContactMarker(void);
+static void ECSyncAimContactCircle(void *guide, BOOL reachable, ECDPoint contact);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -127,6 +129,7 @@ static __weak UIView *gECGLView = nil;
 static id gECRingTexture = nil;
 static id gECLineTexture = nil;
 static id gECPredictionMarkers[20];
+static id gECAimContactMarker = nil;
 static NSMutableArray *gECReboundSprites = nil;
 static NSMutableArray *gECTableOverlaySprites = nil;
 static EightBPShadowPrediction gECLastShadowPrediction;
@@ -151,6 +154,9 @@ static const void *kECMarkerKey = &kECMarkerKey;
 // Visual-only floor for an unpowered cue. Shot speed and collision reach still
 // use the real physical distance.
 #define EC_MIN_GUIDE_DISTANCE 40.0
+// Long enough to always reach the first ball or cushion. Leaving AIM at the
+// leftover post-contact budget is what shrinks the white line after you let go.
+#define EC_FIRST_HIT_AIM_DISTANCE 4000.0
 
 typedef struct {
     unsigned int force;
@@ -810,6 +816,7 @@ static void ECClearPredictionVisuals(void) {
 static void ECRemoveBallMarkers(void) {
     ECClearPredictionVisuals();
     ECClearTableOverlay();
+    ECClearAimContactMarker();
     for (int i = 0; i < 20; i++) {
         id ball = gECCachedBalls[i];
         if (!ball) continue;
@@ -2278,6 +2285,116 @@ static void ECSyncTableOverlay(void) {
         shapeCount, pocketCount, pocketRadius, scale]);
 }
 
+static void ECClearAimContactMarker(void) {
+    if (!gECAimContactMarker) return;
+    if ([gECAimContactMarker respondsToSelector:@selector(removeFromParent)]) {
+        ((void (*)(id, SEL))objc_msgSend)(gECAimContactMarker, @selector(removeFromParent));
+    }
+    gECAimContactMarker = nil;
+}
+
+static id ECStruckBallFromGuide(void *guide) {
+    if (!guide) return nil;
+    Class ballClass = NSClassFromString(@"Ball");
+    id struck = nil;
+    memcpy(&struck, (uint8_t *)guide + 0x18, sizeof(struck));
+    if (ECLooksLikeObject(struck) && struck != gECCachedCueBall &&
+        ballClass && [struck isKindOfClass:ballClass] && !ECBallIsPotted(struck)) {
+        return struck;
+    }
+    return nil;
+}
+
+static id ECNearestBallToVisual(CGPoint visual, double maxDistance) {
+    id best = nil;
+    double bestDistance = maxDistance;
+    for (int slot = 0; slot < gECCachedSnapCount; slot++) {
+        id ball = gECCachedBalls[slot];
+        if (!ball || ball == gECCachedCueBall || ECBallIsPotted(ball)) continue;
+        id sphere = ECVisualSphere(ball);
+        if (!ECLooksLikeObject(sphere) || ![sphere respondsToSelector:@selector(position)]) continue;
+        CGPoint position = ((CGPoint (*)(id, SEL))objc_msgSend)(sphere, @selector(position));
+        double distance = hypot(visual.x - position.x, visual.y - position.y);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = ball;
+        }
+    }
+    return best;
+}
+
+static void ECSyncAimContactCircle(void *guide, BOOL show, ECDPoint contact) {
+    if (!show || !guide || !ECPointValid(contact)) {
+        ECSetMarkerVisible(gECAimContactMarker, NO);
+        return;
+    }
+    id target = ECStruckBallFromGuide(guide);
+    if (!target) target = ECNearestBallToVisual(CGPointMake(contact.x, contact.y), 36.0);
+    if (!target) {
+        ECSetMarkerVisible(gECAimContactMarker, NO);
+        return;
+    }
+
+    id sphere = ECVisualSphere(target);
+    if (!ECLooksLikeObject(sphere)) sphere = ECVisualSphere(gECCachedCueBall);
+    id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+    if (!ECLooksLikeObject(parent)) {
+        ECSetMarkerVisible(gECAimContactMarker, NO);
+        return;
+    }
+
+    long long z = 2;
+    if ([sphere respondsToSelector:@selector(zOrder)]) {
+        z = ((long long (*)(id, SEL))objc_msgSend)(sphere, @selector(zOrder)) + 2;
+    }
+    id marker = gECAimContactMarker;
+    if (!ECLooksLikeObject(marker)) {
+        id texture = ECCircleTexture();
+        Class spriteClass = NSClassFromString(@"CCSprite");
+        if (!texture || !spriteClass) return;
+        marker = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
+        marker = ((id (*)(id, SEL, id))objc_msgSend)(marker, @selector(initWithTexture:), texture);
+        if (!ECLooksLikeObject(marker)) return;
+        if ([parent respondsToSelector:@selector(addChild:z:)]) {
+            ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, z);
+        } else if ([parent respondsToSelector:@selector(addChild:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), marker);
+        }
+        gECAimContactMarker = marker;
+    }
+    id markerParent = ECInvokeId(marker, @"parent");
+    if (markerParent != parent && [parent respondsToSelector:@selector(addChild:z:)]) {
+        if ([marker respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
+        }
+        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, z);
+    }
+
+    int number = ECBallNumber(target);
+    ECccColor3B color = ECColorForBallNumber(number);
+    if ([marker respondsToSelector:@selector(setColor:)]) {
+        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(marker, @selector(setColor:), color);
+    }
+    if ([marker respondsToSelector:@selector(setPosition:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(marker, @selector(setPosition:),
+                                                   CGPointMake(contact.x, contact.y));
+    }
+    CGSize size = [marker respondsToSelector:@selector(contentSize)]
+        ? ((CGSize (*)(id, SEL))objc_msgSend)(marker, @selector(contentSize)) : CGSizeZero;
+    double radius = ECBallLiveRadius(target);
+    if (radius <= 0.5) radius = 3.6;
+    double visualScale = gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+    double wanted = radius * visualScale * 2.0 * EC_RING_PADDING / EC_RING_OUTER_FRACTION;
+    if (size.width > 1.0 && [marker respondsToSelector:@selector(setScale:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:),
+                                                 (float)(wanted / size.width));
+    }
+    if ([marker respondsToSelector:@selector(setOpacity:)]) {
+        ((void (*)(id, SEL, unsigned char))objc_msgSend)(marker, @selector(setOpacity:), 230);
+    }
+    ECSetMarkerVisible(marker, YES);
+}
+
 static void ECSyncLandingMarker(int index, id parent, ECSimBall *ball,
                                 id referenceBall, long long z) {
     if (index < 0 || index >= 20 || !ball) return;
@@ -2865,12 +2982,14 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     double predictedDistance = ECPhysicsStoppingDistance(
         initialSpeed, friction, effectiveSliding, effectiveRolling);
     if (!isfinite(predictedDistance) || predictedDistance < 0.0) return;
-    double displayDistance = fmax(predictedDistance, EC_MIN_GUIDE_DISTANCE);
+    double displayDistance = fmax(predictedDistance, EC_FIRST_HIT_AIM_DISTANCE);
     updating = YES;
 
     void *guide = ECRawPointerIvar(visualCue, "mVisualGuide");
     double nativeHitDistance = NAN;
     BOOL stoppedBeforeCollision = NO;
+    ECDPoint firstHitStart = {NAN, NAN};
+    ECDPoint firstHitEnd = {NAN, NAN};
     ECCollisionGuideResult collisionResult = {
         .transfer = {NAN, NAN}, .distance = {NAN, NAN},
         .nativeWorldLength = {NAN, NAN}, .applied = NO,
@@ -2878,27 +2997,37 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     if (guide) {
         void (*refresh)(void *) = (void (*)(void *))ECGameAddress(EC_VISUAL_GUIDE_REFRESH_ADDRESS);
 
-        // First let the game resolve the real first ball/cushion intersection.
-        // Its stock guide always draws that whole segment, regardless of cue
-        // power; the physics distance is applied to that exact native ray below.
+        // Always cast a long first-hit ray. A short AIM leftover from the
+        // post-contact refresh is what collapsed the white line when you
+        // released the stick.
         *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = displayDistance;
         refresh(guide);
-        stoppedBeforeCollision = ECTrimNativeGuideToStoppingDistance(
-            guide, predictedDistance, displayDistance, &nativeHitDistance);
+        memcpy(&nativeHitDistance, (uint8_t *)guide + 0x48, sizeof(nativeHitDistance));
+        memcpy(&firstHitStart, (uint8_t *)guide + 0xb0, sizeof(firstHitStart));
+        memcpy(&firstHitEnd, (uint8_t *)guide + 0xc0, sizeof(firstHitEnd));
+        stoppedBeforeCollision = isfinite(nativeHitDistance) && nativeHitDistance > 0.0 &&
+            predictedDistance < nativeHitDistance;
 
         if (!stoppedBeforeCollision && isfinite(nativeHitDistance) &&
             nativeHitDistance >= 0.0) {
-            // Once the cue ball can reach the collision, only its remaining
-            // physical travel budget belongs to the native outgoing paths.
-            // Refreshing with that budget prevents the pre-contact distance
-            // from being counted again after impact.
             double remainingDistance = fmax(0.0, predictedDistance - nativeHitDistance);
             *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = remainingDistance;
             refresh(guide);
             collisionResult = ECScaleCollisionGuidePathsToPhysics(
                 guide, initialSpeed, nativeHitDistance, friction,
                 effectiveSliding, effectiveRolling);
+            if (ECPointValid(firstHitStart) && ECPointValid(firstHitEnd)) {
+                memcpy((uint8_t *)guide + 0xb0, &firstHitStart, sizeof(firstHitStart));
+                memcpy((uint8_t *)guide + 0xc0, &firstHitEnd, sizeof(firstHitEnd));
+                if (isfinite(nativeHitDistance) && nativeHitDistance > 0.0) {
+                    memcpy((uint8_t *)guide + 0x48, &nativeHitDistance, sizeof(nativeHitDistance));
+                }
+            }
         }
+        *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = displayDistance;
+        ECSyncAimContactCircle(guide, ((uint8_t *)guide)[0x98] == 1, firstHitEnd);
+    } else {
+        ECClearAimContactMarker();
     }
 
     // Prediction is detached from the live table. Any failed version, ABI,
