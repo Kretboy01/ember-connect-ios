@@ -621,19 +621,6 @@ static NSObject *ConstructClone(NSObject *live, Class ballClass) {
     return clone;
 }
 
-static bool BallIsMoving(NSObject *ball) {
-    if (!ball) return false;
-    NativePoint velocity = ReadPoint(ball, 0x30);
-    double spin[3] = {};
-    std::memcpy(spin,
-        reinterpret_cast<const uint8_t *>((__bridge const void *)ball) + 0x48,
-        sizeof(spin));
-    return std::hypot(velocity.x, velocity.y) > kRestSpeed ||
-           std::fabs(spin[0]) > kRestSpeed ||
-           std::fabs(spin[1]) > kRestSpeed ||
-           std::fabs(spin[2]) > kRestSpeed;
-}
-
 static void RecordPoint(ShadowBall &ball) {
     if (!ball.output || !ball.clone) return;
     NativePoint point = ReadPoint(ball.clone, 0x20);
@@ -1001,10 +988,6 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
                 for (size_t index = 0; index < shadowBalls.size(); ++index) {
                     ShadowBall &ball = shadowBalls[index];
                     if (!ball.active) continue;
-                    // The real runner only queries balls already on the moving
-                    // list. Touching rest balls in a rack return t=0 contacts
-                    // and explode the pack before the cue arrives.
-                    if (!BallIsMoving(ball.clone)) continue;
                     uint8_t *native = reinterpret_cast<uint8_t *>(
                         (__bridge void *)ball.clone) + 0x20;
                     std::memcpy(beforeQuery.data() + index * kBallQueryRestoreSpan,
