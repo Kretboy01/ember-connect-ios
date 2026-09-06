@@ -39,8 +39,6 @@ static BOOL gECShowLandingRings = YES;
 static BOOL gECShowTableOverlay = YES;
 static double gECLastFriction[7];
 static BOOL gECHasLastFriction = NO;
-static BOOL gECTableThemed = NO;
-static id gECTableLogo = nil;
 
 @class EmberEightBPLineOverlay;
 @class EmberEightBPOfflineLinesController;
@@ -62,7 +60,6 @@ static void ECClearTableOverlay(void);
 static void ECSyncTableOverlay(void);
 static void ECClearAimContactMarker(void);
 static void ECRefreshLivePrediction(void);
-static void ECApplyTableTheme(void);
 static void ECSuppressAppleIDPrompts(void);
 
 typedef struct { double x, y; } ECDPoint;
@@ -71,6 +68,8 @@ typedef struct { ECDPoint pos; double radius; } ECSnap;
 typedef struct { uint8_t r, g, b; } ECccColor3B;
 
 static BOOL ECPointValid(ECDPoint p);
+static BOOL ECWorldOnPlayingSurface(ECDPoint point);
+static ECDPoint ECBallLivePosition(id ball);
 static BOOL ECReadPointIvar(id object, const char *name, CGPoint *valueOut);
 static ECDPoint ECNorm(ECDPoint point);
 static ECDBox ECDefaultTableBox(void);
@@ -424,8 +423,6 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECHasShadowPrediction = NO;
     gECShadowShotMoving = NO;
     gECHasLastFriction = NO;
-    gECTableThemed = NO;
-    gECTableLogo = nil;
     memset(&gECLastShadowPrediction, 0, sizeof(gECLastShadowPrediction));
     memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
     memset(gECShadowPathSamples, 0, sizeof(gECShadowPathSamples));
@@ -827,11 +824,6 @@ static void ECRemoveBallMarkers(void) {
     ECClearPredictionVisuals();
     ECClearTableOverlay();
     ECClearAimContactMarker();
-    if (gECTableLogo && [gECTableLogo respondsToSelector:@selector(removeFromParent)]) {
-        ((void (*)(id, SEL))objc_msgSend)(gECTableLogo, @selector(removeFromParent));
-    }
-    gECTableLogo = nil;
-    gECTableThemed = NO;
     for (int i = 0; i < 20; i++) {
         id ball = gECCachedBalls[i];
         if (!ball) continue;
@@ -868,12 +860,23 @@ static BOOL ECBallIsPotted(id ball) {
     if (!ball) return NO;
     int slot = ECSlotForBall(ball);
     if (slot >= 0 && gECPotted[slot]) return YES;
-    if (!gECCachedTable) return NO;
-    id potted = ECIvarObject(gECCachedTable, "mBallsPotted");
-    if (![potted isKindOfClass:NSArray.class]) return NO;
-    if ([(NSArray *)potted indexOfObjectIdenticalTo:ball] == NSNotFound) return NO;
-    if (slot >= 0) gECPotted[slot] = YES;
-    return YES;
+    if (gECCachedTable) {
+        id potted = ECIvarObject(gECCachedTable, "mBallsPotted");
+        if ([potted isKindOfClass:NSArray.class] &&
+            [(NSArray *)potted indexOfObjectIdenticalTo:ball] != NSNotFound) {
+            if (slot >= 0) gECPotted[slot] = YES;
+            return YES;
+        }
+    }
+    // mBallsPotted is emptied after the shot, and it has never matched a live
+    // Ball pointer here. Rack-display balls sit off the playing surface, so
+    // treat that as potted or the last table path is redrawn on the rack.
+    ECDPoint live = ECBallLivePosition(ball);
+    if (ECPointValid(live) && !ECWorldOnPlayingSurface(live)) {
+        if (slot >= 0) gECPotted[slot] = YES;
+        return YES;
+    }
+    return NO;
 }
 
 static void ECClearPotted(id ball) {
@@ -1155,7 +1158,6 @@ static void ECUpdateVisualBall(id self, SEL selector) {
     @try {
         ECSyncCocosMarker(self, YES);
         ECHideReachedLandingMarker(self);
-        ECApplyTableTheme();
         ECSyncTableOverlay();
         ECLogRingSnapshot();
         ECObserveShadowParity();
@@ -1994,9 +1996,16 @@ static void ECResetReboundSprites(void) {
     [gECReboundSprites removeAllObjects];
 }
 
+static BOOL ECWorldOnPlayingSurface(ECDPoint point) {
+    return ECPointValid(point) &&
+           point.x > -140.0 && point.x < 140.0 &&
+           point.y > -80.0 && point.y < 80.0;
+}
+
 static void ECAddReboundSprite(id parent, ECDPoint from, ECDPoint to,
                                ECccColor3B color, id referenceBall, long long z) {
-    if (!parent || !ECPointValid(from) || !ECPointValid(to)) return;
+    if (!parent || !ECWorldOnPlayingSurface(from) || !ECWorldOnPlayingSurface(to)) return;
+    if (hypot(to.x - from.x, to.y - from.y) > 180.0) return;
     CGPoint start = ECVisualPointForWorld(from, referenceBall);
     CGPoint end = ECVisualPointForWorld(to, referenceBall);
     double dx = end.x - start.x;
@@ -2108,42 +2117,6 @@ static void ECAddTableOverlayLine(id parent, ECDPoint from, ECDPoint to,
     }
     if ([sprite respondsToSelector:@selector(setOpacity:)]) {
         ((void (*)(id, SEL, unsigned char))objc_msgSend)(sprite, @selector(setOpacity:), 210);
-    }
-    if ([parent respondsToSelector:@selector(addChild:z:)]) {
-        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), sprite, z);
-    } else if ([parent respondsToSelector:@selector(addChild:)]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), sprite);
-    }
-    if (!gECTableOverlaySprites) gECTableOverlaySprites = [NSMutableArray array];
-    [gECTableOverlaySprites addObject:sprite];
-}
-
-static void ECAddTableOverlayPocket(id parent, ECDPoint world, double radius,
-                                   ECccColor3B color, id referenceBall, long long z) {
-    if (!parent || !ECPointValid(world) || radius <= 0.2) return;
-    id texture = ECCircleTexture();
-    Class spriteClass = NSClassFromString(@"CCSprite");
-    if (!texture || !spriteClass) return;
-    id sprite = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
-    sprite = ((id (*)(id, SEL, id))objc_msgSend)(sprite, @selector(initWithTexture:), texture);
-    if (!ECLooksLikeObject(sprite)) return;
-    double visualScale = gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
-    double wanted = radius * visualScale * 2.0 * EC_RING_PADDING / EC_RING_OUTER_FRACTION;
-    CGSize size = [sprite respondsToSelector:@selector(contentSize)]
-        ? ((CGSize (*)(id, SEL))objc_msgSend)(sprite, @selector(contentSize)) : CGSizeZero;
-    if ([sprite respondsToSelector:@selector(setPosition:)]) {
-        ((void (*)(id, SEL, CGPoint))objc_msgSend)(sprite, @selector(setPosition:),
-                                                   ECVisualPointForWorld(world, referenceBall));
-    }
-    if (size.width > 1.0 && [sprite respondsToSelector:@selector(setScale:)]) {
-        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setScale:),
-                                                 (float)(wanted / size.width));
-    }
-    if ([sprite respondsToSelector:@selector(setColor:)]) {
-        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(sprite, @selector(setColor:), color);
-    }
-    if ([sprite respondsToSelector:@selector(setOpacity:)]) {
-        ((void (*)(id, SEL, unsigned char))objc_msgSend)(sprite, @selector(setOpacity:), 200);
     }
     if ([parent respondsToSelector:@selector(addChild:z:)]) {
         ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), sprite, z);
@@ -2270,8 +2243,8 @@ static void ECSyncTableOverlay(void) {
         long long sphereZ = ((long long (*)(id, SEL))objc_msgSend)(sphere, @selector(zOrder));
         z = sphereZ > 2 ? 1 : 0;
     }
-    const ECccColor3B railColor = {90, 220, 255};
-    const ECccColor3B pocketColor = {255, 208, 70};
+    const ECccColor3B railColor = {255, 120, 72};
+    const ECccColor3B pocketColor = {255, 236, 220};
     if (shapeCount >= 2) {
         double closeGap = hypot(shapePoints[0].x - shapePoints[shapeCount - 1].x,
                                 shapePoints[0].y - shapePoints[shapeCount - 1].y);
@@ -2279,7 +2252,7 @@ static void ECSyncTableOverlay(void) {
         for (int index = 0; index < edges; index++) {
             ECDPoint from = shapePoints[index];
             ECDPoint to = shapePoints[(index + 1) % shapeCount];
-            ECAddTableOverlayLine(parent, from, to, railColor, reference, z, 2.15);
+            ECAddTableOverlayLine(parent, from, to, railColor, reference, z, 1.85);
         }
     } else {
         ECDBox box = ECDefaultTableBox();
@@ -2289,12 +2262,23 @@ static void ECSyncTableOverlay(void) {
         };
         for (int index = 0; index < 4; index++) {
             ECAddTableOverlayLine(parent, corners[index], corners[(index + 1) % 4],
-                                  railColor, reference, z, 2.15);
+                                  railColor, reference, z, 1.85);
         }
     }
     for (int index = 0; index < pocketCount; index++) {
-        ECAddTableOverlayPocket(parent, pockets[index], pocketRadius,
-                                pocketColor, reference, z);
+        double radius = fmax(4.8, pocketRadius * 0.82);
+        ECDPoint previous = {NAN, NAN};
+        for (int step = 0; step <= 10; step++) {
+            double angle = (double)step * (2.0 * M_PI / 10.0);
+            ECDPoint point = {
+                pockets[index].x + cos(angle) * radius,
+                pockets[index].y + sin(angle) * radius,
+            };
+            if (ECPointValid(previous)) {
+                ECAddTableOverlayLine(parent, previous, point, pocketColor, reference, z, 1.55);
+            }
+            previous = point;
+        }
     }
     ECLogLine([NSString stringWithFormat:
         @"table-overlay shape=%d pockets=%d radius=%.2f scale=%.4f",
@@ -2501,13 +2485,18 @@ static void ECRenderShadowPrediction(const EightBPShadowPrediction *prediction) 
         }
         if (!ball || slot < 0 || slot >= 20) continue;
         usedMarkers[slot] = YES;
+        if (source->potted || ECBallIsPotted(ball)) {
+            ECSetMarkerVisible(gECPredictionMarkers[slot], NO);
+            continue;
+        }
 
         ECDPoint start = source->pathPointCount > 0
             ? (ECDPoint){source->path[0].x, source->path[0].y}
             : ECBallLivePosition(ball);
-        BOOL moved = hypot(source->finalPosition.x - start.x,
-                           source->finalPosition.y - start.y) > 0.25;
-        if (source->potted || !gECShowLandingRings || !moved) {
+        BOOL moved = source->pathPointCount >= 3 &&
+            hypot(source->finalPosition.x - start.x,
+                  source->finalPosition.y - start.y) > 8.0;
+        if (!gECShowLandingRings || !moved) {
             ECSetMarkerVisible(gECPredictionMarkers[slot], NO);
         } else {
             id sphere = ECVisualSphere(ball);
@@ -2531,21 +2520,17 @@ static void ECRenderShadowPrediction(const EightBPShadowPrediction *prediction) 
         }
 
         if (!gECShowRebounds || source->pathPointCount < 2) continue;
-        id sphere = ECVisualSphere(ball);
-        id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+        id parent = ECPredictionParent();
+        id reference = ECLooksLikeObject(gECCachedCueBall) ? gECCachedCueBall : ball;
         if (!ECLooksLikeObject(parent)) continue;
-        long long z = 2;
-        if ([sphere respondsToSelector:@selector(zOrder)]) {
-            z = ((long long (*)(id, SEL))objc_msgSend)(
-                sphere, @selector(zOrder)) + 2;
-        }
+        long long z = ECPredictionZ();
         ECccColor3B color = ECColorForBallNumber((int)source->number);
         for (int point = 1;
              point < source->pathPointCount && point < EightBPShadowMaxPathPoints;
              point++) {
             ECDPoint from = {source->path[point - 1].x, source->path[point - 1].y};
             ECDPoint to = {source->path[point].x, source->path[point].y};
-            ECAddReboundSprite(parent, from, to, color, ball, z);
+            ECAddReboundSprite(parent, from, to, color, reference, z);
         }
     }
     for (int slot = 0; slot < 20; slot++) {
@@ -2722,109 +2707,6 @@ static void ECRefreshLivePrediction(void) {
         prediction.simulatedFrames, prediction.resolvedEvents,
         prediction.ballCount, prediction.status]);
     ECRenderShadowPrediction(&prediction);
-}
-
-static void ECTintNodeIfTableArt(id node, int depth) {
-    if (!ECLooksLikeObject(node) || depth > 6) return;
-    NSString *name = NSStringFromClass([node class]);
-    if ([name containsString:@"ProjectedSphere"] || [name containsString:@"Ball"]) return;
-    if (node == gECAimContactMarker || node == gECTableLogo) return;
-    CGSize size = CGSizeZero;
-    if ([node respondsToSelector:@selector(contentSize)]) {
-        size = ((CGSize (*)(id, SEL))objc_msgSend)(node, @selector(contentSize));
-    }
-    BOOL large = size.width > 80.0 && size.height > 40.0;
-    if (large && [node respondsToSelector:@selector(setColor:)]) {
-        ECccColor3B felt = {42, 18, 16};
-        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(node, @selector(setColor:), felt);
-    }
-    id children = ECInvokeId(node, @"children");
-    if (![children isKindOfClass:NSArray.class]) return;
-    for (id child in (NSArray *)children) {
-        ECTintNodeIfTableArt(child, depth + 1);
-    }
-}
-
-static id ECEmberLogoTexture(void) {
-    static id texture = nil;
-    if (texture) return texture;
-    Class texCls = NSClassFromString(@"CCTexture2D");
-    if (!texCls) return nil;
-    const int n = 256;
-    uint32_t *pixels = calloc((size_t)n * n, sizeof(uint32_t));
-    if (!pixels) return nil;
-    float cx = (n - 1) * 0.5f;
-    for (int y = 0; y < n; y++) {
-        for (int x = 0; x < n; x++) {
-            float dx = ((float)x - cx) / cx;
-            float dy = ((float)y - cx) / cx;
-            float r = hypotf(dx, dy);
-            if (r > 0.92f) continue;
-            float flame = fmaxf(0.0f, 0.78f - (dy + 0.15f) * (dy + 0.15f) * 1.6f - fabsf(dx) * 0.55f);
-            float ring = fabsf(r - 0.78f) < 0.06f ? 1.0f : 0.0f;
-            float a = fminf(1.0f, flame * 1.4f + ring);
-            if (a <= 0.02f) continue;
-            uint32_t v = (uint32_t)(a * 255.0f);
-            pixels[y * n + x] = (v << 24) | (v << 16) | (v << 8) | v;
-        }
-    }
-    SEL initSel = @selector(initWithData:pixelFormat:pixelsWide:pixelsHigh:contentSize:);
-    static const int formats[] = {1, 0, 2, 3, 6, 7, 8};
-    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
-        id tex = ((id (*)(id, SEL))objc_msgSend)(texCls, @selector(alloc));
-        if (![tex respondsToSelector:initSel]) break;
-        tex = ((id (*)(id, SEL, const void *, int, unsigned long, unsigned long, CGSize))objc_msgSend)(
-            tex, initSel, pixels, formats[i], (unsigned long)n, (unsigned long)n, CGSizeMake(n, n));
-        if (!ECLooksLikeObject(tex)) continue;
-        unsigned long bits = [tex respondsToSelector:@selector(bitsPerPixelForFormat)]
-            ? ((unsigned long (*)(id, SEL))objc_msgSend)(tex, @selector(bitsPerPixelForFormat)) : 0;
-        if (bits == 32) {
-            texture = tex;
-            break;
-        }
-    }
-    free(pixels);
-    return texture;
-}
-
-static void ECApplyTableTheme(void) {
-    if (gECTableThemed || !gECInMatch || !gECCachedTable) return;
-    id cloth = ECIvarObject(gECCachedTable, "_clothClippingNode");
-    if (!ECLooksLikeObject(cloth)) cloth = ECIvarObject(gECCachedTable, "mClothClippingNode");
-    if (!ECLooksLikeObject(cloth)) cloth = gECCachedTable;
-    ECTintNodeIfTableArt(cloth, 0);
-    id reference = gECCachedCueBall;
-    id sphere = ECVisualSphere(reference);
-    id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : cloth;
-    if (!ECLooksLikeObject(parent)) parent = cloth;
-    id texture = ECEmberLogoTexture();
-    Class spriteClass = NSClassFromString(@"CCSprite");
-    if (texture && spriteClass && ECLooksLikeObject(parent) && !ECLooksLikeObject(gECTableLogo)) {
-        id logo = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
-        logo = ((id (*)(id, SEL, id))objc_msgSend)(logo, @selector(initWithTexture:), texture);
-        if (ECLooksLikeObject(logo)) {
-            CGPoint center = ECVisualPointForWorld((ECDPoint){0, 0}, reference);
-            if ([logo respondsToSelector:@selector(setPosition:)]) {
-                ((void (*)(id, SEL, CGPoint))objc_msgSend)(logo, @selector(setPosition:), center);
-            }
-            if ([logo respondsToSelector:@selector(setColor:)]) {
-                ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(logo, @selector(setColor:),
-                                                              (ECccColor3B){255, 94, 58});
-            }
-            if ([logo respondsToSelector:@selector(setOpacity:)]) {
-                ((void (*)(id, SEL, unsigned char))objc_msgSend)(logo, @selector(setOpacity:), 80);
-            }
-            if ([logo respondsToSelector:@selector(setScale:)]) {
-                ((void (*)(id, SEL, float))objc_msgSend)(logo, @selector(setScale:), 1.15f);
-            }
-            if ([parent respondsToSelector:@selector(addChild:z:)]) {
-                ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), logo, 0);
-            }
-            gECTableLogo = logo;
-        }
-    }
-    gECTableThemed = YES;
-    ECLogLine(@"table-theme ember felt + centre logo");
 }
 
 static void ECSuppressAppleIDPrompts(void) {
