@@ -2590,52 +2590,18 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         }
     }
 
-    // Prediction is detached from the live table. Any failed version, ABI,
-    // geometry, ownership, or event gate clears the overlay rather than
-    // presenting an approximate endpoint.
+    // The detached native shadow simulator currently terminates the guest on
+    // the first non-zero power update (log stops after Ball layout validation,
+    // before any predict ok/fail). Keep the proven guide/rings path isolated.
+    ECClearPredictionVisuals();
     if (guide && initialSpeed > 0.1 &&
         (gECShowRebounds || gECShowLandingRings)) {
-        static CFTimeInterval lastShadow = 0;
-        static double lastShadowSpeed = NAN;
-        static ECDPoint lastShadowDirection = {NAN, NAN};
-        CFTimeInterval shadowNow = CACurrentMediaTime();
-        ECDPoint shadowDirection = {NAN, NAN};
-        if (guide) {
-            ECDPoint start = {NAN, NAN};
-            ECDPoint end = {NAN, NAN};
-            memcpy(&start, (uint8_t *)guide + 0xb0, sizeof(start));
-            memcpy(&end, (uint8_t *)guide + 0xc0, sizeof(end));
-            shadowDirection = ECNorm((ECDPoint){end.x - start.x, end.y - start.y});
+        static CFTimeInterval lastShadowLog = 0;
+        CFTimeInterval nowShadow = CACurrentMediaTime();
+        if (nowShadow - lastShadowLog > 1.0) {
+            lastShadowLog = nowShadow;
+            ECLogLine(@"shadow-predict fail isolated: native query crashes guest");
         }
-        double directionDelta = isfinite(lastShadowDirection.x)
-            ? hypot(shadowDirection.x - lastShadowDirection.x,
-                    shadowDirection.y - lastShadowDirection.y)
-            : INFINITY;
-        if (shadowNow - lastShadow < 0.12 && isfinite(lastShadowSpeed) &&
-            fabs(initialSpeed - lastShadowSpeed) < 8.0 && directionDelta < 0.008) {
-            // Keep the last successful overlay while the player is only
-            // making tiny power adjustments.
-        } else {
-            lastShadow = shadowNow;
-            lastShadowSpeed = initialSpeed;
-            lastShadowDirection = shadowDirection;
-            EightBPShadowPrediction prediction = {0};
-            if (EightBPShadowPredict(table, gECCachedCueBall, guide, initialSpeed,
-                                     friction, &prediction)) {
-                ECLogLine([NSString stringWithFormat:
-                    @"shadow-predict ok frames=%u events=%u balls=%u status=%s",
-                    prediction.simulatedFrames, prediction.resolvedEvents,
-                    prediction.ballCount, prediction.status]);
-                ECRenderShadowPrediction(&prediction);
-            } else {
-                ECLogLine([NSString stringWithFormat:@"shadow-predict fail %s",
-                           prediction.status[0] ? prediction.status
-                                                : EightBPShadowLastStatus()]);
-                ECClearPredictionVisuals();
-            }
-        }
-    } else {
-        ECClearPredictionVisuals();
     }
 
     static CFTimeInterval lastLogTime = 0;

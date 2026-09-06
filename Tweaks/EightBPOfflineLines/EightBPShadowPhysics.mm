@@ -23,7 +23,10 @@
 // The query-facade return ABI is reconstructed from static analysis but has not
 // yet passed the passive on-device parity stages. Keep execution fail-closed.
 #ifndef EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI
-#define EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI 1
+// Keep the full native query/simulation path disabled until ConstructClone /
+// SnapshotGeometry / QueryCollision survive an on-device dry-run without killing
+// the guest. Validation helpers can still be exercised offline.
+#define EIGHTBP_SHADOW_ENABLE_VALIDATED_QUERY_ABI 0
 #endif
 
 struct NativePoint {
