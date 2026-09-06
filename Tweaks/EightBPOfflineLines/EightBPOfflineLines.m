@@ -11,6 +11,7 @@
 #import <string.h>
 #import <stdint.h>
 #import <stdlib.h>
+#import "../Shared/EmberMenu.h"
 
 #define EC_LINES_BUTTON_TAG 0x8B901
 #define EC_LINE_OVERLAY_TAG 0x8B902
@@ -19,6 +20,8 @@ static NSString *const ECBundleIdentifier = @"com.miniclip.8ballpoolmult";
 static NSString *const ECMultiplierKey = @"EmberEightBPOfflineLines.multiplier";
 static NSString *const ECButtonXKey = @"EmberEightBPOfflineLines.buttonX";
 static NSString *const ECButtonYKey = @"EmberEightBPOfflineLines.buttonY";
+static NSString *const ECReboundsKey = @"EmberEightBPOfflineLines.rebounds";
+static NSString *const ECLandingRingsKey = @"EmberEightBPOfflineLines.landingRings";
 
 static id gECGameManager = nil;
 static BOOL gECInMatch = NO;
@@ -29,6 +32,8 @@ static BOOL gECHooksInstalled = NO;
 static __weak id gECActiveVisualCue = nil;
 static double gECNativeAimDistance = NAN;
 static double gECLastPredictedDistance = NAN;
+static BOOL gECShowRebounds = YES;
+static BOOL gECShowLandingRings = YES;
 
 @class EmberEightBPLineOverlay;
 @class EmberEightBPOfflineLinesController;
@@ -48,6 +53,7 @@ static void ECCaptureNativeCueStats(void);
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
 typedef struct { ECDPoint pos; double radius; } ECSnap;
+typedef struct { uint8_t r, g, b; } ECccColor3B;
 
 static BOOL ECPointValid(ECDPoint p);
 static BOOL ECReadPointIvar(id object, const char *name, CGPoint *valueOut);
@@ -109,6 +115,9 @@ static BOOL gECPotted[20];
 static int gECWindowHits = 0;
 static __weak UIView *gECGLView = nil;
 static id gECRingTexture = nil;
+static id gECLineTexture = nil;
+static id gECPredictionMarkers[20];
+static NSMutableArray *gECReboundSprites = nil;
 static int gECVisualLog = 0;
 static int gECReparentLog = 0;
 static int gECHiddenLog = 0;
@@ -697,7 +706,75 @@ static id ECCircleTexture(void) {
     return gECRingTexture;
 }
 
+static int ECBallNumber(id ball) {
+    if (!ball || ![ball respondsToSelector:@selector(number)]) return ball == gECCachedCueBall ? 0 : -1;
+    return ((int (*)(id, SEL))objc_msgSend)(ball, @selector(number));
+}
+
+static ECccColor3B ECColorForBallNumber(int number) {
+    // Solids and stripes share their actual cloth-visible base colour.
+    switch (number == 0 ? 0 : ((number - 1) % 8) + 1) {
+        case 0: return (ECccColor3B){255, 255, 255};
+        case 1: return (ECccColor3B){250, 210, 35};   // yellow
+        case 2: return (ECccColor3B){45, 105, 235};   // blue
+        case 3: return (ECccColor3B){225, 48, 48};    // red
+        case 4: return (ECccColor3B){135, 65, 185};   // purple
+        case 5: return (ECccColor3B){245, 125, 28};   // orange
+        case 6: return (ECccColor3B){35, 155, 75};    // green
+        case 7: return (ECccColor3B){145, 35, 48};    // maroon
+        case 8: return (ECccColor3B){22, 22, 24};     // black
+        default: return (ECccColor3B){255, 255, 255};
+    }
+}
+
+static id ECSolidLineTexture(void) {
+    if (gECLineTexture) return gECLineTexture;
+    Class texCls = NSClassFromString(@"CCTexture2D");
+    if (!texCls) return nil;
+    SEL initSel = @selector(initWithData:pixelFormat:pixelsWide:pixelsHigh:contentSize:);
+    enum { width = 16, height = 4 };
+    uint32_t pixels[width * height];
+    for (int i = 0; i < width * height; i++) pixels[i] = 0xffffffffu;
+    static const int formats[] = {1, 0, 2, 3, 6, 7, 8, 4, 5};
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        id tex = ((id (*)(id, SEL))objc_msgSend)(texCls, @selector(alloc));
+        if (![tex respondsToSelector:initSel]) break;
+        tex = ((id (*)(id, SEL, const void *, int, unsigned long, unsigned long, CGSize))objc_msgSend)(
+            tex, initSel, pixels, formats[i], (unsigned long)width, (unsigned long)height,
+            CGSizeMake(width, height));
+        if (!ECLooksLikeObject(tex)) continue;
+        unsigned long bits = [tex respondsToSelector:@selector(bitsPerPixelForFormat)]
+            ? ((unsigned long (*)(id, SEL))objc_msgSend)(tex, @selector(bitsPerPixelForFormat)) : 0;
+        if (bits == 32) {
+            gECLineTexture = tex;
+            break;
+        }
+    }
+    if (gECLineTexture && [gECLineTexture respondsToSelector:@selector(setHasPremultipliedAlpha:)]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(gECLineTexture,
+                                                @selector(setHasPremultipliedAlpha:), YES);
+    }
+    return gECLineTexture;
+}
+
+static void ECClearPredictionVisuals(void) {
+    for (int i = 0; i < 20; i++) {
+        id marker = gECPredictionMarkers[i];
+        if (marker && [marker respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
+        }
+        gECPredictionMarkers[i] = nil;
+    }
+    for (id sprite in gECReboundSprites.copy) {
+        if ([sprite respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(sprite, @selector(removeFromParent));
+        }
+    }
+    [gECReboundSprites removeAllObjects];
+}
+
 static void ECRemoveBallMarkers(void) {
+    ECClearPredictionVisuals();
     for (int i = 0; i < 20; i++) {
         id ball = gECCachedBalls[i];
         if (!ball) continue;
@@ -830,13 +907,6 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
         if ([marker respondsToSelector:@selector(setOpacity:)]) {
             ((void (*)(id, SEL, unsigned char))objc_msgSend)(marker, @selector(setOpacity:), 230);
         }
-        typedef struct { uint8_t r, g, b; } ECccColor3B;
-        ECccColor3B color = (ball == gECCachedCueBall)
-            ? (ECccColor3B){255, 255, 255}
-            : (ECccColor3B){255, 210, 40};
-        if ([marker respondsToSelector:@selector(setColor:)]) {
-            ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(marker, @selector(setColor:), color);
-        }
         if ([parent respondsToSelector:@selector(addChild:z:)]) {
             ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, ringZ);
         } else if ([parent respondsToSelector:@selector(addChild:)]) {
@@ -848,6 +918,14 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
             ECLogLine([NSString stringWithFormat:@"cocos-marker pos=%.1f,%.1f z=%lld parent=%@ cue=%d",
                        pos.x, pos.y, ringZ, [parent class], ball == gECCachedCueBall]);
         }
+    }
+    // Retint every sync rather than only at creation: the cue-ball identity is
+    // sometimes discovered after the rack's sprites have already been made.
+    ECccColor3B ballColor = ECColorForBallNumber(
+        ball == gECCachedCueBall ? 0 : ECBallNumber(ball));
+    if ([marker respondsToSelector:@selector(setColor:)]) {
+        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(marker,
+                                                       @selector(setColor:), ballColor);
     }
     ECSetMarkerVisible(marker, YES);
     if ([marker respondsToSelector:@selector(setPosition:)]) {
@@ -1607,6 +1685,393 @@ static ECCollisionGuideResult ECScaleCollisionGuidePathsToPhysics(
     return result;
 }
 
+#define EC_SIM_MAX_BALLS 20
+#define EC_SIM_MAX_POINTS 24
+
+typedef struct {
+    id source;
+    int number;
+    ECDPoint start;
+    ECDPoint pos;
+    ECDPoint velocity;
+    double radius;
+    double slidingTime;
+    BOOL active;
+    BOOL moved;
+    BOOL hasRebounded;
+    int pointCount;
+    ECDPoint points[EC_SIM_MAX_POINTS];
+} ECSimBall;
+
+typedef struct { ECDPoint origin; ECDPoint size; } ECRawTableRect;
+
+static BOOL ECReadNativeTableBox(id table, ECDBox *boxOut) {
+    if (!table || !boxOut) return NO;
+    SEL selector = @selector(tableBounds);
+    Method method = class_getInstanceMethod([table class], selector);
+    if (!method) return NO;
+    ECRawTableRect (*implementation)(id, SEL) =
+        (ECRawTableRect (*)(id, SEL))method_getImplementation(method);
+    if (!implementation) return NO;
+    ECRawTableRect rect = implementation(table, selector);
+    if (!ECPointValid(rect.origin) || !ECPointValid(rect.size) ||
+        rect.size.x < 100.0 || rect.size.y < 40.0 ||
+        rect.size.x > 1000.0 || rect.size.y > 1000.0) return NO;
+    *boxOut = (ECDBox){rect.origin.x, rect.origin.y,
+                      rect.origin.x + rect.size.x, rect.origin.y + rect.size.y};
+    return YES;
+}
+
+static BOOL ECSimBallInPocket(id table, ECSimBall *ball) {
+    if (!table || !ball || !ball->source) return NO;
+    SEL selector = NSSelectorFromString(@"isBallOverlappingAnyPocket:position:");
+    if (![table respondsToSelector:selector]) return NO;
+    return ((BOOL (*)(id, SEL, id, ECDPoint))objc_msgSend)(
+        table, selector, ball->source, ball->pos);
+}
+
+static void ECRecordSimPoint(ECSimBall *ball, ECDPoint point) {
+    if (!ball || !ECPointValid(point) || ball->pointCount >= EC_SIM_MAX_POINTS) return;
+    if (ball->pointCount > 0) {
+        ECDPoint previous = ball->points[ball->pointCount - 1];
+        if (hypot(point.x - previous.x, point.y - previous.y) < 0.2) return;
+    }
+    ball->points[ball->pointCount++] = point;
+}
+
+static int ECSnapshotSimulationBalls(ECSimBall *balls, int capacity) {
+    if (!balls || capacity <= 0) return 0;
+    int count = 0;
+    for (int i = 0; i < gECCachedSnapCount && count < capacity; i++) {
+        id ball = gECCachedBalls[i];
+        if (!ECLooksLikeObject(ball) || ECBallIsPotted(ball)) continue;
+        ECDPoint position = ECBallLivePosition(ball);
+        double radius = ECBallLiveRadius(ball);
+        if (!ECPointValid(position) || radius <= 0.0) continue;
+        balls[count] = (ECSimBall){
+            .source = ball,
+            .number = ball == gECCachedCueBall ? 0 : ECBallNumber(ball),
+            .start = position,
+            .pos = position,
+            .velocity = {0.0, 0.0},
+            .radius = radius,
+            .slidingTime = 0.0,
+            .active = YES,
+        };
+        count++;
+    }
+    return count;
+}
+
+static CGPoint ECVisualPointForWorld(ECDPoint world, id referenceBall) {
+    CGPoint origin = gECCachedVisualOrigin;
+    CGPoint ownOrigin = CGPointMake(NAN, NAN);
+    if (referenceBall && ECReadPointIvar(referenceBall, "mVisualTableOrigin", &ownOrigin)) {
+        origin = ownOrigin;
+    }
+    double scale = gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+    return CGPointMake(origin.x + world.x * scale, origin.y + world.y * scale);
+}
+
+static id ECPredictionParent(void) {
+    id sphere = ECVisualSphere(gECCachedCueBall);
+    id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+    return ECLooksLikeObject(parent) ? parent : gECCachedTable;
+}
+
+static long long ECPredictionZ(void) {
+    id sphere = ECVisualSphere(gECCachedCueBall);
+    if (ECLooksLikeObject(sphere) && [sphere respondsToSelector:@selector(zOrder)]) {
+        return ((long long (*)(id, SEL))objc_msgSend)(sphere, @selector(zOrder)) + 2;
+    }
+    return 2;
+}
+
+static void ECResetReboundSprites(void) {
+    if (!gECReboundSprites) gECReboundSprites = [NSMutableArray array];
+    for (id sprite in gECReboundSprites.copy) {
+        if ([sprite respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(sprite, @selector(removeFromParent));
+        }
+    }
+    [gECReboundSprites removeAllObjects];
+}
+
+static void ECAddReboundSprite(id parent, ECDPoint from, ECDPoint to,
+                               ECccColor3B color, id referenceBall, long long z) {
+    if (!parent || !ECPointValid(from) || !ECPointValid(to)) return;
+    CGPoint start = ECVisualPointForWorld(from, referenceBall);
+    CGPoint end = ECVisualPointForWorld(to, referenceBall);
+    double dx = end.x - start.x;
+    double dy = end.y - start.y;
+    double length = hypot(dx, dy);
+    if (!isfinite(length) || length < 1.0) return;
+    id texture = ECSolidLineTexture();
+    Class spriteClass = NSClassFromString(@"CCSprite");
+    if (!texture || !spriteClass) return;
+    id sprite = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
+    sprite = ((id (*)(id, SEL, id))objc_msgSend)(sprite, @selector(initWithTexture:), texture);
+    if (!ECLooksLikeObject(sprite)) return;
+    CGSize size = [sprite respondsToSelector:@selector(contentSize)]
+        ? ((CGSize (*)(id, SEL))objc_msgSend)(sprite, @selector(contentSize)) : CGSizeMake(1, 1);
+    if ([sprite respondsToSelector:@selector(setAnchorPoint:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(sprite, @selector(setAnchorPoint:), CGPointMake(0, 0.5));
+    }
+    if ([sprite respondsToSelector:@selector(setPosition:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(sprite, @selector(setPosition:), start);
+    }
+    if ([sprite respondsToSelector:@selector(setRotation:)]) {
+        float degrees = (float)(-atan2(dy, dx) * 180.0 / M_PI);
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setRotation:), degrees);
+    }
+    if ([sprite respondsToSelector:@selector(setScaleX:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setScaleX:),
+                                                 (float)(length / MAX(1.0, size.width)));
+    }
+    if ([sprite respondsToSelector:@selector(setScaleY:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setScaleY:),
+                                                 (float)(1.6 / MAX(1.0, size.height)));
+    }
+    if ([sprite respondsToSelector:@selector(setColor:)]) {
+        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(sprite, @selector(setColor:), color);
+    }
+    if ([sprite respondsToSelector:@selector(setOpacity:)]) {
+        ((void (*)(id, SEL, unsigned char))objc_msgSend)(sprite, @selector(setOpacity:), 190);
+    }
+    if ([parent respondsToSelector:@selector(addChild:z:)]) {
+        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), sprite, z);
+    } else if ([parent respondsToSelector:@selector(addChild:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), sprite);
+    }
+    [gECReboundSprites addObject:sprite];
+}
+
+static void ECSyncLandingMarker(int index, id parent, ECSimBall *ball,
+                                id referenceBall, long long z) {
+    if (index < 0 || index >= 20 || !ball) return;
+    id marker = gECPredictionMarkers[index];
+    if (!gECShowLandingRings || !ball->active || !ball->moved) {
+        ECSetMarkerVisible(marker, NO);
+        return;
+    }
+    if (!ECLooksLikeObject(marker)) {
+        id texture = ECCircleTexture();
+        Class spriteClass = NSClassFromString(@"CCSprite");
+        if (!texture || !spriteClass) return;
+        marker = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
+        marker = ((id (*)(id, SEL, id))objc_msgSend)(marker, @selector(initWithTexture:), texture);
+        if (!ECLooksLikeObject(marker)) return;
+        if ([marker respondsToSelector:@selector(setOpacity:)]) {
+            ((void (*)(id, SEL, unsigned char))objc_msgSend)(marker, @selector(setOpacity:), 150);
+        }
+        if ([parent respondsToSelector:@selector(addChild:z:)]) {
+            ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, z);
+        } else if ([parent respondsToSelector:@selector(addChild:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), marker);
+        }
+        gECPredictionMarkers[index] = marker;
+    }
+    id markerParent = ECInvokeId(marker, @"parent");
+    if (markerParent != parent && [parent respondsToSelector:@selector(addChild:z:)]) {
+        if ([marker respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(marker, @selector(removeFromParent));
+        }
+        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), marker, z);
+    }
+    ECccColor3B color = ECColorForBallNumber(ball->number);
+    if ([marker respondsToSelector:@selector(setColor:)]) {
+        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(marker, @selector(setColor:), color);
+    }
+    if ([marker respondsToSelector:@selector(setPosition:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(marker, @selector(setPosition:),
+                                                   ECVisualPointForWorld(ball->pos, referenceBall));
+    }
+    CGSize size = [marker respondsToSelector:@selector(contentSize)]
+        ? ((CGSize (*)(id, SEL))objc_msgSend)(marker, @selector(contentSize)) : CGSizeZero;
+    double visualScale = gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+    double wanted = ball->radius * visualScale * 2.0 * EC_RING_PADDING / EC_RING_OUTER_FRACTION;
+    if (size.width > 1.0 && [marker respondsToSelector:@selector(setScale:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(marker, @selector(setScale:),
+                                                 (float)(wanted / size.width));
+    }
+    ECSetMarkerVisible(marker, YES);
+}
+
+static void ECRunFullTablePrediction(void *guide, double initialSpeed,
+                                     const double *friction,
+                                     double slidingReduction, double rollingReduction) {
+    static CFTimeInterval lastRun = 0;
+    static double lastSpeed = NAN;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - lastRun < 0.10 && isfinite(lastSpeed) && fabs(initialSpeed - lastSpeed) < 5.0) return;
+    lastRun = now;
+    lastSpeed = initialSpeed;
+
+    if (!guide || initialSpeed <= 0.1 || (!gECShowRebounds && !gECShowLandingRings)) {
+        ECClearPredictionVisuals();
+        return;
+    }
+    id table = gECCachedTable;
+    id cueBall = gECCachedCueBall;
+    id parent = ECPredictionParent();
+    if (!table || !cueBall || !parent) return;
+
+    ECDBox bounds = ECDefaultTableBox();
+    ECReadNativeTableBox(table, &bounds);
+    gECTableBox = bounds;
+
+    uint8_t *guideBytes = (uint8_t *)guide;
+    ECDPoint primaryStart = {NAN, NAN};
+    ECDPoint primaryEnd = {NAN, NAN};
+    memcpy(&primaryStart, guideBytes + 0xb0, sizeof(primaryStart));
+    memcpy(&primaryEnd, guideBytes + 0xc0, sizeof(primaryEnd));
+    ECDPoint direction = ECNorm((ECDPoint){primaryEnd.x - primaryStart.x,
+                                           primaryEnd.y - primaryStart.y});
+    if (!ECPointValid(direction) || hypot(direction.x, direction.y) < 0.5) return;
+
+    ECSimBall balls[EC_SIM_MAX_BALLS] = {0};
+    int count = ECSnapshotSimulationBalls(balls, EC_SIM_MAX_BALLS);
+    int cueIndex = -1;
+    for (int i = 0; i < count; i++) {
+        if (balls[i].source == cueBall) { cueIndex = i; break; }
+    }
+    if (cueIndex < 0) return;
+    balls[cueIndex].velocity = (ECDPoint){direction.x * initialSpeed, direction.y * initialSpeed};
+    balls[cueIndex].slidingTime = initialSpeed * friction[3];
+
+    const double dt = 1.0 / 120.0;
+    const int maxSteps = 7800;
+    for (int step = 0; step < maxSteps; step++) {
+        BOOL anyMoving = NO;
+        for (int i = 0; i < count; i++) {
+            ECSimBall *ball = &balls[i];
+            if (!ball->active) continue;
+            double speed = hypot(ball->velocity.x, ball->velocity.y);
+            if (speed < 0.04) {
+                ball->velocity = (ECDPoint){0, 0};
+                continue;
+            }
+            anyMoving = YES;
+            ball->moved = ball->moved || hypot(ball->pos.x - ball->start.x,
+                                               ball->pos.y - ball->start.y) > 0.25;
+            ball->pos.x += ball->velocity.x * dt;
+            ball->pos.y += ball->velocity.y * dt;
+
+            if (ECSimBallInPocket(table, ball)) {
+                if (ball->hasRebounded) ECRecordSimPoint(ball, ball->pos);
+                ball->active = NO;
+                ball->velocity = (ECDPoint){0, 0};
+                continue;
+            }
+
+            double left = bounds.minX + ball->radius;
+            double right = bounds.maxX - ball->radius;
+            double bottom = bounds.minY + ball->radius;
+            double top = bounds.maxY - ball->radius;
+            BOOL rebound = NO;
+            if (ball->pos.x < left && ball->velocity.x < 0) {
+                ball->pos.x = left + (left - ball->pos.x);
+                ball->velocity.x = -ball->velocity.x;
+                rebound = YES;
+            } else if (ball->pos.x > right && ball->velocity.x > 0) {
+                ball->pos.x = right - (ball->pos.x - right);
+                ball->velocity.x = -ball->velocity.x;
+                rebound = YES;
+            }
+            if (ball->pos.y < bottom && ball->velocity.y < 0) {
+                ball->pos.y = bottom + (bottom - ball->pos.y);
+                ball->velocity.y = -ball->velocity.y;
+                rebound = YES;
+            } else if (ball->pos.y > top && ball->velocity.y > 0) {
+                ball->pos.y = top - (ball->pos.y - top);
+                ball->velocity.y = -ball->velocity.y;
+                rebound = YES;
+            }
+            if (rebound) {
+                if (!ball->hasRebounded) ball->hasRebounded = YES;
+                ECRecordSimPoint(ball, ball->pos);
+            }
+        }
+
+        for (int i = 0; i < count; i++) {
+            if (!balls[i].active) continue;
+            for (int j = i + 1; j < count; j++) {
+                if (!balls[j].active) continue;
+                double dx = balls[j].pos.x - balls[i].pos.x;
+                double dy = balls[j].pos.y - balls[i].pos.y;
+                double distance = hypot(dx, dy);
+                double contact = balls[i].radius + balls[j].radius;
+                if (!isfinite(distance) || distance <= 1e-8 || distance >= contact) continue;
+                ECDPoint normal = {dx / distance, dy / distance};
+                double relative = (balls[i].velocity.x - balls[j].velocity.x) * normal.x +
+                                  (balls[i].velocity.y - balls[j].velocity.y) * normal.y;
+                double overlap = contact - distance;
+                balls[i].pos.x -= normal.x * overlap * 0.5;
+                balls[i].pos.y -= normal.y * overlap * 0.5;
+                balls[j].pos.x += normal.x * overlap * 0.5;
+                balls[j].pos.y += normal.y * overlap * 0.5;
+                if (relative <= 0.0) continue;
+                balls[i].velocity.x -= normal.x * relative;
+                balls[i].velocity.y -= normal.y * relative;
+                balls[j].velocity.x += normal.x * relative;
+                balls[j].velocity.y += normal.y * relative;
+                double speedI = hypot(balls[i].velocity.x, balls[i].velocity.y);
+                double speedJ = hypot(balls[j].velocity.x, balls[j].velocity.y);
+                balls[i].slidingTime = MAX(balls[i].slidingTime, speedI * friction[3]);
+                balls[j].slidingTime = MAX(balls[j].slidingTime, speedJ * friction[3]);
+                balls[i].moved = balls[j].moved = YES;
+                if (balls[i].hasRebounded) ECRecordSimPoint(&balls[i], balls[i].pos);
+                if (balls[j].hasRebounded) ECRecordSimPoint(&balls[j], balls[j].pos);
+            }
+        }
+
+        for (int i = 0; i < count; i++) {
+            ECSimBall *ball = &balls[i];
+            if (!ball->active) continue;
+            double speed = hypot(ball->velocity.x, ball->velocity.y);
+            if (speed <= 0.0) continue;
+            double reduction = ball->slidingTime > 0.0 ? slidingReduction : rollingReduction;
+            double nextSpeed = fmax(0.0, speed - reduction * dt);
+            double ratio = nextSpeed / speed;
+            ball->velocity.x *= ratio;
+            ball->velocity.y *= ratio;
+            ball->slidingTime = fmax(0.0, ball->slidingTime - dt);
+        }
+        if (!anyMoving) break;
+    }
+
+    ECResetReboundSprites();
+    long long z = ECPredictionZ();
+    for (int i = 0; i < count; i++) {
+        ECSimBall *ball = &balls[i];
+        if (ball->hasRebounded && ball->active) ECRecordSimPoint(ball, ball->pos);
+        if (gECShowRebounds && ball->pointCount >= 2) {
+            ECccColor3B color = ECColorForBallNumber(ball->number);
+            for (int point = 1; point < ball->pointCount; point++) {
+                ECAddReboundSprite(parent, ball->points[point - 1], ball->points[point],
+                                   color, cueBall, z);
+            }
+        }
+        ECSyncLandingMarker(i, parent, ball, cueBall, z + 1);
+    }
+    for (int i = count; i < 20; i++) ECSetMarkerVisible(gECPredictionMarkers[i], NO);
+
+    static CFTimeInterval lastLog = 0;
+    if (now - lastLog > 0.75) {
+        lastLog = now;
+        int moved = 0, potted = 0, reboundLines = 0;
+        for (int i = 0; i < count; i++) {
+            if (balls[i].moved) moved++;
+            if (!balls[i].active) potted++;
+            reboundLines += MAX(0, balls[i].pointCount - 1);
+        }
+        ECLogLine([NSString stringWithFormat:
+            @"full-prediction balls=%d moved=%d potted=%d rebounds=%d bounds=%.2f,%.2f..%.2f,%.2f",
+            count, moved, potted, reboundLines,
+            bounds.minX, bounds.minY, bounds.maxX, bounds.maxY]);
+    }
+}
+
 static void ECUpdatePhysicsGuideForCue(id visualCue) {
     if (!visualCue || !ECExtensionIsActive() || !ECNativePhysicsSurfaceValid()) return;
 
@@ -1664,6 +2129,9 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
                 effectiveSliding, effectiveRolling);
         }
     }
+
+    ECRunFullTablePrediction(guide, initialSpeed, friction,
+                             effectiveSliding, effectiveRolling);
 
     static CFTimeInterval lastLogTime = 0;
     CFTimeInterval now = CACurrentMediaTime();
@@ -2087,6 +2555,7 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 @interface EmberEightBPOfflineLinesController : NSObject <UIGestureRecognizerDelegate>
 @property (nonatomic, weak) UIButton *button;
 @property (nonatomic, weak) UIWindow *hostWindow;
+@property (nonatomic, strong) EmberMenuPanel *panel;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 + (instancetype)sharedController;
 - (UIWindow *)guestWindow;
@@ -2155,31 +2624,81 @@ static void ECRequestOverlayRedraw(void) {
     [presenter presentViewController:alert animated:YES completion:nil];
 }
 
+- (void)closePanel {
+    [self.panel removeFromSuperview];
+    self.panel = nil;
+}
+
+- (void)refreshPrediction {
+    id cue = gECActiveVisualCue;
+    if (!cue) cue = ECIvarObject(ECFindGameManager(), "mVisualCue");
+    if (!cue) cue = ECIvarObject(ECFindGameManager(), "_visualCue");
+    ECUpdatePhysicsGuideForCue(cue);
+}
+
+- (void)renderMenu {
+    EmberMenuPanel *panel = self.panel;
+    if (!panel) return;
+    [panel clearRows];
+    [panel setStatus:ECIsLocalMatch() ? @"OFFLINE PHYSICS READY" : @"NETWORK MODE LOCKED"];
+    [panel setFooter:@"EMBER TOOLKIT  |  8 Ball Pool 56.29.2"];
+    [panel addSection:@"SHOT PREDICTION"];
+
+    __weak typeof(self) weakSelf = self;
+    [panel addToggle:@"PHYSICS GUIDE"
+              detail:@"Scale native aim paths from cue force and table friction"
+             enabled:gECMultiplier > 1
+             handler:^(BOOL enabled) {
+        [weakSelf saveMultiplier:enabled ? 8 : 1];
+        if (!enabled) ECClearPredictionVisuals();
+    }];
+    [panel addToggle:@"CUSHION REBOUNDS"
+              detail:@"Continue predicted paths after cushion contacts"
+             enabled:gECShowRebounds
+             handler:^(BOOL enabled) {
+        gECShowRebounds = enabled;
+        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:ECReboundsKey];
+        if (!enabled && !gECShowLandingRings) ECClearPredictionVisuals();
+        [weakSelf refreshPrediction];
+    }];
+    [panel addToggle:@"LANDING RINGS"
+              detail:@"Show each moving ball's predicted resting position"
+             enabled:gECShowLandingRings
+             handler:^(BOOL enabled) {
+        gECShowLandingRings = enabled;
+        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:ECLandingRingsKey];
+        if (!enabled && !gECShowRebounds) ECClearPredictionVisuals();
+        [weakSelf refreshPrediction];
+    }];
+
+    [panel addSection:@"RINGS"];
+    [panel addAction:@"BALL-COLOURED RINGS"
+              detail:@"Live and predicted rings use each ball's base colour"
+             handler:^{}];
+}
+
 - (void)tapped {
     ECFindGameManager();
     if (!ECIsLocalMatch()) {
         [self showOfflineLockedMessage];
         return;
     }
-    UIViewController *presenter = [self topViewController];
-    if (!presenter || [presenter isKindOfClass:UIAlertController.class]) return;
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Physics guideline"
-        message:@"Uses the live cue force and this table's sliding/rolling physics to predict shot travel. Offline modes only."
-        preferredStyle:UIAlertControllerStyleActionSheet];
+    UIWindow *host = self.hostWindow ?: [self guestWindow];
+    if (!host) return;
+    [self closePanel];
+    EmberMenuPanel *panel = [[EmberMenuPanel alloc]
+        initWithTitle:@"8 BALL POOL  //  EMBER TOOLKIT"
+        accentColor:[UIColor colorWithRed:0.95 green:0.72 blue:0.12 alpha:1.0]];
     __weak typeof(self) weakSelf = self;
-    for (NSNumber *value in @[@1, @8]) {
-        NSInteger mode = value.integerValue;
-        BOOL selected = (mode == 1) == (gECMultiplier <= 1);
-        NSString *label = [NSString stringWithFormat:@"%@%@",
-            mode == 1 ? @"Off" : @"Physics prediction", selected ? @"  ✓" : @""];
-        [menu addAction:[UIAlertAction actionWithTitle:label style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            [weakSelf saveMultiplier:mode];
-        }]];
-    }
-    [menu addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
-    menu.popoverPresentationController.sourceView = self.button;
-    menu.popoverPresentationController.sourceRect = self.button.bounds;
-    [presenter presentViewController:menu animated:YES completion:nil];
+    panel.onClose = ^{ [weakSelf closePanel]; };
+    [panel setTabs:@[@"Prediction"] activeTab:0 handler:^(NSInteger index) {
+        [weakSelf renderMenu];
+    }];
+    self.panel = panel;
+    [self renderMenu];
+    [panel presentInWindow:host];
+    [host bringSubviewToFront:self.button];
+    [host bringSubviewToFront:panel];
 }
 
 - (void)dragged:(UIPanGestureRecognizer *)gesture {
@@ -2301,6 +2820,11 @@ static void EmberEightBPOfflineLinesBoot(void) {
     }
     NSInteger saved = [NSUserDefaults.standardUserDefaults integerForKey:ECMultiplierKey];
     gECMultiplier = (saved == 1 || saved == 2 || saved == 4 || saved == 8) ? saved : 8;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    gECShowRebounds = [defaults objectForKey:ECReboundsKey] == nil
+        ? YES : [defaults boolForKey:ECReboundsKey];
+    gECShowLandingRings = [defaults objectForKey:ECLandingRingsKey] == nil
+        ? YES : [defaults boolForKey:ECLandingRingsKey];
     ECInstallHooks();
     EmberEightBPOfflineLinesController *controller = [EmberEightBPOfflineLinesController sharedController];
     [controller start];

@@ -111,6 +111,7 @@ jobs:
             -fobjc-arc \
             -fblocks \
             -dynamiclib \
+            Tweaks/Shared/EmberMenu.m \
             Tweaks/EightBPOfflineLines/EightBPOfflineLines.m \
             -framework Foundation \
             -framework UIKit \
