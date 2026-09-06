@@ -941,8 +941,14 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
     }
     // Retint every sync rather than only at creation: the cue-ball identity is
     // sometimes discovered after the rack's sprites have already been made.
-    ECccColor3B ballColor = ECColorForBallNumber(
-        ball == gECCachedCueBall ? 0 : ECBallNumber(ball));
+    int ballNumber = ball == gECCachedCueBall ? 0 : ECBallNumber(ball);
+    ECccColor3B ballColor = ECColorForBallNumber(ballNumber);
+    static int colorLogCount = 0;
+    if (colorLogCount < 20) {
+        colorLogCount++;
+        ECLogLine([NSString stringWithFormat:@"ring-color number=%d rgb=%u,%u,%u",
+            ballNumber, ballColor.r, ballColor.g, ballColor.b]);
+    }
     if ([marker respondsToSelector:@selector(setColor:)]) {
         ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(marker,
                                                        @selector(setColor:), ballColor);
@@ -2292,8 +2298,10 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         }
     }
 
-    ECRunFullTablePrediction(guide, initialSpeed, friction,
-                             effectiveSliding, effectiveRolling);
+    // Keep the proven native guide path isolated while the full-table
+    // simulator is validated. The simulator currently terminates the guest as
+    // soon as non-zero shot power reaches it.
+    ECClearPredictionVisuals();
 
     static CFTimeInterval lastLogTime = 0;
     CFTimeInterval now = CACurrentMediaTime();
