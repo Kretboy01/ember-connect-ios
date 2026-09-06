@@ -127,6 +127,7 @@ static NSMutableArray *gECReboundSprites = nil;
 static EightBPShadowPrediction gECLastShadowPrediction;
 static BOOL gECHasShadowPrediction = NO;
 static BOOL gECShadowShotMoving = NO;
+static BOOL gECShadowSettleCheckScheduled = NO;
 static CFTimeInterval gECShadowArmedAt = 0;
 static double gECShadowMaxPathError[EightBPShadowMaxBalls];
 static unsigned int gECShadowPathSamples[EightBPShadowMaxBalls];
@@ -812,6 +813,7 @@ static void ECClearPredictionVisuals(void) {
     [gECReboundSprites removeAllObjects];
     gECHasShadowPrediction = NO;
     gECShadowShotMoving = NO;
+    gECShadowSettleCheckScheduled = NO;
     gECShadowArmedAt = 0;
 }
 
@@ -1986,6 +1988,19 @@ static void ECAddReboundSprite(id parent, ECDPoint from, ECDPoint to,
     double dy = end.y - start.y;
     double length = hypot(dx, dy);
     if (!isfinite(length) || length < 1.0) return;
+    // Slightly overlap the square ends of adjacent rotated sprites. Without
+    // this, sub-pixel rounding leaves visible gaps at otherwise identical
+    // cushion vertices and makes a continuous rebound look disconnected.
+    const double jointOverlap = 1.25;
+    const double ux = dx / length;
+    const double uy = dy / length;
+    start.x -= ux * jointOverlap;
+    start.y -= uy * jointOverlap;
+    end.x += ux * jointOverlap;
+    end.y += uy * jointOverlap;
+    dx = end.x - start.x;
+    dy = end.y - start.y;
+    length = hypot(dx, dy);
     id texture = ECSolidLineTexture();
     Class spriteClass = NSClassFromString(@"CCSprite");
     if (!texture || !spriteClass) return;
@@ -2267,6 +2282,18 @@ static void ECObserveShadowParity(void) {
     }
     if (anyMoving) {
         gECShadowShotMoving = YES;
+        // Ball visuals are not guaranteed to receive one final update after
+        // the physics runner stops. Schedule one bounded follow-up check so
+        // the old shot's paths cannot survive into the next turn.
+        if (!gECShadowSettleCheckScheduled) {
+            gECShadowSettleCheckScheduled = YES;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(0.10 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                gECShadowSettleCheckScheduled = NO;
+                if (gECHasShadowPrediction) ECObserveShadowParity();
+            });
+        }
         return;
     }
     if (!gECShadowShotMoving) return;

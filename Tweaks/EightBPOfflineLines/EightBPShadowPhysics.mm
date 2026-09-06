@@ -81,12 +81,16 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
     double _combinedBallRadiusSquared;
     BOOL _fast;
     ECEightBPShadowTableProperties *_properties;
+    alignas(8) uint8_t _shotResults[232];
+    void (*_shotResultsDestructor)(void *);
+    BOOL _shotResultsInitialized;
     BOOL _unexpectedRunnerCall;
 }
 - (NSArray *)balls;
 - (BOOL)isFastComputationEnabled;
 - (NativeRect)tableBounds;
 - (NativeNumber)combinedBallRadiusSquared;
+- (void *)shotResults;
 - (const EightBPShadowPointVector *)tableShape;
 - (id)tableProperties;
 - (void)addToBallRunner:(id)ball playSound:(BOOL)playSound;
@@ -99,12 +103,19 @@ using EightBPShadowPointVector = std::vector<NativePoint>;
 - (NativeNumber)combinedBallRadiusSquared {
     return NativeNumber(_combinedBallRadiusSquared);
 }
+- (void *)shotResults { return _shotResults; }
 - (const EightBPShadowPointVector *)tableShape { return &_tableShape; }
 - (id)tableProperties { return _properties; }
 - (void)addToBallRunner:(id)ball playSound:(BOOL)playSound {
     (void)ball;
     (void)playSound;
     _unexpectedRunnerCall = YES;
+}
+- (void)dealloc {
+    if (_shotResultsInitialized && _shotResultsDestructor) {
+        _shotResultsDestructor(_shotResults);
+        _shotResultsInitialized = NO;
+    }
 }
 @end
 #endif
@@ -117,6 +128,8 @@ constexpr uintptr_t kBallInitializer = 0x10005B478ULL;
 constexpr uintptr_t kBallMove = 0x10005B888ULL;
 constexpr uintptr_t kResolveBallBall = 0x1002FB918ULL;
 constexpr uintptr_t kResolveCushion = 0x1002FBAB4ULL;
+constexpr uintptr_t kShotResultsInitializer = 0x10007AFB4ULL;
+constexpr uintptr_t kShotResultsDestructor = 0x10007B074ULL;
 
 constexpr uintptr_t kBallBallVTable = 0x103B69260ULL;
 constexpr uintptr_t kBallLineVTable = 0x103B69288ULL;
@@ -822,6 +835,20 @@ bool EightBPShadowPredict(NSObject *table, NSObject *cueBall, const void *visual
         // Use the full query path. The fast path depends on mutable runner
         // bookkeeping that intentionally is not copied into the detached world.
         facade->_fast = NO;
+        // The full native collision query consults Table::shotResults once a
+        // trajectory reaches later cushions or pockets. Cursor's facade
+        // omitted it, so low-power previews happened to work while stronger
+        // ones threw an unrecognized-selector exception. Construct an entirely
+        // detached ShotResults value with the game's own 56.29.2 constructor;
+        // returning the live Table value would let a preview mutate real shot
+        // bookkeeping. Its ObjC ivar metadata reports an exact size of 232.
+        using ShotResultsLifecycle = void (*)(void *);
+        auto initializeShotResults = reinterpret_cast<ShotResultsLifecycle>(
+            SlidAddress(kShotResultsInitializer, slide));
+        facade->_shotResultsDestructor = reinterpret_cast<ShotResultsLifecycle>(
+            SlidAddress(kShotResultsDestructor, slide));
+        initializeShotResults(facade->_shotResults);
+        facade->_shotResultsInitialized = YES;
         if (!SnapshotGeometry(table, facade)) {
             SetStatus(prediction->status, "detached table geometry snapshot gate failed");
             return false;
