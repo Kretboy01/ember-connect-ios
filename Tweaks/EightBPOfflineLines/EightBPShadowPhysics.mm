@@ -914,20 +914,13 @@ static bool PredictShadow(NSObject *table, NSObject *cueBall, const void *visual
             EightBPShadowBallPrediction &output = prediction->balls[index];
             output.liveBall = (__bridge const void *)live;
             output.number = ReadUInt32(live, 0xA8);
-            NativePoint livePosition = ReadPoint(live, 0x20);
-            const bool offTable = !FinitePoint(livePosition) ||
-                livePosition.x < -140.0 || livePosition.x > 140.0 ||
-                livePosition.y < -80.0 || livePosition.y > 80.0;
-            output.valid = !offTable;
-            output.potted = offTable;
+            output.valid = true;
             ShadowBall state;
             state.live = live;
             state.clone = clone;
-            state.active = !offTable;
-            state.potted = offTable;
             state.output = &output;
             shadowBalls.push_back(std::move(state));
-            if (!offTable) RecordPoint(shadowBalls.back());
+            RecordPoint(shadowBalls.back());
         }
         SetStatus(prediction->status, "shadow stage 2/4: detached balls cloned");
 
@@ -1001,8 +994,7 @@ static bool PredictShadow(NSObject *table, NSObject *cueBall, const void *visual
         uint16_t zeroTimeEvents = 0;
         bool firstQueryCompleted = false;
         for (uint16_t frame = 0; frame < kMaximumFrames; ++frame) {
-            auto limit = applyAim ? std::chrono::milliseconds(90) : std::chrono::milliseconds(50);
-            if (std::chrono::steady_clock::now() - started > limit) {
+            if (std::chrono::steady_clock::now() - started > kWallTimeLimit) {
                 SetStatus(prediction->status, "shadow simulation wall-time limit reached");
                 return false;
             }

@@ -13,9 +13,12 @@
 #import <stdlib.h>
 #import "../Shared/EmberMenu.h"
 #import "EightBPShadowPhysics.h"
+#import "EmberConnectIcon.h"
 
-#define EC_LINES_BUTTON_TAG 0x8B901
+#define EC_LINES_BUTTON_TAG 0x8B903
+#define EC_LINES_BUTTON_LEGACY_TAG 0x8B901
 #define EC_LINE_OVERLAY_TAG 0x8B902
+#define EC_MENU_BUTTON_SIZE 48.0
 
 static NSString *const ECBundleIdentifier = @"com.miniclip.8ballpoolmult";
 static NSString *const ECMultiplierKey = @"EmberEightBPOfflineLines.multiplier";
@@ -860,23 +863,12 @@ static BOOL ECBallIsPotted(id ball) {
     if (!ball) return NO;
     int slot = ECSlotForBall(ball);
     if (slot >= 0 && gECPotted[slot]) return YES;
-    if (gECCachedTable) {
-        id potted = ECIvarObject(gECCachedTable, "mBallsPotted");
-        if ([potted isKindOfClass:NSArray.class] &&
-            [(NSArray *)potted indexOfObjectIdenticalTo:ball] != NSNotFound) {
-            if (slot >= 0) gECPotted[slot] = YES;
-            return YES;
-        }
-    }
-    // mBallsPotted is emptied after the shot, and it has never matched a live
-    // Ball pointer here. Rack-display balls sit off the playing surface, so
-    // treat that as potted or the last table path is redrawn on the rack.
-    ECDPoint live = ECBallLivePosition(ball);
-    if (ECPointValid(live) && !ECWorldOnPlayingSurface(live)) {
-        if (slot >= 0) gECPotted[slot] = YES;
-        return YES;
-    }
-    return NO;
+    if (!gECCachedTable) return NO;
+    id potted = ECIvarObject(gECCachedTable, "mBallsPotted");
+    if (![potted isKindOfClass:NSArray.class]) return NO;
+    if ([(NSArray *)potted indexOfObjectIdenticalTo:ball] == NSNotFound) return NO;
+    if (slot >= 0) gECPotted[slot] = YES;
+    return YES;
 }
 
 static void ECClearPotted(id ball) {
@@ -3644,68 +3636,79 @@ static void ECRequestOverlayRedraw(void) {
 - (void)renderMenu {
     EmberMenuPanel *panel = self.panel;
     if (!panel) return;
+    @try {
     [panel clearRows];
     [panel setStatus:@"PHYSICS READY"];
     [panel setFooter:@"EMBER TOOLKIT  |  8 Ball Pool 56.29.2"];
     [panel addSection:@"SHOT PREDICTION"];
 
     __weak typeof(self) weakSelf = self;
-    [panel addToggle:@"PHYSICS GUIDE"
+    [panel addAction:gECMultiplier > 1 ? @"PHYSICS GUIDE  ·  ON" : @"PHYSICS GUIDE  ·  OFF"
               detail:@"Scale native aim paths from cue force and table friction"
-             enabled:gECMultiplier > 1
-             handler:^(BOOL enabled) {
+             handler:^{
+        BOOL enabled = gECMultiplier <= 1;
         [weakSelf saveMultiplier:enabled ? 8 : 1];
         if (!enabled) ECClearPredictionVisuals();
+        [weakSelf renderMenu];
     }];
-    [panel addToggle:@"CUSHION REBOUNDS"
+    [panel addAction:gECShowRebounds ? @"CUSHION REBOUNDS  ·  ON" : @"CUSHION REBOUNDS  ·  OFF"
               detail:@"Continue predicted paths after cushion contacts"
-             enabled:gECShowRebounds
-             handler:^(BOOL enabled) {
-        gECShowRebounds = enabled;
-        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:ECReboundsKey];
-        if (!enabled && !gECShowLandingRings) ECClearPredictionVisuals();
+             handler:^{
+        gECShowRebounds = !gECShowRebounds;
+        [NSUserDefaults.standardUserDefaults setBool:gECShowRebounds forKey:ECReboundsKey];
+        if (!gECShowRebounds && !gECShowLandingRings) ECClearPredictionVisuals();
         [weakSelf refreshPrediction];
+        [weakSelf renderMenu];
     }];
-    [panel addToggle:@"LANDING RINGS"
+    [panel addAction:gECShowLandingRings ? @"LANDING RINGS  ·  ON" : @"LANDING RINGS  ·  OFF"
               detail:@"Show each moving ball's predicted resting position"
-             enabled:gECShowLandingRings
-             handler:^(BOOL enabled) {
-        gECShowLandingRings = enabled;
-        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:ECLandingRingsKey];
-        if (!enabled && !gECShowRebounds) ECClearPredictionVisuals();
+             handler:^{
+        gECShowLandingRings = !gECShowLandingRings;
+        [NSUserDefaults.standardUserDefaults setBool:gECShowLandingRings forKey:ECLandingRingsKey];
+        if (!gECShowLandingRings && !gECShowRebounds) ECClearPredictionVisuals();
         [weakSelf refreshPrediction];
+        [weakSelf renderMenu];
     }];
-    [panel addToggle:@"TABLE OVERLAY"
+    [panel addAction:gECShowTableOverlay ? @"TABLE OVERLAY  ·  ON" : @"TABLE OVERLAY  ·  OFF"
               detail:@"Trace the inner cushions and pockets on the live table"
-             enabled:gECShowTableOverlay
-             handler:^(BOOL enabled) {
-        gECShowTableOverlay = enabled;
-        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:ECTableOverlayKey];
-        if (!enabled) ECClearTableOverlay();
+             handler:^{
+        gECShowTableOverlay = !gECShowTableOverlay;
+        [NSUserDefaults.standardUserDefaults setBool:gECShowTableOverlay forKey:ECTableOverlayKey];
+        if (!gECShowTableOverlay) ECClearTableOverlay();
         else ECSyncTableOverlay();
+        [weakSelf renderMenu];
     }];
 
     [panel addSection:@"RINGS FOLLOW EACH BALL'S COLOUR"];
+    } @catch (NSException *exception) {
+        ECLogLine([NSString stringWithFormat:@"menu-render %@", exception]);
+    }
 }
 
 - (void)tapped {
-    ECFindGameManager();
-    UIWindow *host = self.hostWindow ?: [self guestWindow];
-    if (!host) return;
-    [self closePanel];
-    EmberMenuPanel *panel = [[EmberMenuPanel alloc]
-        initWithTitle:@"8 BALL POOL  //  EMBER TOOLKIT"
-        accentColor:[UIColor colorWithRed:0.95 green:0.72 blue:0.12 alpha:1.0]];
-    __weak typeof(self) weakSelf = self;
-    panel.onClose = ^{ [weakSelf closePanel]; };
-    [panel setTabs:@[@"Prediction"] activeTab:0 handler:^(NSInteger index) {
-        [weakSelf renderMenu];
-    }];
-    self.panel = panel;
-    [self renderMenu];
-    [panel presentInWindow:host];
-    [host bringSubviewToFront:self.button];
-    [host bringSubviewToFront:panel];
+    @try {
+        ECFindGameManager();
+        UIWindow *host = self.hostWindow ?: [self guestWindow];
+        if (!host) return;
+        [self closePanel];
+        EmberMenuPanel *panel = [[EmberMenuPanel alloc]
+            initWithTitle:@"8 BALL POOL  //  EMBER TOOLKIT"
+            accentColor:[UIColor colorWithRed:0.95 green:0.42 blue:0.14 alpha:1.0]];
+        __weak typeof(self) weakSelf = self;
+        panel.onClose = ^{ [weakSelf closePanel]; };
+        [panel setTabs:@[@"Prediction"] activeTab:0 handler:^(NSInteger index) {
+            (void)index;
+            [weakSelf renderMenu];
+        }];
+        self.panel = panel;
+        [self renderMenu];
+        [panel presentInWindow:host];
+        [host bringSubviewToFront:self.button];
+        [host bringSubviewToFront:panel];
+    } @catch (NSException *exception) {
+        ECLogLine([NSString stringWithFormat:@"menu-open %@", exception]);
+        [self closePanel];
+    }
 }
 
 - (void)dragged:(UIPanGestureRecognizer *)gesture {
@@ -3728,29 +3731,32 @@ static void ECRequestOverlayRedraw(void) {
 - (void)updateButton {
     UIButton *button = self.button;
     if (!button) return;
-    BOOL local = ECIsLocalMatch();
-    NSString *title;
-    UIColor *color;
-    if (!local) {
-        title = @"GUIDE 🔒";
-        color = [UIColor colorWithWhite:0.18 alpha:0.88];
-    } else if (gECMultiplier <= 1) {
-        title = @"GUIDE Off";
-        color = [UIColor colorWithRed:0.55 green:0.25 blue:0.08 alpha:0.9];
-    } else {
-        title = @"GUIDE Auto";
-        color = [UIColor colorWithRed:0.08 green:0.42 blue:0.25 alpha:0.92];
-    }
-    [button setTitle:title forState:UIControlStateNormal];
-    button.backgroundColor = color;
+    BOOL on = ECIsLocalMatch() && gECMultiplier > 1;
+    button.layer.borderColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.18 alpha:on ? 0.95 : 0.35].CGColor;
+    button.alpha = on ? 1.0 : 0.78;
+    button.accessibilityValue = on ? @"on" : @"off";
+}
+
+static UIImage *ECEmberConnectIconImage(void) {
+    static UIImage *icon = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSData *data = [NSData dataWithBytes:kEmberConnectIconPNG
+                                      length:kEmberConnectIconPNGLength];
+        icon = [UIImage imageWithData:data scale:2.0];
+    });
+    return icon;
 }
 
 - (void)install {
     ECFindGameManager();
     UIWindow *host = [self guestWindow];
     if (!host) return;
+    UIView *legacy = [host viewWithTag:EC_LINES_BUTTON_LEGACY_TAG];
+    if (legacy) [legacy removeFromSuperview];
     UIView *existing = [host viewWithTag:EC_LINES_BUTTON_TAG];
-    if ([existing isKindOfClass:UIButton.class]) {
+    if ([existing isKindOfClass:UIButton.class] &&
+        fabs(CGRectGetWidth(existing.bounds) - EC_MENU_BUTTON_SIZE) < 0.5) {
         self.button = (UIButton *)existing;
         self.hostWindow = host;
         [host bringSubviewToFront:existing];
@@ -3758,25 +3764,33 @@ static void ECRequestOverlayRedraw(void) {
         [self updateButton];
         return;
     }
+    [existing removeFromSuperview];
 
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
     button.tag = EC_LINES_BUTTON_TAG;
-    button.bounds = CGRectMake(0, 0, 104, 40);
+    button.bounds = CGRectMake(0, 0, EC_MENU_BUTTON_SIZE, EC_MENU_BUTTON_SIZE);
     CGFloat savedX = [NSUserDefaults.standardUserDefaults doubleForKey:ECButtonXKey];
     CGFloat savedY = [NSUserDefaults.standardUserDefaults doubleForKey:ECButtonYKey];
-    CGFloat defaultX = 62;
+    CGFloat defaultX = 28 + host.safeAreaInsets.left;
     CGFloat defaultY = CGRectGetHeight(host.bounds) - MAX(36, host.safeAreaInsets.bottom + 28);
     button.center = CGPointMake(savedX > 0 ? savedX : defaultX, savedY > 0 ? savedY : defaultY);
     button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin;
-    button.layer.cornerRadius = 12;
-    button.layer.borderWidth = 1;
-    button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
-    button.layer.shadowColor = UIColor.blackColor.CGColor;
-    button.layer.shadowOpacity = 0.35;
-    button.layer.shadowRadius = 4;
-    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
-    button.accessibilityLabel = @"Physics-based aiming guideline";
+    button.backgroundColor = [UIColor colorWithRed:0.07 green:0.05 blue:0.04 alpha:1.0];
+    button.layer.cornerRadius = EC_MENU_BUTTON_SIZE * 0.5;
+    button.layer.masksToBounds = YES;
+    button.layer.borderWidth = 1.5;
+    button.layer.borderColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.18 alpha:0.95].CGColor;
+    button.accessibilityLabel = @"Ember Connect menu";
+
+    UIImageView *iconView = [[UIImageView alloc] initWithImage:ECEmberConnectIconImage()];
+    iconView.frame = button.bounds;
+    iconView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    iconView.contentMode = UIViewContentModeScaleAspectFill;
+    iconView.userInteractionEnabled = NO;
+    iconView.layer.cornerRadius = EC_MENU_BUTTON_SIZE * 0.5;
+    iconView.layer.masksToBounds = YES;
+    [button addSubview:iconView];
+
     [button addTarget:self action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragged:)];
