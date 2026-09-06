@@ -57,6 +57,8 @@ typedef struct { uint8_t r, g, b; } ECccColor3B;
 
 static BOOL ECPointValid(ECDPoint p);
 static BOOL ECReadPointIvar(id object, const char *name, CGPoint *valueOut);
+static ECDPoint ECNorm(ECDPoint point);
+static ECDBox ECDefaultTableBox(void);
 
 static inline ECDPoint ECMakePoint(double x, double y) { return (ECDPoint){x, y}; }
 
@@ -97,6 +99,7 @@ static void (*ECOriginalSetHideGuidelinesMode)(id, SEL, BOOL) = NULL;
 static BOOL (*ECOriginalNoGuidelinesOffline)(id, SEL) = NULL;
 static BOOL (*ECOriginalFixedGuidelines)(id, SEL) = NULL;
 static void (*ECOriginalApplyCueStatsForShot)(id, SEL, int, int, int) = NULL;
+static void (*ECOriginalAimChangedCallback)(id, SEL, id) = NULL;
 static void (*ECOriginalVisualCueSetPower)(id, SEL, const void *) = NULL;
 static void (*ECOriginalSetAimAngle)(id, SEL, double) = NULL;
 static id (*ECOriginalGetCueBall)(id, SEL) = NULL;
@@ -503,6 +506,14 @@ static void ECVisualCueSetPower(id self, SEL selector, const void *powerValue) {
     if (ECOriginalVisualCueSetPower) ECOriginalVisualCueSetPower(self, selector, powerValue);
     gECActiveVisualCue = self;
     ECUpdatePhysicsGuideForCue(self);
+}
+
+static void ECAimChangedCallback(id self, SEL selector, id event) {
+    if (ECOriginalAimChangedCallback) ECOriginalAimChangedCallback(self, selector, event);
+    id cue = gECActiveVisualCue;
+    if (!cue) cue = ECIvarObject(self, "mVisualCue");
+    if (!cue) cue = ECIvarObject(self, "_visualCue");
+    if (cue) ECUpdatePhysicsGuideForCue(cue);
 }
 
 static BOOL ECShowCueBallTrajectory(id self, SEL selector) {
@@ -1216,6 +1227,9 @@ static void ECInstallHooks(void) {
                                             (IMP)ECGetCueStatsWithBonus, (IMP *)&ECOriginalGetCueStatsWithBonus);
         BOOL applyOK = ECHookApplyCueStats(gameManager, NSSelectorFromString(@"applyCueStatsForShot:aim:spin:"),
                                            (IMP)ECApplyCueStatsForShot, (IMP *)&ECOriginalApplyCueStatsForShot);
+        BOOL aimChangedOK = ECHookIMP(gameManager, NSSelectorFromString(@"aimChangedCallback:"),
+                                      (IMP)ECAimChangedCallback,
+                                      (IMP *)&ECOriginalAimChangedCallback);
 
         Class visualCue = NSClassFromString(@"VisualCue");
         Class table = NSClassFromString(@"Table");
@@ -1276,8 +1290,9 @@ static void ECInstallHooks(void) {
         }
 
         gECHooksInstalled = lowOK && highOK && powerOK && applyOK;
-        ECLogLine([NSString stringWithFormat:@"hook enter=%d exit=%d low=%d high=%d setLow=%d setHigh=%d stats=%d bonus=%d apply=%d power=%d gm=%@ user=%@",
-                   enterOK, exitOK, lowOK, highOK, setLowOK, setHighOK, statsOK, bonusOK, applyOK, powerOK, gameManager, userInfo]);
+        ECLogLine([NSString stringWithFormat:@"hook enter=%d exit=%d low=%d high=%d setLow=%d setHigh=%d stats=%d bonus=%d apply=%d power=%d aimChanged=%d gm=%@ user=%@",
+                   enterOK, exitOK, lowOK, highOK, setLowOK, setHighOK,
+                   statsOK, bonusOK, applyOK, powerOK, aimChangedOK, gameManager, userInfo]);
         ECWriteStatus(gECHooksInstalled ? @"hooks-installed" : @"incompatible-runtime");
     });
 }
@@ -1704,6 +1719,16 @@ typedef struct {
 } ECSimBall;
 
 typedef struct { ECDPoint origin; ECDPoint size; } ECRawTableRect;
+typedef struct { const ECDPoint *begin, *end, *capacity; } ECPointVector;
+typedef struct { int16_t first, second; } ECShortPair;
+typedef struct { const ECShortPair *begin, *end, *capacity; } ECShortPairVector;
+typedef struct {
+    ECDPoint start;
+    ECDPoint end;
+    ECDPoint inward;
+} ECSimCushion;
+
+#define EC_SIM_MAX_CUSHIONS 64
 
 static BOOL ECReadNativeTableBox(id table, ECDBox *boxOut) {
     if (!table || !boxOut) return NO;
@@ -1728,6 +1753,117 @@ static BOOL ECSimBallInPocket(id table, ECSimBall *ball) {
     if (![table respondsToSelector:selector]) return NO;
     return ((BOOL (*)(id, SEL, id, ECDPoint))objc_msgSend)(
         table, selector, ball->source, ball->pos);
+}
+
+static int ECSnapshotNativeCushions(id table, ECDBox bounds,
+                                    ECSimCushion *segments, int capacity) {
+    if (!table || !segments || capacity <= 0) return 0;
+    Ivar shapeIvar = class_getInstanceVariable([table class], "mTableShape");
+    if (!shapeIvar) return 0;
+    const uint8_t *tableBytes = (const uint8_t *)(__bridge const void *)table;
+    const ECPointVector *shape = (const ECPointVector *)(tableBytes + ivar_getOffset(shapeIvar));
+    if (!shape->begin || !shape->end || shape->end < shape->begin) return 0;
+    ptrdiff_t pointCount = shape->end - shape->begin;
+    if (pointCount < 4 || pointCount > 256) return 0;
+
+    id cushions = nil;
+    if ([table respondsToSelector:@selector(getActiveCushions)]) {
+        cushions = ((id (*)(id, SEL))objc_msgSend)(table, @selector(getActiveCushions));
+    }
+    if (![cushions isKindOfClass:NSArray.class]) {
+        cushions = ECIvarObject(table, "_tableCushions");
+    }
+    if (![cushions isKindOfClass:NSArray.class]) return 0;
+
+    ECDPoint center = {(bounds.minX + bounds.maxX) * 0.5,
+                       (bounds.minY + bounds.maxY) * 0.5};
+    int count = 0;
+    for (id cushion in (NSArray *)cushions) {
+        if (count >= capacity || !ECLooksLikeObject(cushion)) break;
+        if ([cushion respondsToSelector:@selector(cushionActive)] &&
+            !((BOOL (*)(id, SEL))objc_msgSend)(cushion, @selector(cushionActive))) continue;
+        Ivar linesIvar = class_getInstanceVariable([cushion class], "_cushionLines");
+        if (!linesIvar) continue;
+        const uint8_t *cushionBytes = (const uint8_t *)(__bridge const void *)cushion;
+        const ECShortPairVector *lines =
+            (const ECShortPairVector *)(cushionBytes + ivar_getOffset(linesIvar));
+        if (!lines->begin || !lines->end || lines->end < lines->begin) continue;
+        ptrdiff_t lineCount = lines->end - lines->begin;
+        if (lineCount < 0 || lineCount > 64) continue;
+        for (ptrdiff_t index = 0; index < lineCount && count < capacity; index++) {
+            int first = lines->begin[index].first;
+            int second = lines->begin[index].second;
+            if (first < 0 || second < 0 || first >= pointCount || second >= pointCount ||
+                first == second) continue;
+            ECDPoint start = shape->begin[first];
+            ECDPoint end = shape->begin[second];
+            if (!ECPointValid(start) || !ECPointValid(end)) continue;
+            double dx = end.x - start.x;
+            double dy = end.y - start.y;
+            double length = hypot(dx, dy);
+            if (length < 0.1 || length > 1000.0) continue;
+            ECDPoint inward = {-dy / length, dx / length};
+            ECDPoint midpoint = {(start.x + end.x) * 0.5, (start.y + end.y) * 0.5};
+            if ((center.x - midpoint.x) * inward.x +
+                (center.y - midpoint.y) * inward.y < 0.0) {
+                inward.x = -inward.x;
+                inward.y = -inward.y;
+            }
+            segments[count++] = (ECSimCushion){
+                .start = start, .end = end, .inward = inward,
+            };
+        }
+    }
+    return count;
+}
+
+static BOOL ECResolveNativeCushion(ECSimBall *ball,
+                                   const ECSimCushion *segments, int count) {
+    if (!ball || !segments || count <= 0) return NO;
+    int best = -1;
+    double bestPenetration = 0.0;
+    ECDPoint bestNormal = {0.0, 0.0};
+    for (int index = 0; index < count; index++) {
+        ECDPoint start = segments[index].start;
+        ECDPoint end = segments[index].end;
+        double sx = end.x - start.x;
+        double sy = end.y - start.y;
+        double lengthSquared = sx * sx + sy * sy;
+        if (lengthSquared <= 1e-8) continue;
+        double projection = ((ball->pos.x - start.x) * sx +
+                             (ball->pos.y - start.y) * sy) / lengthSquared;
+        projection = fmax(0.0, fmin(1.0, projection));
+        ECDPoint nearest = {start.x + sx * projection, start.y + sy * projection};
+        double dx = ball->pos.x - nearest.x;
+        double dy = ball->pos.y - nearest.y;
+        double distance = hypot(dx, dy);
+        if (!isfinite(distance) || distance >= ball->radius) continue;
+
+        ECDPoint normal = distance > 1e-6
+            ? (ECDPoint){dx / distance, dy / distance}
+            : segments[index].inward;
+        if (normal.x * segments[index].inward.x +
+            normal.y * segments[index].inward.y < 0.0) {
+            normal = segments[index].inward;
+        }
+        double towardCushion = ball->velocity.x * normal.x +
+                               ball->velocity.y * normal.y;
+        if (towardCushion >= 0.0) continue;
+        double penetration = ball->radius - distance;
+        if (penetration > bestPenetration) {
+            best = index;
+            bestPenetration = penetration;
+            bestNormal = normal;
+        }
+    }
+    if (best < 0) return NO;
+    ball->pos.x += bestNormal.x * bestPenetration;
+    ball->pos.y += bestNormal.y * bestPenetration;
+    double normalVelocity = ball->velocity.x * bestNormal.x +
+                            ball->velocity.y * bestNormal.y;
+    ball->velocity.x -= 2.0 * normalVelocity * bestNormal.x;
+    ball->velocity.y -= 2.0 * normalVelocity * bestNormal.y;
+    return YES;
 }
 
 static void ECRecordSimPoint(ECSimBall *ball, ECDPoint point) {
@@ -1902,10 +2038,8 @@ static void ECRunFullTablePrediction(void *guide, double initialSpeed,
                                      double slidingReduction, double rollingReduction) {
     static CFTimeInterval lastRun = 0;
     static double lastSpeed = NAN;
+    static ECDPoint lastDirection = {NAN, NAN};
     CFTimeInterval now = CACurrentMediaTime();
-    if (now - lastRun < 0.10 && isfinite(lastSpeed) && fabs(initialSpeed - lastSpeed) < 5.0) return;
-    lastRun = now;
-    lastSpeed = initialSpeed;
 
     if (!guide || initialSpeed <= 0.1 || (!gECShowRebounds && !gECShowLandingRings)) {
         ECClearPredictionVisuals();
@@ -1928,6 +2062,13 @@ static void ECRunFullTablePrediction(void *guide, double initialSpeed,
     ECDPoint direction = ECNorm((ECDPoint){primaryEnd.x - primaryStart.x,
                                            primaryEnd.y - primaryStart.y});
     if (!ECPointValid(direction) || hypot(direction.x, direction.y) < 0.5) return;
+    double directionDelta = isfinite(lastDirection.x)
+        ? hypot(direction.x - lastDirection.x, direction.y - lastDirection.y) : INFINITY;
+    if (now - lastRun < 0.10 && isfinite(lastSpeed) &&
+        fabs(initialSpeed - lastSpeed) < 5.0 && directionDelta < 0.002) return;
+    lastRun = now;
+    lastSpeed = initialSpeed;
+    lastDirection = direction;
 
     ECSimBall balls[EC_SIM_MAX_BALLS] = {0};
     int count = ECSnapshotSimulationBalls(balls, EC_SIM_MAX_BALLS);
@@ -1938,6 +2079,10 @@ static void ECRunFullTablePrediction(void *guide, double initialSpeed,
     if (cueIndex < 0) return;
     balls[cueIndex].velocity = (ECDPoint){direction.x * initialSpeed, direction.y * initialSpeed};
     balls[cueIndex].slidingTime = initialSpeed * friction[3];
+
+    ECSimCushion cushions[EC_SIM_MAX_CUSHIONS] = {0};
+    int cushionCount = ECSnapshotNativeCushions(
+        table, bounds, cushions, EC_SIM_MAX_CUSHIONS);
 
     const double dt = 1.0 / 120.0;
     const int maxSteps = 7800;
@@ -1964,28 +2109,31 @@ static void ECRunFullTablePrediction(void *guide, double initialSpeed,
                 continue;
             }
 
-            double left = bounds.minX + ball->radius;
-            double right = bounds.maxX - ball->radius;
-            double bottom = bounds.minY + ball->radius;
-            double top = bounds.maxY - ball->radius;
-            BOOL rebound = NO;
-            if (ball->pos.x < left && ball->velocity.x < 0) {
-                ball->pos.x = left + (left - ball->pos.x);
-                ball->velocity.x = -ball->velocity.x;
-                rebound = YES;
-            } else if (ball->pos.x > right && ball->velocity.x > 0) {
-                ball->pos.x = right - (ball->pos.x - right);
-                ball->velocity.x = -ball->velocity.x;
-                rebound = YES;
-            }
-            if (ball->pos.y < bottom && ball->velocity.y < 0) {
-                ball->pos.y = bottom + (bottom - ball->pos.y);
-                ball->velocity.y = -ball->velocity.y;
-                rebound = YES;
-            } else if (ball->pos.y > top && ball->velocity.y > 0) {
-                ball->pos.y = top - (ball->pos.y - top);
-                ball->velocity.y = -ball->velocity.y;
-                rebound = YES;
+            BOOL rebound = ECResolveNativeCushion(ball, cushions, cushionCount);
+            if (!rebound && cushionCount == 0) {
+                // Defensive fallback for an unsupported table implementation.
+                double left = bounds.minX + ball->radius;
+                double right = bounds.maxX - ball->radius;
+                double bottom = bounds.minY + ball->radius;
+                double top = bounds.maxY - ball->radius;
+                if (ball->pos.x < left && ball->velocity.x < 0) {
+                    ball->pos.x = left + (left - ball->pos.x);
+                    ball->velocity.x = -ball->velocity.x;
+                    rebound = YES;
+                } else if (ball->pos.x > right && ball->velocity.x > 0) {
+                    ball->pos.x = right - (ball->pos.x - right);
+                    ball->velocity.x = -ball->velocity.x;
+                    rebound = YES;
+                }
+                if (ball->pos.y < bottom && ball->velocity.y < 0) {
+                    ball->pos.y = bottom + (bottom - ball->pos.y);
+                    ball->velocity.y = -ball->velocity.y;
+                    rebound = YES;
+                } else if (ball->pos.y > top && ball->velocity.y > 0) {
+                    ball->pos.y = top - (ball->pos.y - top);
+                    ball->velocity.y = -ball->velocity.y;
+                    rebound = YES;
+                }
             }
             if (rebound) {
                 if (!ball->hasRebounded) ball->hasRebounded = YES;
@@ -2066,13 +2214,15 @@ static void ECRunFullTablePrediction(void *guide, double initialSpeed,
             reboundLines += MAX(0, balls[i].pointCount - 1);
         }
         ECLogLine([NSString stringWithFormat:
-            @"full-prediction balls=%d moved=%d potted=%d rebounds=%d bounds=%.2f,%.2f..%.2f,%.2f",
-            count, moved, potted, reboundLines,
+            @"full-prediction balls=%d moved=%d potted=%d rebounds=%d cushions=%d bounds=%.2f,%.2f..%.2f,%.2f",
+            count, moved, potted, reboundLines, cushionCount,
             bounds.minX, bounds.minY, bounds.maxX, bounds.maxY]);
     }
 }
 
 static void ECUpdatePhysicsGuideForCue(id visualCue) {
+    static BOOL updating = NO;
+    if (updating) return;
     if (!visualCue || !ECExtensionIsActive() || !ECNativePhysicsSurfaceValid()) return;
 
     double cuePower = 0.0;
@@ -2096,6 +2246,7 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     double predictedDistance = ECPhysicsStoppingDistance(
         initialSpeed, friction, effectiveSliding, effectiveRolling);
     if (!isfinite(predictedDistance) || predictedDistance < 0.0) return;
+    updating = YES;
 
     void *guide = ECRawPointerIvar(visualCue, "mVisualGuide");
     double nativeHitDistance = NAN;
@@ -2150,6 +2301,7 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
             friction[5], effectiveRolling, gECNativeAimDistance]);
     }
     gECLastPredictedDistance = predictedDistance;
+    updating = NO;
 }
 
 // Read a CGPoint value ivar without treating it as an Objective-C object.
@@ -2671,10 +2823,7 @@ static void ECRequestOverlayRedraw(void) {
         [weakSelf refreshPrediction];
     }];
 
-    [panel addSection:@"RINGS"];
-    [panel addAction:@"BALL-COLOURED RINGS"
-              detail:@"Live and predicted rings use each ball's base colour"
-             handler:^{}];
+    [panel addSection:@"RINGS FOLLOW EACH BALL'S COLOUR"];
 }
 
 - (void)tapped {
