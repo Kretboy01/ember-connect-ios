@@ -1445,6 +1445,30 @@ static double ECPhysicsStoppingDistance(double speed, const double *friction,
     return slidingDistance + rollingDistance;
 }
 
+static double ECPhysicsSpeedAfterDistance(double speed, double distance,
+                                          const double *friction,
+                                          double slidingReduction, double rollingReduction) {
+    if (!friction || !isfinite(speed) || speed <= 0.0 ||
+        !isfinite(distance) || distance < 0.0) return 0.0;
+
+    double equilibriumFactor = friction[3];
+    if (!isfinite(equilibriumFactor) || equilibriumFactor <= 0.0 ||
+        !isfinite(slidingReduction) || slidingReduction <= 0.0 ||
+        !isfinite(rollingReduction) || rollingReduction <= 0.0) return NAN;
+
+    // Invert the same two phases used by ECPhysicsStoppingDistance. This gives
+    // the real translational speed at the first collision instead of treating
+    // pre-contact distance as an interchangeable post-contact distance budget.
+    double slideTime = speed * equilibriumFactor;
+    double rollingSpeed = fmax(0.0, speed - slidingReduction * slideTime);
+    double slidingDistance = 0.5 * (speed + rollingSpeed) * slideTime;
+    if (distance <= slidingDistance) {
+        return sqrt(fmax(0.0, speed * speed - 2.0 * slidingReduction * distance));
+    }
+    return sqrt(fmax(0.0, rollingSpeed * rollingSpeed -
+                           2.0 * rollingReduction * (distance - slidingDistance)));
+}
+
 static double ECShotSpeedForCuePower(double cuePower, double cueForce) {
     if (!isfinite(cuePower) || !isfinite(cueForce) || cueForce <= 0.0) return NAN;
 
@@ -1497,6 +1521,92 @@ static BOOL ECTrimNativeGuideToStoppingDistance(void *guide, double stoppingDist
     return YES;
 }
 
+typedef struct {
+    double transfer[2];
+    double distance[2];
+    double nativeWorldLength[2];
+    BOOL applied;
+} ECCollisionGuideResult;
+
+static ECCollisionGuideResult ECScaleCollisionGuidePathsToPhysics(
+    void *guide, double initialSpeed, double hitDistance, const double *friction,
+    double slidingReduction, double rollingReduction) {
+    ECCollisionGuideResult result = {
+        .transfer = {NAN, NAN},
+        .distance = {NAN, NAN},
+        .nativeWorldLength = {NAN, NAN},
+        .applied = NO,
+    };
+    if (!guide || !friction || !isfinite(hitDistance) || hitDistance < 0.0) return result;
+
+    uint8_t *bytes = (uint8_t *)guide;
+    if (bytes[0x98] != 1 || bytes[0x9a] != 1) return result;
+
+    // refresh() runs the game's own collision response on its two temporary
+    // balls. It leaves the resulting translational speed magnitudes here.
+    // Their normalized ratio is the exact velocity transfer for this contact
+    // angle (including the game's collision implementation), independent of
+    // the arbitrary native aim-stat length used to draw the paths.
+    double nativeOutgoingSpeed[2] = {NAN, NAN};
+    memcpy(&nativeOutgoingSpeed[0], bytes + 0x690, sizeof(double));
+    memcpy(&nativeOutgoingSpeed[1], bytes + 0x6a8, sizeof(double));
+    double nativeInputSpeed = hypot(nativeOutgoingSpeed[0], nativeOutgoingSpeed[1]);
+    if (!isfinite(nativeInputSpeed) || nativeInputSpeed <= 1e-8 ||
+        !isfinite(nativeOutgoingSpeed[0]) || nativeOutgoingSpeed[0] < 0.0 ||
+        !isfinite(nativeOutgoingSpeed[1]) || nativeOutgoingSpeed[1] < 0.0) return result;
+
+    uint8_t *active = NULL;
+    memcpy(&active, bytes + 0x218, sizeof(active));
+    if (active != bytes + 0x118 && active != bytes + 0x158 &&
+        active != bytes + 0x198 && active != bytes + 0x1d8) return result;
+
+    ECDPoint primaryStart = {NAN, NAN};
+    ECDPoint primaryEnd = {NAN, NAN};
+    memcpy(&primaryStart, bytes + 0xb0, sizeof(primaryStart));
+    memcpy(&primaryEnd, bytes + 0xc0, sizeof(primaryEnd));
+    double primaryRenderedLength = hypot(primaryEnd.x - primaryStart.x,
+                                         primaryEnd.y - primaryStart.y);
+    if (!ECPointValid(primaryStart) || !ECPointValid(primaryEnd) ||
+        !isfinite(primaryRenderedLength) || primaryRenderedLength <= 1e-8 ||
+        hitDistance <= 1e-8) return result;
+    double renderUnitsPerWorldUnit = primaryRenderedLength / hitDistance;
+
+    double impactSpeed = ECPhysicsSpeedAfterDistance(
+        initialSpeed, hitDistance, friction, slidingReduction, rollingReduction);
+    if (!isfinite(impactSpeed) || impactSpeed <= 0.0) return result;
+
+    for (int path = 0; path < 2; path++) {
+        result.transfer[path] = fmax(0.0, fmin(1.0,
+            nativeOutgoingSpeed[path] / nativeInputSpeed));
+        double outgoingSpeed = impactSpeed * result.transfer[path];
+        result.distance[path] = ECPhysicsStoppingDistance(
+            outgoingSpeed, friction, slidingReduction, rollingReduction);
+
+        size_t pointOffset = (size_t)path * 0x20;
+        ECDPoint start = {NAN, NAN};
+        ECDPoint end = {NAN, NAN};
+        memcpy(&start, active + pointOffset, sizeof(start));
+        memcpy(&end, active + pointOffset + 0x10, sizeof(end));
+        if (!ECPointValid(start) || !ECPointValid(end)) continue;
+
+        double dx = end.x - start.x;
+        double dy = end.y - start.y;
+        double renderedLength = hypot(dx, dy);
+        if (!isfinite(renderedLength) || renderedLength <= 1e-8) continue;
+        result.nativeWorldLength[path] = renderedLength / renderUnitsPerWorldUnit;
+
+        // Preserve a nearer native cushion/ball intersection. Only shorten a
+        // branch when its own physical stopping distance occurs first.
+        double physicalRenderedLength = result.distance[path] * renderUnitsPerWorldUnit;
+        if (!isfinite(physicalRenderedLength) || physicalRenderedLength >= renderedLength) continue;
+        double fraction = fmax(0.0, physicalRenderedLength / renderedLength);
+        ECDPoint physicalEnd = {start.x + dx * fraction, start.y + dy * fraction};
+        memcpy(active + pointOffset + 0x10, &physicalEnd, sizeof(physicalEnd));
+        result.applied = YES;
+    }
+    return result;
+}
+
 static void ECUpdatePhysicsGuideForCue(id visualCue) {
     if (!visualCue || !ECExtensionIsActive() || !ECNativePhysicsSurfaceValid()) return;
 
@@ -1525,6 +1635,10 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
     void *guide = ECRawPointerIvar(visualCue, "mVisualGuide");
     double nativeHitDistance = NAN;
     BOOL stoppedBeforeCollision = NO;
+    ECCollisionGuideResult collisionResult = {
+        .transfer = {NAN, NAN}, .distance = {NAN, NAN},
+        .nativeWorldLength = {NAN, NAN}, .applied = NO,
+    };
     if (guide) {
         void (*refresh)(void *) = (void (*)(void *))ECGameAddress(EC_VISUAL_GUIDE_REFRESH_ADDRESS);
 
@@ -1545,6 +1659,9 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
             double remainingDistance = fmax(0.0, predictedDistance - nativeHitDistance);
             *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = remainingDistance;
             refresh(guide);
+            collisionResult = ECScaleCollisionGuidePathsToPhysics(
+                guide, initialSpeed, nativeHitDistance, friction,
+                effectiveSliding, effectiveRolling);
         }
     }
 
@@ -1554,9 +1671,13 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         fabs(predictedDistance - gECLastPredictedDistance) > 40.0) {
         lastLogTime = now;
         ECLogLine([NSString stringWithFormat:
-            @"physics-guide power=%.5f cueForce=%.3f speed=%.3f distance=%.3f hit=%.3f preStop=%d eq=%.8f slide=%.3f/%.3f roll=%.3f/%.3f nativeAim=%.3f",
+            @"physics-guide power=%.5f cueForce=%.3f speed=%.3f distance=%.3f hit=%.3f preStop=%d transfer=%.3f/%.3f branch=%.3f/%.3f nativeBranch=%.3f/%.3f branchTrim=%d eq=%.8f slide=%.3f/%.3f roll=%.3f/%.3f nativeAim=%.3f",
             cuePower, cueForce, initialSpeed, predictedDistance,
             nativeHitDistance, stoppedBeforeCollision,
+            collisionResult.transfer[0], collisionResult.transfer[1],
+            collisionResult.distance[0], collisionResult.distance[1],
+            collisionResult.nativeWorldLength[0], collisionResult.nativeWorldLength[1],
+            collisionResult.applied,
             friction[3], friction[4], effectiveSliding,
             friction[5], effectiveRolling, gECNativeAimDistance]);
     }
