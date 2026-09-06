@@ -23,6 +23,7 @@ static NSString *const ECButtonXKey = @"EmberEightBPOfflineLines.buttonX";
 static NSString *const ECButtonYKey = @"EmberEightBPOfflineLines.buttonY";
 static NSString *const ECReboundsKey = @"EmberEightBPOfflineLines.rebounds";
 static NSString *const ECLandingRingsKey = @"EmberEightBPOfflineLines.landingRings";
+static NSString *const ECTableOverlayKey = @"EmberEightBPOfflineLines.tableOverlay";
 
 static id gECGameManager = nil;
 static BOOL gECInMatch = NO;
@@ -35,6 +36,7 @@ static double gECNativeAimDistance = NAN;
 static double gECLastPredictedDistance = NAN;
 static BOOL gECShowRebounds = YES;
 static BOOL gECShowLandingRings = YES;
+static BOOL gECShowTableOverlay = YES;
 
 @class EmberEightBPLineOverlay;
 @class EmberEightBPOfflineLinesController;
@@ -52,6 +54,8 @@ static void ECUpdatePhysicsGuideForCue(id visualCue);
 static void ECCaptureNativeCueStats(void);
 static void ECObserveShadowParity(void);
 static void ECHideReachedLandingMarker(id ball);
+static void ECClearTableOverlay(void);
+static void ECSyncTableOverlay(void);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -124,6 +128,7 @@ static id gECRingTexture = nil;
 static id gECLineTexture = nil;
 static id gECPredictionMarkers[20];
 static NSMutableArray *gECReboundSprites = nil;
+static NSMutableArray *gECTableOverlaySprites = nil;
 static EightBPShadowPrediction gECLastShadowPrediction;
 static BOOL gECHasShadowPrediction = NO;
 static BOOL gECShadowShotMoving = NO;
@@ -804,6 +809,7 @@ static void ECClearPredictionVisuals(void) {
 
 static void ECRemoveBallMarkers(void) {
     ECClearPredictionVisuals();
+    ECClearTableOverlay();
     for (int i = 0; i < 20; i++) {
         id ball = gECCachedBalls[i];
         if (!ball) continue;
@@ -1127,6 +1133,7 @@ static void ECUpdateVisualBall(id self, SEL selector) {
     @try {
         ECSyncCocosMarker(self, YES);
         ECHideReachedLandingMarker(self);
+        ECSyncTableOverlay();
         ECLogRingSnapshot();
         ECObserveShadowParity();
     } @catch (NSException *exception) {
@@ -2024,6 +2031,251 @@ static void ECAddReboundSprite(id parent, ECDPoint from, ECDPoint to,
         ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), sprite);
     }
     [gECReboundSprites addObject:sprite];
+}
+
+static void ECClearTableOverlay(void) {
+    if (!gECTableOverlaySprites) return;
+    for (id sprite in gECTableOverlaySprites.copy) {
+        if ([sprite respondsToSelector:@selector(removeFromParent)]) {
+            ((void (*)(id, SEL))objc_msgSend)(sprite, @selector(removeFromParent));
+        }
+    }
+    [gECTableOverlaySprites removeAllObjects];
+}
+
+static void ECAddTableOverlayLine(id parent, ECDPoint from, ECDPoint to,
+                                  ECccColor3B color, id referenceBall, long long z,
+                                  double thickness) {
+    if (!parent || !ECPointValid(from) || !ECPointValid(to)) return;
+    CGPoint start = ECVisualPointForWorld(from, referenceBall);
+    CGPoint end = ECVisualPointForWorld(to, referenceBall);
+    double dx = end.x - start.x;
+    double dy = end.y - start.y;
+    double length = hypot(dx, dy);
+    if (!isfinite(length) || length < 0.4) return;
+    id texture = ECSolidLineTexture();
+    Class spriteClass = NSClassFromString(@"CCSprite");
+    if (!texture || !spriteClass) return;
+    id sprite = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
+    sprite = ((id (*)(id, SEL, id))objc_msgSend)(sprite, @selector(initWithTexture:), texture);
+    if (!ECLooksLikeObject(sprite)) return;
+    CGSize size = [sprite respondsToSelector:@selector(contentSize)]
+        ? ((CGSize (*)(id, SEL))objc_msgSend)(sprite, @selector(contentSize)) : CGSizeMake(1, 1);
+    if ([sprite respondsToSelector:@selector(setAnchorPoint:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(sprite, @selector(setAnchorPoint:),
+                                                   CGPointMake(0, 0.5));
+    }
+    if ([sprite respondsToSelector:@selector(setPosition:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(sprite, @selector(setPosition:), start);
+    }
+    if ([sprite respondsToSelector:@selector(setRotation:)]) {
+        float degrees = (float)(-atan2(dy, dx) * 180.0 / M_PI);
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setRotation:), degrees);
+    }
+    if ([sprite respondsToSelector:@selector(setScaleX:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setScaleX:),
+                                                 (float)(length / MAX(1.0, size.width)));
+    }
+    if ([sprite respondsToSelector:@selector(setScaleY:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setScaleY:),
+                                                 (float)(thickness / MAX(1.0, size.height)));
+    }
+    if ([sprite respondsToSelector:@selector(setColor:)]) {
+        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(sprite, @selector(setColor:), color);
+    }
+    if ([sprite respondsToSelector:@selector(setOpacity:)]) {
+        ((void (*)(id, SEL, unsigned char))objc_msgSend)(sprite, @selector(setOpacity:), 210);
+    }
+    if ([parent respondsToSelector:@selector(addChild:z:)]) {
+        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), sprite, z);
+    } else if ([parent respondsToSelector:@selector(addChild:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), sprite);
+    }
+    if (!gECTableOverlaySprites) gECTableOverlaySprites = [NSMutableArray array];
+    [gECTableOverlaySprites addObject:sprite];
+}
+
+static void ECAddTableOverlayPocket(id parent, ECDPoint world, double radius,
+                                   ECccColor3B color, id referenceBall, long long z) {
+    if (!parent || !ECPointValid(world) || radius <= 0.2) return;
+    id texture = ECCircleTexture();
+    Class spriteClass = NSClassFromString(@"CCSprite");
+    if (!texture || !spriteClass) return;
+    id sprite = ((id (*)(id, SEL))objc_msgSend)(spriteClass, @selector(alloc));
+    sprite = ((id (*)(id, SEL, id))objc_msgSend)(sprite, @selector(initWithTexture:), texture);
+    if (!ECLooksLikeObject(sprite)) return;
+    double visualScale = gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+    double wanted = radius * visualScale * 2.0 * EC_RING_PADDING / EC_RING_OUTER_FRACTION;
+    CGSize size = [sprite respondsToSelector:@selector(contentSize)]
+        ? ((CGSize (*)(id, SEL))objc_msgSend)(sprite, @selector(contentSize)) : CGSizeZero;
+    if ([sprite respondsToSelector:@selector(setPosition:)]) {
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(sprite, @selector(setPosition:),
+                                                   ECVisualPointForWorld(world, referenceBall));
+    }
+    if (size.width > 1.0 && [sprite respondsToSelector:@selector(setScale:)]) {
+        ((void (*)(id, SEL, float))objc_msgSend)(sprite, @selector(setScale:),
+                                                 (float)(wanted / size.width));
+    }
+    if ([sprite respondsToSelector:@selector(setColor:)]) {
+        ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(sprite, @selector(setColor:), color);
+    }
+    if ([sprite respondsToSelector:@selector(setOpacity:)]) {
+        ((void (*)(id, SEL, unsigned char))objc_msgSend)(sprite, @selector(setOpacity:), 200);
+    }
+    if ([parent respondsToSelector:@selector(addChild:z:)]) {
+        ((void (*)(id, SEL, id, long long))objc_msgSend)(parent, @selector(addChild:z:), sprite, z);
+    } else if ([parent respondsToSelector:@selector(addChild:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(parent, @selector(addChild:), sprite);
+    }
+    if (!gECTableOverlaySprites) gECTableOverlaySprites = [NSMutableArray array];
+    [gECTableOverlaySprites addObject:sprite];
+}
+
+static int ECReadPocketCenters(id table, ECDPoint *pockets, int capacity, double *radiusOut) {
+    if (!table || !pockets || capacity <= 0) return 0;
+    id properties = ECInvokeId(table, @"tableProperties");
+    if (!ECLooksLikeObject(properties)) return 0;
+    SEL pocketsSelector = NSSelectorFromString(@"getPockets");
+    if (![properties respondsToSelector:pocketsSelector]) return 0;
+    const ECPointVector *vector = ((const ECPointVector *(*)(id, SEL))objc_msgSend)(
+        properties, pocketsSelector);
+    if (!vector || !vector->begin || !vector->end || vector->end < vector->begin) return 0;
+    ptrdiff_t count = vector->end - vector->begin;
+    if (count < 1 || count > 16) return 0;
+    int written = 0;
+    for (ptrdiff_t index = 0; index < count && written < capacity; index++) {
+        ECDPoint point = vector->begin[index];
+        if (!ECPointValid(point)) continue;
+        pockets[written++] = point;
+    }
+    if (radiusOut) {
+        double fallback = 6.7;
+        id cue = gECCachedCueBall;
+        double ballRadius = ECBallLiveRadius(cue);
+        if (ballRadius > 0.5) fallback = ballRadius * 1.85;
+        *radiusOut = fallback;
+    }
+    return written;
+}
+
+static void ECSyncTableOverlay(void) {
+    static double lastScale = 0;
+    static CGPoint lastOrigin = {NAN, NAN};
+    static const void *lastParent = NULL;
+    static int lastSegmentCount = -1;
+    static int lastPocketCount = -1;
+    if (!gECShowTableOverlay || !gECInMatch) {
+        ECClearTableOverlay();
+        lastScale = 0;
+        lastOrigin = CGPointMake(NAN, NAN);
+        lastParent = NULL;
+        lastSegmentCount = -1;
+        lastPocketCount = -1;
+        return;
+    }
+    id table = gECCachedTable;
+    id reference = gECCachedCueBall;
+    if (!ECLooksLikeObject(reference)) {
+        for (int slot = 0; slot < gECCachedSnapCount; slot++) {
+            if (ECLooksLikeObject(gECCachedBalls[slot])) {
+                reference = gECCachedBalls[slot];
+                break;
+            }
+        }
+    }
+    id sphere = ECVisualSphere(reference);
+    id parent = ECLooksLikeObject(sphere) ? ECInvokeId(sphere, @"parent") : nil;
+    if (!ECLooksLikeObject(table) || !ECLooksLikeObject(reference) ||
+        !ECLooksLikeObject(parent)) return;
+
+    CGPoint origin = CGPointMake(NAN, NAN);
+    if (!ECReadPointIvar(reference, "mVisualTableOrigin", &origin)) return;
+    double scale = gECDerivedVisualScale > 0.2 ? gECDerivedVisualScale : 1.7007874015748;
+
+    ECDPoint shapePoints[128];
+    int shapeCount = 0;
+    Ivar shapeIvar = class_getInstanceVariable([table class], "mTableShape");
+    if (shapeIvar) {
+        const uint8_t *tableBytes = (const uint8_t *)(__bridge const void *)table;
+        const ECPointVector *shape =
+            (const ECPointVector *)(tableBytes + ivar_getOffset(shapeIvar));
+        if (shape && shape->begin && shape->end && shape->end > shape->begin) {
+            ptrdiff_t count = shape->end - shape->begin;
+            if (count >= 4 && count <= 128) {
+                for (ptrdiff_t index = 0; index < count; index++) {
+                    if (ECPointValid(shape->begin[index])) {
+                        shapePoints[shapeCount++] = shape->begin[index];
+                    }
+                }
+            }
+        }
+    }
+
+    ECDPoint pockets[16];
+    double pocketRadius = 6.7;
+    int pocketCount = ECReadPocketCenters(table, pockets, 16, &pocketRadius);
+    if (pocketCount <= 0) {
+        ECDBox box = ECDefaultTableBox();
+        pockets[0] = (ECDPoint){box.minX, box.minY};
+        pockets[1] = (ECDPoint){box.minX, box.maxY};
+        pockets[2] = (ECDPoint){box.maxX, box.minY};
+        pockets[3] = (ECDPoint){box.maxX, box.maxY};
+        pockets[4] = (ECDPoint){0.0, box.minY};
+        pockets[5] = (ECDPoint){0.0, box.maxY};
+        pocketCount = 6;
+    }
+
+    if (gECTableOverlaySprites.count > 0 &&
+        fabs(scale - lastScale) < 1e-6 &&
+        fabs(origin.x - lastOrigin.x) < 0.05 &&
+        fabs(origin.y - lastOrigin.y) < 0.05 &&
+        lastParent == (__bridge const void *)parent &&
+        lastSegmentCount == shapeCount &&
+        lastPocketCount == pocketCount) {
+        return;
+    }
+
+    ECClearTableOverlay();
+    lastScale = scale;
+    lastOrigin = origin;
+    lastParent = (__bridge const void *)parent;
+    lastSegmentCount = shapeCount;
+    lastPocketCount = pocketCount;
+
+    long long z = 0;
+    if ([sphere respondsToSelector:@selector(zOrder)]) {
+        long long sphereZ = ((long long (*)(id, SEL))objc_msgSend)(sphere, @selector(zOrder));
+        z = sphereZ > 2 ? 1 : 0;
+    }
+    const ECccColor3B railColor = {90, 220, 255};
+    const ECccColor3B pocketColor = {255, 208, 70};
+    if (shapeCount >= 2) {
+        double closeGap = hypot(shapePoints[0].x - shapePoints[shapeCount - 1].x,
+                                shapePoints[0].y - shapePoints[shapeCount - 1].y);
+        int edges = closeGap < 12.0 ? shapeCount : shapeCount - 1;
+        for (int index = 0; index < edges; index++) {
+            ECDPoint from = shapePoints[index];
+            ECDPoint to = shapePoints[(index + 1) % shapeCount];
+            ECAddTableOverlayLine(parent, from, to, railColor, reference, z, 2.15);
+        }
+    } else {
+        ECDBox box = ECDefaultTableBox();
+        ECDPoint corners[4] = {
+            {box.minX, box.minY}, {box.maxX, box.minY},
+            {box.maxX, box.maxY}, {box.minX, box.maxY},
+        };
+        for (int index = 0; index < 4; index++) {
+            ECAddTableOverlayLine(parent, corners[index], corners[(index + 1) % 4],
+                                  railColor, reference, z, 2.15);
+        }
+    }
+    for (int index = 0; index < pocketCount; index++) {
+        ECAddTableOverlayPocket(parent, pockets[index], pocketRadius,
+                                pocketColor, reference, z);
+    }
+    ECLogLine([NSString stringWithFormat:
+        @"table-overlay shape=%d pockets=%d radius=%.2f scale=%.4f",
+        shapeCount, pocketCount, pocketRadius, scale]);
 }
 
 static void ECSyncLandingMarker(int index, id parent, ECSimBall *ball,
@@ -3234,6 +3486,15 @@ static void ECRequestOverlayRedraw(void) {
         if (!enabled && !gECShowRebounds) ECClearPredictionVisuals();
         [weakSelf refreshPrediction];
     }];
+    [panel addToggle:@"TABLE OVERLAY"
+              detail:@"Trace the inner cushions and pockets on the live table"
+             enabled:gECShowTableOverlay
+             handler:^(BOOL enabled) {
+        gECShowTableOverlay = enabled;
+        [NSUserDefaults.standardUserDefaults setBool:enabled forKey:ECTableOverlayKey];
+        if (!enabled) ECClearTableOverlay();
+        else ECSyncTableOverlay();
+    }];
 
     [panel addSection:@"RINGS FOLLOW EACH BALL'S COLOUR"];
 }
@@ -3382,6 +3643,8 @@ static void EmberEightBPOfflineLinesBoot(void) {
         ? YES : [defaults boolForKey:ECReboundsKey];
     gECShowLandingRings = [defaults objectForKey:ECLandingRingsKey] == nil
         ? YES : [defaults boolForKey:ECLandingRingsKey];
+    gECShowTableOverlay = [defaults objectForKey:ECTableOverlayKey] == nil
+        ? YES : [defaults boolForKey:ECTableOverlayKey];
     EightBPShadowSetLogCallback(ECShadowLogCallback, NULL);
     ECInstallHooks();
     EmberEightBPOfflineLinesController *controller = [EmberEightBPOfflineLinesController sharedController];
