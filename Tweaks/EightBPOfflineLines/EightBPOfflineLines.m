@@ -2205,6 +2205,13 @@ typedef struct {
     double alignment;
     double score;
     BOOL directPot;
+    BOOL bankShot;
+    int cushionIndex;
+    double totalObjectDistance;
+    id secondBall;
+    int secondNumber;
+    double secondDistance;
+    BOOL lastResort;
 } ECAutoplayPlan;
 
 static BOOL ECReadIntegerIvar(id object, const char *name, int *valueOut) {
@@ -2307,6 +2314,108 @@ static BOOL ECAutoplayBallIsLegal(id manager, id ball, int number) {
     return YES;
 }
 
+// ── Forward declarations for collision helpers defined later in the file ──
+static double ECRayCircle(ECDPoint origin, ECDPoint dir, ECDPoint center, double radius);
+static void ECElasticSplit(ECDPoint inDir, ECDPoint normal, ECDPoint *objectDir, ECDPoint *leftover);
+
+// Returns the index of the first pocket a ray from `origin` in `direction`
+// enters within `maxDistance`, or -1 if none. Reuses the prediction tracer's
+// ray-circle test so the geometry matches the live table.
+static int ECAutoplayRayHitsPocket(ECDPoint origin, ECDPoint direction,
+                                   const ECDPoint *pockets, int pocketCount,
+                                   double pocketRadius, double maxDistance) {
+    ECDPoint dir = ECNorm(direction);
+    if (dir.x == 0 && dir.y == 0) return -1;
+    int hit = -1;
+    double bestT = maxDistance > 0 ? maxDistance : 1e9;
+    for (int i = 0; i < pocketCount; i++) {
+        double t = ECRayCircle(origin, dir, pockets[i], pocketRadius);
+        if (t > 0.5 && t < bestT) { bestT = t; hit = i; }
+    }
+    return hit;
+}
+
+// Reflect a point across one of the four cushions.
+//   0 = left (x=minX), 1 = right (x=maxX), 2 = bottom (y=minY), 3 = top (y=maxY)
+static ECDPoint ECAutoplayReflectAcrossCushion(ECDPoint point, int cushion, ECDBox bounds) {
+    switch (cushion) {
+        case 0: return ECMakePoint(2.0 * bounds.minX - point.x, point.y);
+        case 1: return ECMakePoint(2.0 * bounds.maxX - point.x, point.y);
+        case 2: return ECMakePoint(point.x, 2.0 * bounds.minY - point.y);
+        case 3: return ECMakePoint(point.x, 2.0 * bounds.maxY - point.y);
+        default: return point;
+    }
+}
+
+// Where a ray from `origin` in `direction` crosses a specific cushion line
+// (offset inward by `radius` to the ball-centre bounce line). Returns NAN,NAN
+// if the ray never hits that cushion in the forward direction.
+static ECDPoint ECAutoplayCushionHitPoint(ECDPoint origin, ECDPoint direction,
+                                          int cushion, ECDBox bounds, double radius) {
+    ECDPoint dir = ECNorm(direction);
+    double t = -1;
+    switch (cushion) {
+        case 0: if (dir.x < -1e-9) t = (bounds.minX + radius - origin.x) / dir.x; break;
+        case 1: if (dir.x >  1e-9) t = (bounds.maxX - radius - origin.x) / dir.x; break;
+        case 2: if (dir.y < -1e-9) t = (bounds.minY + radius - origin.y) / dir.y; break;
+        case 3: if (dir.y >  1e-9) t = (bounds.maxY - radius - origin.y) / dir.y; break;
+    }
+    if (t <= 0.5) return ECMakePoint(NAN, NAN);
+    return ECMakePoint(origin.x + dir.x * t, origin.y + dir.y * t);
+}
+
+// Estimate whether the cue ball scratches (enters a pocket) after contacting
+// the object ball. Uses equal-mass elastic collision: the cue keeps the
+// velocity component tangential to the contact normal. `cueDirection` is the
+// incoming cue direction (cue -> ghost), `pocketDirection` is the contact
+// normal (ghost -> pocket, same as object-ball travel direction). Returns YES
+// if the post-contact cue path reaches a pocket (directly or after one rail).
+static BOOL ECAutoplayCueScratches(ECDPoint contactPoint, ECDPoint cueDirection,
+                                  ECDPoint pocketDirection,
+                                  const ECDPoint *pockets, int pocketCount,
+                                  double pocketRadius, ECDBox bounds,
+                                  double ballRadius) {
+    // If the contact point is already inside a pocket mouth, the cue ball
+    // scratches regardless of post-contact direction.
+    for (int i = 0; i < pocketCount; i++) {
+        if (hypot(contactPoint.x - pockets[i].x,
+                  contactPoint.y - pockets[i].y) < pocketRadius) return YES;
+    }
+    ECDPoint inDir = ECNorm(cueDirection);
+    ECDPoint normal = ECNorm(pocketDirection);
+    ECDPoint objectDir = {0, 0}, leftover = {0, 0};
+    ECElasticSplit(inDir, normal, &objectDir, &leftover);
+    double leftoverMag = hypot(leftover.x, leftover.y);
+    double maxTravel = hypot(bounds.maxX - bounds.minX, bounds.maxY - bounds.minY) * 2.0;
+    // Near-straight full-ball hit: the cue barely moves. It can only scratch
+    // if the contact point is already close to a pocket mouth.
+    if (leftoverMag < 0.06) {
+        for (int i = 0; i < pocketCount; i++) {
+            if (hypot(contactPoint.x - pockets[i].x,
+                      contactPoint.y - pockets[i].y) < pocketRadius * 1.3) return YES;
+        }
+        return NO;
+    }
+    ECDPoint postDir = ECNorm(leftover);
+    if (ECAutoplayRayHitsPocket(contactPoint, postDir, pockets, pocketCount,
+                                pocketRadius, maxTravel) >= 0) return YES;
+    // One-cushion bounce: the cue could scratch after rebounding off a rail.
+    for (int c = 0; c < 4; c++) {
+        ECDPoint bounce = ECAutoplayCushionHitPoint(contactPoint, postDir, c,
+                                                    bounds, ballRadius);
+        if (!ECPointValid(bounce)) continue;
+        ECDPoint after = postDir;
+        if (c < 2) after.x = -after.x; else after.y = -after.y;
+        double remaining = maxTravel - hypot(bounce.x - contactPoint.x,
+                                             bounce.y - contactPoint.y);
+        if (remaining > 1.0 &&
+            ECAutoplayRayHitsPocket(bounce, after, pockets, pocketCount,
+                                   pocketRadius, remaining) >= 0) return YES;
+    }
+    return NO;
+}
+
+
 static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPlan *planOut) {
     if (!manager || !table || !cueBall || !planOut) return NO;
     NSArray *balls = ECAutoplayBalls(table);
@@ -2324,9 +2433,11 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
     // The live pocket centres use the same fixed world coordinate system and
     // the build's canonical playable bounds safely cover every valid ghost.
     ECDBox bounds = ECDefaultTableBox();
+    double ballDiameter = cueRadius * 2.0;
 
-    ECAutoplayPlan best = { .score = INFINITY, .pocketIndex = -1 };
-    ECAutoplayPlan fallback = { .score = INFINITY, .pocketIndex = -1 };
+    ECAutoplayPlan best = { .score = INFINITY, .pocketIndex = -1, .cushionIndex = -1 };
+    ECAutoplayPlan fallback = { .score = INFINITY, .pocketIndex = -1, .cushionIndex = -1 };
+    ECAutoplayPlan lastResort = { .score = INFINITY, .pocketIndex = -1, .cushionIndex = -1 };
     for (id ball in balls) {
         if (!ECLooksLikeObject(ball) || ball == cueBall || ECBallIsPotted(ball)) continue;
         int number = ECBallNumber(ball);
@@ -2335,17 +2446,53 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
         double ballRadius = ECBallLiveRadius(ball);
         if (!ECPointValid(ballPosition) || ballRadius <= 0.0) continue;
 
-        double straightDistance = hypot(ballPosition.x - cuePosition.x,
-                                        ballPosition.y - cuePosition.y);
-        if (straightDistance > cueRadius + ballRadius &&
-            ECAutoplayLaneClear(balls, cueBall, ball, cuePosition, ballPosition, cueRadius) &&
-            straightDistance < fallback.score) {
-            fallback = (ECAutoplayPlan){
-                .targetBall = ball, .targetNumber = number, .pocketIndex = -1,
-                .aimPoint = ballPosition, .cueDistance = straightDistance,
-                .objectDistance = 0.0, .alignment = 1.0,
-                .score = straightDistance, .directPot = NO,
-            };
+        // Safety fallback + last resort: ghost-ball tap toward nearest pocket.
+        // The fallback rejects scratches; the last resort accepts them but
+        // uses very low power so the cue ball stops short of the pocket.
+        int nearestPocket = -1;
+        double nearestPocketDist = INFINITY;
+        for (int p = 0; p < pocketCount; p++) {
+            double d = hypot(pockets[p].x - ballPosition.x, pockets[p].y - ballPosition.y);
+            if (d < nearestPocketDist) { nearestPocketDist = d; nearestPocket = p; }
+        }
+        if (nearestPocket >= 0) {
+            ECDPoint pocketDir = ECNorm(ECMakePoint(
+                pockets[nearestPocket].x - ballPosition.x,
+                pockets[nearestPocket].y - ballPosition.y));
+            ECDPoint ghost = ECMakePoint(
+                ballPosition.x - pocketDir.x * ballDiameter,
+                ballPosition.y - pocketDir.y * ballDiameter);
+            ECDPoint cueVec = ECMakePoint(ghost.x - cuePosition.x, ghost.y - cuePosition.y);
+            double cueDist = hypot(cueVec.x, cueVec.y);
+            BOOL laneClear = cueDist > cueRadius &&
+                ECAutoplayLaneClear(balls, cueBall, ball, cuePosition, ghost, cueRadius);
+            if (laneClear) {
+                double score = cueDist + nearestPocketDist * 0.5;
+                if (score < lastResort.score) {
+                    lastResort = (ECAutoplayPlan){
+                        .targetBall = ball, .targetNumber = number,
+                        .pocketIndex = nearestPocket, .aimPoint = ghost,
+                        .cueDistance = cueDist, .objectDistance = nearestPocketDist,
+                        .alignment = 0.5, .score = score, .directPot = NO,
+                        .bankShot = NO, .cushionIndex = -1,
+                        .totalObjectDistance = nearestPocketDist, .lastResort = YES,
+                    };
+                }
+                if (!ECAutoplayCueScratches(ghost, cueVec, ECMakePoint(
+                        pockets[nearestPocket].x - ballPosition.x,
+                        pockets[nearestPocket].y - ballPosition.y),
+                        pockets, pocketCount, pocketRadius, bounds, cueRadius) &&
+                    score < fallback.score) {
+                    fallback = (ECAutoplayPlan){
+                        .targetBall = ball, .targetNumber = number,
+                        .pocketIndex = nearestPocket, .aimPoint = ghost,
+                        .cueDistance = cueDist, .objectDistance = nearestPocketDist,
+                        .alignment = 0.5, .score = score, .directPot = NO,
+                        .bankShot = NO, .cushionIndex = -1,
+                        .totalObjectDistance = nearestPocketDist,
+                    };
+                }
+            }
         }
 
         for (int pocketIndex = 0; pocketIndex < pocketCount; pocketIndex++) {
@@ -2372,6 +2519,9 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
             if (alignment < 0.28) continue;
             if (!ECAutoplayLaneClear(balls, cueBall, ball, cuePosition, ghost, cueRadius)) continue;
             if (!ECAutoplayLaneClear(balls, ball, nil, ballPosition, pocket, ballRadius)) continue;
+            // Scratch avoidance: reject if the cue ball heads into a pocket.
+            if (ECAutoplayCueScratches(ghost, cueVector, pocketVector, pockets,
+                                       pocketCount, pocketRadius, bounds, cueRadius)) continue;
 
             // Prefer short, nearly straight pots. The pocket radius term gives
             // the wider corner/side entrances a small but real tolerance bonus.
@@ -2383,28 +2533,172 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
                     .pocketIndex = pocketIndex, .aimPoint = ghost,
                     .cueDistance = cueDistance, .objectDistance = objectDistance,
                     .alignment = alignment, .score = score, .directPot = YES,
+                    .bankShot = NO, .cushionIndex = -1,
+                    .totalObjectDistance = objectDistance,
                 };
             }
         }
+
+        // ── Bank shots: object ball off a cushion into a pocket ────────────
+        for (int pocketIndex = 0; pocketIndex < pocketCount; pocketIndex++) {
+            ECDPoint pocket = pockets[pocketIndex];
+            for (int cushion = 0; cushion < 4; cushion++) {
+                ECDPoint reflected = ECAutoplayReflectAcrossCushion(pocket, cushion, bounds);
+                ECDPoint reflectVec = {reflected.x - ballPosition.x,
+                                      reflected.y - ballPosition.y};
+                double reflectDist = hypot(reflectVec.x, reflectVec.y);
+                if (!isfinite(reflectDist) || reflectDist < ballRadius * 2.0) continue;
+                ECDPoint travelDir = {reflectVec.x / reflectDist, reflectVec.y / reflectDist};
+                ECDPoint ghost = {
+                    ballPosition.x - travelDir.x * ballDiameter,
+                    ballPosition.y - travelDir.y * ballDiameter,
+                };
+                if (ghost.x <= bounds.minX + cueRadius || ghost.x >= bounds.maxX - cueRadius ||
+                    ghost.y <= bounds.minY + cueRadius || ghost.y >= bounds.maxY - cueRadius)
+                    continue;
+                ECDPoint cueVector = {ghost.x - cuePosition.x, ghost.y - cuePosition.y};
+                double cueDistance = hypot(cueVector.x, cueVector.y);
+                if (!isfinite(cueDistance) || cueDistance < cueRadius * 0.25) continue;
+                ECDPoint cueDirection = {cueVector.x / cueDistance, cueVector.y / cueDistance};
+                double alignment = cueDirection.x * travelDir.x + cueDirection.y * travelDir.y;
+                if (alignment < 0.35) continue;
+                ECDPoint cushionHit = ECAutoplayCushionHitPoint(ballPosition, travelDir,
+                                                               cushion, bounds, ballRadius);
+                if (!ECPointValid(cushionHit)) continue;
+                // Verify the hit is on the correct cushion, not past a corner.
+                if (cushion < 2) {
+                    if (cushionHit.y < bounds.minY || cushionHit.y > bounds.maxY) continue;
+                } else {
+                    if (cushionHit.x < bounds.minX || cushionHit.x > bounds.maxX) continue;
+                }
+                double bounceDist = hypot(pocket.x - cushionHit.x, pocket.y - cushionHit.y);
+                if (!isfinite(bounceDist) || bounceDist < 1.0) continue;
+                if (!ECAutoplayLaneClear(balls, cueBall, ball, cuePosition, ghost, cueRadius)) continue;
+                if (!ECAutoplayLaneClear(balls, ball, nil, ballPosition, cushionHit, ballRadius)) continue;
+                if (!ECAutoplayLaneClear(balls, ball, nil, cushionHit, pocket, ballRadius)) continue;
+                if (ECAutoplayCueScratches(ghost, cueVector, reflectVec, pockets,
+                                           pocketCount, pocketRadius, bounds, cueRadius)) continue;
+                double legToCushion = hypot(cushionHit.x - ballPosition.x,
+                                            cushionHit.y - ballPosition.y);
+                double totalObject = legToCushion + bounceDist;
+                double cutPenalty = (1.0 - alignment) * 260.0;
+                double bankPenalty = 120.0;
+                double bankScore = cueDistance + totalObject * 0.72 + cutPenalty + bankPenalty
+                             - pocketRadius * 0.1;
+                if (bankScore < best.score) {
+                    best = (ECAutoplayPlan){
+                        .targetBall = ball, .targetNumber = number,
+                        .pocketIndex = pocketIndex, .aimPoint = ghost,
+                        .cueDistance = cueDistance, .objectDistance = bounceDist,
+                        .alignment = alignment, .score = bankScore, .directPot = NO,
+                        .bankShot = YES, .cushionIndex = cushion,
+                        .totalObjectDistance = totalObject,
+                    };
+                }
+            }
+        }
+
+
+        // ── Combo shots: cue -> ball A -> ball B -> pocket ──────────────────
+        for (id secondBall in balls) {
+            if (!ECLooksLikeObject(secondBall) || secondBall == cueBall ||
+                secondBall == ball || ECBallIsPotted(secondBall)) continue;
+            int secondNumber = ECBallNumber(secondBall);
+            if (!ECAutoplayBallIsLegal(manager, secondBall, secondNumber)) continue;
+            ECDPoint secondPos = ECBallLivePosition(secondBall);
+            double secondRadius = ECBallLiveRadius(secondBall);
+            if (!ECPointValid(secondPos) || secondRadius <= 0.0) continue;
+            for (int pocketIndex = 0; pocketIndex < pocketCount; pocketIndex++) {
+                ECDPoint pocket = pockets[pocketIndex];
+                ECDPoint pocketVec = {pocket.x - secondPos.x, pocket.y - secondPos.y};
+                double pocketDist = hypot(pocketVec.x, pocketVec.y);
+                if (!isfinite(pocketDist) || pocketDist < secondRadius * 1.2) continue;
+                ECDPoint pocketDir = {pocketVec.x / pocketDist, pocketVec.y / pocketDist};
+                ECDPoint ghostB = {
+                    secondPos.x - pocketDir.x * (ballRadius + secondRadius),
+                    secondPos.y - pocketDir.y * (ballRadius + secondRadius),
+                };
+                ECDPoint aVec = {ghostB.x - ballPosition.x, ghostB.y - ballPosition.y};
+                double aDist = hypot(aVec.x, aVec.y);
+                if (!isfinite(aDist) || aDist < ballRadius * 2.0) continue;
+                ECDPoint aDir = {aVec.x / aDist, aVec.y / aDist};
+                ECDPoint ghostA = {
+                    ballPosition.x - aDir.x * ballDiameter,
+                    ballPosition.y - aDir.y * ballDiameter,
+                };
+                if (ghostA.x <= bounds.minX + cueRadius || ghostA.x >= bounds.maxX - cueRadius ||
+                    ghostA.y <= bounds.minY + cueRadius || ghostA.y >= bounds.maxY - cueRadius)
+                    continue;
+                ECDPoint cueVec = {ghostA.x - cuePosition.x, ghostA.y - cuePosition.y};
+                double cueDist = hypot(cueVec.x, cueVec.y);
+                if (!isfinite(cueDist) || cueDist < cueRadius * 0.25) continue;
+                ECDPoint cueDir = {cueVec.x / cueDist, cueVec.y / cueDist};
+                double align1 = cueDir.x * aDir.x + cueDir.y * aDir.y;
+                double align2 = aDir.x * pocketDir.x + aDir.y * pocketDir.y;
+                if (align1 < 0.40 || align2 < 0.55) continue;
+                if (!ECAutoplayLaneClear(balls, cueBall, ball, cuePosition, ghostA, cueRadius)) continue;
+                if (!ECAutoplayLaneClear(balls, ball, secondBall, ballPosition, ghostB, ballRadius)) continue;
+                if (!ECAutoplayLaneClear(balls, ball, secondBall, secondPos, pocket, secondRadius)) continue;
+                if (ECAutoplayCueScratches(ghostA, cueVec, aVec, pockets,
+                                           pocketCount, pocketRadius, bounds, cueRadius)) continue;
+                double comboPenalty = 180.0;
+                double comboScore = cueDist + (aDist + pocketDist) * 0.72 + comboPenalty
+                             + (1.0 - align1) * 200.0 + (1.0 - align2) * 200.0;
+                if (comboScore < best.score) {
+                    best = (ECAutoplayPlan){
+                        .targetBall = ball, .targetNumber = number,
+                        .pocketIndex = pocketIndex, .aimPoint = ghostA,
+                        .cueDistance = cueDist, .objectDistance = pocketDist,
+                        .alignment = align1 * align2, .score = comboScore, .directPot = NO,
+                        .bankShot = NO, .cushionIndex = -1,
+                        .totalObjectDistance = aDist + pocketDist,
+                        .secondBall = secondBall, .secondNumber = secondNumber,
+                        .secondDistance = pocketDist,
+                    };
+                }
+            }
+        }
+
     }
-    ECAutoplayPlan selected = best.targetBall ? best : fallback;
+    // Prefer a real pot (direct / bank / combo). Fall back to a non-scratching
+    // safety tap, then a last-resort very-low-power tap that never has enough
+    // speed to reach a pocket. This replaces the old 0.88 center-smash that
+    // potted the white ball.
+    ECAutoplayPlan selected = best.targetBall ? best
+        : (fallback.targetBall ? fallback : lastResort);
     if (!selected.targetBall) return NO;
     *planOut = selected;
     return YES;
 }
 
 static double ECAutoplayPowerForPlan(id table, ECAutoplayPlan plan) {
-    if (!plan.directPot) return 0.88;
+    // Last-resort safety tap: very low power so the cue ball stops well
+    // short of any pocket even if the direction is unfavourable.
+    if (plan.lastResort) return 0.22;
+    // Non-potting safety fallback: gentle ghost-ball tap toward a pocket.
+    if (!plan.directPot && !plan.bankShot && !plan.secondBall) return 0.34;
     Ivar frictionIvar = class_getInstanceVariable([table class], "_frictionProperties");
-    if (!frictionIvar || !ECNativePhysicsSurfaceValid()) return 0.68;
+    if (!frictionIvar || !ECNativePhysicsSurfaceValid()) {
+        if (plan.bankShot) return 0.82;
+        if (plan.secondBall) return 0.78;
+        return 0.68;
+    }
     const uint8_t *tableBytes = (const uint8_t *)(__bridge const void *)table;
     const double *friction = (const double *)(tableBytes + ivar_getOffset(frictionIvar));
     double sliding = NAN, rolling = NAN;
-    if (!ECEffectiveFrictionFactors((double *)friction, &sliding, &rolling)) return 0.68;
+    if (!ECEffectiveFrictionFactors((double *)friction, &sliding, &rolling)) {
+        if (plan.bankShot) return 0.82;
+        if (plan.secondBall) return 0.78;
+        return 0.68;
+    }
     double unitStoppingDistance = ECPhysicsStoppingDistance(1.0, friction, sliding, rolling);
     double cueForce = *(double *)ECGameAddress(EC_GAME_FORCE_ADDRESS);
     if (!isfinite(unitStoppingDistance) || unitStoppingDistance <= 1e-8 ||
-        !isfinite(cueForce) || cueForce <= 0.0) return 0.68;
+        !isfinite(cueForce) || cueForce <= 0.0) {
+        if (plan.bankShot) return 0.82;
+        if (plan.secondBall) return 0.78;
+        return 0.68;
+    }
 
     // Equal-mass collision transfer is the cue speed projected onto the line
     // between the two ball centres. Since stopping distance is quadratic in
@@ -2412,11 +2706,16 @@ static double ECAutoplayPowerForPlan(id table, ECAutoplayPlan plan) {
     // travel by alignment squared, then add the cue's pre-contact travel.
     double transfer = fmax(0.25, plan.alignment * 0.92);
     double requiredStoppingDistance = plan.cueDistance +
-        (plan.objectDistance + 8.0) / (transfer * transfer);
+        (plan.totalObjectDistance + 8.0) / (transfer * transfer);
+    // Bank and combo shots lose energy at the extra cushion contact / ball
+    // transfer, so add a margin to keep the object ball moving to the pocket.
+    if (plan.bankShot) requiredStoppingDistance *= 1.18;
+    if (plan.secondBall) requiredStoppingDistance *= 1.25;
     double speed = sqrt(requiredStoppingDistance / unitStoppingDistance);
     double speedRatio = fmin(1.0, fmax(0.0, speed / cueForce));
     double power = 1.0 - (1.0 - speedRatio) * (1.0 - speedRatio);
-    return fmin(0.94, fmax(0.20, power));
+    double maxPower = plan.bankShot ? 0.92 : (plan.secondBall ? 0.90 : 0.94);
+    return fmin(maxPower, fmax(0.20, power));
 }
 
 static BOOL ECAutoplaySetPointAndPower(id cue, ECDPoint point, double power) {
@@ -2532,9 +2831,10 @@ static void ECAutoplayTick(void) {
     gECAutoplayShotId = shotId;
     gECAutoplayActionAt = now;
     ECLogLine([NSString stringWithFormat:
-        @"autoplay aim ball=%d pocket=%d direct=%d power=%.4f cue=%.2f object=%.2f align=%.3f",
-        plan.targetNumber, plan.pocketIndex, plan.directPot, power,
-        plan.cueDistance, plan.objectDistance, plan.alignment]);
+        @"autoplay aim ball=%d pocket=%d direct=%d bank=%d combo=%d cushion=%d resort=%d power=%.4f cue=%.2f object=%.2f total=%.2f align=%.3f",
+        plan.targetNumber, plan.pocketIndex, plan.directPot, plan.bankShot,
+        plan.secondBall != nil, plan.cushionIndex, plan.lastResort, power,
+        plan.cueDistance, plan.objectDistance, plan.totalObjectDistance, plan.alignment]);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
