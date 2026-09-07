@@ -2629,6 +2629,7 @@ static void ECObserveShadowParity(void) {
     }
     if (anyMoving) {
         gECShadowShotMoving = YES;
+        ECClearAimContactMarker();
         ECRefreshLivePrediction();
         // Ball visuals are not guaranteed to receive one final update after
         // the physics runner stops. Schedule one bounded follow-up check so
@@ -3077,7 +3078,13 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
             }
         }
         *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = displayDistance;
-        ECSyncAimContactCircle(guide, ((uint8_t *)guide)[0x98] == 1, firstHitEnd);
+        // Aim-only: this is the first-hit ring on the extended white line.
+        // Hide it the instant power drops so it does not sit on the table
+        // until the balls finish moving.
+        BOOL aiming = initialSpeed > 0.1 && !gECShadowShotMoving;
+        ECSyncAimContactCircle(guide,
+                               aiming && ((uint8_t *)guide)[0x98] == 1,
+                               firstHitEnd);
     } else {
         ECClearAimContactMarker();
     }
@@ -3134,6 +3141,7 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         // prediction while the balls begin moving; updateVisualBall removes
         // each destination ring on arrival and clears the remaining paths when
         // the table settles. A cancelled pull expires after a short grace time.
+        ECClearAimContactMarker();
         BOOL waitingForShot = gECHasShadowPrediction && !gECShadowShotMoving &&
             CACurrentMediaTime() - gECShadowArmedAt < 1.25;
         if (!gECShadowShotMoving && !waitingForShot) ECClearPredictionVisuals();
