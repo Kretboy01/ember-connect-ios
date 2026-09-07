@@ -2311,8 +2311,11 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
     double pocketRadius = 0.0;
     int pocketCount = ECReadPocketCenters(table, pockets, 16, &pocketRadius);
     if (pocketCount <= 0) return NO;
+    // Do not call Table::tableBounds here. Its return value is a non-trivial
+    // C++ MCRect and therefore does not use the plain C struct-return ABI.
+    // The live pocket centres use the same fixed world coordinate system and
+    // the build's canonical playable bounds safely cover every valid ghost.
     ECDBox bounds = ECDefaultTableBox();
-    (void)ECReadNativeTableBox(table, &bounds);
 
     ECAutoplayPlan best = { .score = INFINITY, .pocketIndex = -1 };
     ECAutoplayPlan fallback = { .score = INFINITY, .pocketIndex = -1 };
