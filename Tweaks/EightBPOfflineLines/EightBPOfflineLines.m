@@ -77,6 +77,7 @@ static BOOL ECReadPointIvar(id object, const char *name, CGPoint *valueOut);
 static ECDPoint ECNorm(ECDPoint point);
 static ECDBox ECDefaultTableBox(void);
 static void ECSyncAimContactCircle(void *guide, BOOL reachable, ECDPoint contact);
+static BOOL ECCuePredictedScratch(void);
 
 static inline ECDPoint ECMakePoint(double x, double y) { return (ECDPoint){x, y}; }
 
@@ -998,7 +999,9 @@ static void ECSyncCocosMarker(id ball, BOOL visualFresh) {
     // Retint every sync rather than only at creation: the cue-ball identity is
     // sometimes discovered after the rack's sprites have already been made.
     int ballNumber = ball == gECCachedCueBall ? 0 : ECBallNumber(ball);
-    ECccColor3B ballColor = ECColorForBallNumber(ballNumber);
+    ECccColor3B ballColor = (ball == gECCachedCueBall && ECCuePredictedScratch())
+        ? (ECccColor3B){255, 36, 36}
+        : ECColorForBallNumber(ballNumber);
     static int colorLogCount = 0;
     if (colorLogCount < 20) {
         colorLogCount++;
@@ -2300,6 +2303,20 @@ static void ECSyncTableOverlay(void) {
         shapeCount, pocketCount, pocketRadius, scale]);
 }
 
+static BOOL ECCuePredictedScratch(void) {
+    if (!gECHasShadowPrediction || !gECLastShadowPrediction.valid) return NO;
+    const void *cue = (__bridge const void *)gECCachedCueBall;
+    for (int index = 0;
+         index < gECLastShadowPrediction.ballCount && index < EightBPShadowMaxBalls;
+         index++) {
+        const EightBPShadowBallPrediction *ball = &gECLastShadowPrediction.balls[index];
+        if (!ball->valid) continue;
+        BOOL isCue = (cue && ball->liveBall == cue) || ball->number == 0;
+        if (isCue) return ball->potted ? YES : NO;
+    }
+    return NO;
+}
+
 static void ECClearAimContactMarker(void) {
     if (!gECAimContactMarker) return;
     if ([gECAimContactMarker respondsToSelector:@selector(removeFromParent)]) {
@@ -2346,8 +2363,11 @@ static void ECSyncAimContactCircle(void *guide, BOOL show, ECDPoint contact) {
     id target = ECStruckBallFromGuide(guide);
     if (!target) target = ECNearestBallToVisual(CGPointMake(contact.x, contact.y), 36.0);
     if (!target) {
-        ECSetMarkerVisible(gECAimContactMarker, NO);
-        return;
+        if (!ECCuePredictedScratch()) {
+            ECSetMarkerVisible(gECAimContactMarker, NO);
+            return;
+        }
+        target = gECCachedCueBall;
     }
 
     id sphere = ECVisualSphere(target);
@@ -2386,7 +2406,9 @@ static void ECSyncAimContactCircle(void *guide, BOOL show, ECDPoint contact) {
     }
 
     int number = ECBallNumber(target);
-    ECccColor3B color = ECColorForBallNumber(number);
+    ECccColor3B color = ECCuePredictedScratch()
+        ? (ECccColor3B){255, 36, 36}
+        : ECColorForBallNumber(number);
     if ([marker respondsToSelector:@selector(setColor:)]) {
         ((void (*)(id, SEL, ECccColor3B))objc_msgSend)(marker, @selector(setColor:), color);
     }
@@ -3098,13 +3120,6 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
             }
         }
         *(double *)ECGameAddress(EC_GAME_AIM_ADDRESS) = displayDistance;
-        // Aim-only: this is the first-hit ring on the extended white line.
-        // Hide it the instant power drops so it does not sit on the table
-        // until the balls finish moving.
-        BOOL aiming = initialSpeed > 0.1 && !gECShadowShotMoving;
-        ECSyncAimContactCircle(guide,
-                               aiming && ((uint8_t *)guide)[0x98] == 1,
-                               firstHitEnd);
     } else {
         ECClearAimContactMarker();
     }
@@ -3165,6 +3180,13 @@ static void ECUpdatePhysicsGuideForCue(id visualCue) {
         BOOL waitingForShot = gECHasShadowPrediction && !gECShadowShotMoving &&
             CACurrentMediaTime() - gECShadowArmedAt < 1.25;
         if (!gECShadowShotMoving && !waitingForShot) ECClearPredictionVisuals();
+    }
+
+    if (guide && initialSpeed > 0.1 && !gECShadowShotMoving) {
+        BOOL scratch = ECCuePredictedScratch();
+        ECSyncAimContactCircle(guide,
+                               ((uint8_t *)guide)[0x98] == 1 || scratch,
+                               firstHitEnd);
     }
 
     static CFTimeInterval lastLogTime = 0;
@@ -3592,6 +3614,7 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 @property (nonatomic, weak) UIWindow *hostWindow;
 @property (nonatomic, strong) EmberMenuPanel *panel;
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
+@property (nonatomic, strong) NSTimer *idleTimer;
 + (instancetype)sharedController;
 - (UIWindow *)guestWindow;
 @end
@@ -3653,6 +3676,24 @@ static void ECRequestOverlayRedraw(void) {
     [self.panel removeFromSuperview];
     self.panel = nil;
     gECMenuOpen = NO;
+    [self markButtonActive];
+}
+
+- (void)markButtonActive {
+    [self.idleTimer invalidate];
+    self.idleTimer = nil;
+    UIButton *button = self.button;
+    if (!button) return;
+    button.alpha = 1.0;
+    if (gECMenuOpen) return;
+    __weak typeof(self) weakSelf = self;
+    self.idleTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:NO block:^(NSTimer *timer) {
+        (void)timer;
+        if (gECMenuOpen) return;
+        [UIView animateWithDuration:0.35 animations:^{
+            weakSelf.button.alpha = 0.34;
+        }];
+    }];
 }
 
 - (void)refreshPrediction {
@@ -3740,6 +3781,7 @@ static void ECRequestOverlayRedraw(void) {
         [panel presentInWindow:host];
         if (self.button) [host bringSubviewToFront:self.button];
         [host bringSubviewToFront:panel];
+        [self markButtonActive];
     } @catch (NSException *exception) {
         ECLogLine([NSString stringWithFormat:@"menu-open %@", exception]);
         [self closePanel];
@@ -3747,6 +3789,7 @@ static void ECRequestOverlayRedraw(void) {
 }
 
 - (void)dragged:(UIPanGestureRecognizer *)gesture {
+    [self markButtonActive];
     UIView *view = gesture.view;
     if (!view || !view.superview) return;
     CGPoint translation = [gesture translationInView:view.superview];
@@ -3768,7 +3811,6 @@ static void ECRequestOverlayRedraw(void) {
     if (!button) return;
     BOOL on = ECIsLocalMatch() && gECMultiplier > 1;
     button.layer.borderColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.18 alpha:on ? 0.95 : 0.35].CGColor;
-    button.alpha = on ? 1.0 : 0.78;
     button.accessibilityValue = on ? @"on" : @"off";
 }
 
@@ -3845,6 +3887,7 @@ static UIImage *ECEmberConnectIconImage(void) {
     ECStripUIKitOverlay();
     [self updateButton];
     ECWriteStatus(@"menu-installed");
+    [self markButtonActive];
 }
 
 - (void)start {
@@ -3859,6 +3902,8 @@ static UIImage *ECEmberConnectIconImage(void) {
 - (void)stop {
     [self.keepAliveTimer invalidate];
     self.keepAliveTimer = nil;
+    [self.idleTimer invalidate];
+    self.idleTimer = nil;
 }
 
 @end
