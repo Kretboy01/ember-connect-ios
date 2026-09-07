@@ -1517,6 +1517,8 @@ static id ECIvarObject(id object, const char *name) {
 #define EC_FRICTION_GETTER_OPCODE ((uint32_t)0xD10083FFU)
 #define EC_AUTOPLAY_RELEASE_ADDRESS ((uintptr_t)0x100CDA974ULL)
 #define EC_AUTOPLAY_RELEASE_OPCODE ((uint32_t)0xD101C3FFU)
+#define EC_RULES_PLAYER_CLASS_ADDRESS ((uintptr_t)0x100A9CC28ULL)
+#define EC_RULES_PLAYER_CLASS_OPCODE ((uint32_t)0xA9BE4FF4U)
 
 static intptr_t ECGameImageSlide(void) {
     static intptr_t slide = 0;
@@ -2246,50 +2248,56 @@ static BOOL ECAutoplayBallsMoving(NSArray *balls) {
     return NO;
 }
 
-static double ECDistanceToSegment(ECDPoint point, ECDPoint start, ECDPoint end) {
+static BOOL ECAutoplayLaneClear(NSArray *balls, id firstExcluded, id secondExcluded,
+                                ECDPoint start, ECDPoint end, double movingRadius) {
     double dx = end.x - start.x;
     double dy = end.y - start.y;
     double lengthSquared = dx * dx + dy * dy;
-    if (lengthSquared <= 1e-9) return hypot(point.x - start.x, point.y - start.y);
-    double amount = ((point.x - start.x) * dx + (point.y - start.y) * dy) /
-                    lengthSquared;
-    amount = fmax(0.0, fmin(1.0, amount));
-    return hypot(point.x - (start.x + dx * amount),
-                 point.y - (start.y + dy * amount));
-}
-
-static BOOL ECAutoplayLaneClear(NSArray *balls, id firstExcluded, id secondExcluded,
-                                ECDPoint start, ECDPoint end, double movingRadius) {
-    if (!ECPointValid(start) || !ECPointValid(end) || hypot(end.x - start.x, end.y - start.y) < 0.1)
-        return NO;
+    if (!ECPointValid(start) || !ECPointValid(end) || lengthSquared < 0.01) return NO;
     for (id ball in balls) {
         if (!ECLooksLikeObject(ball) || ball == firstExcluded || ball == secondExcluded ||
             ECBallIsPotted(ball)) continue;
         ECDPoint position = ECBallLivePosition(ball);
         double radius = ECBallLiveRadius(ball);
         if (!ECPointValid(position) || radius <= 0.0) continue;
-        if (ECDistanceToSegment(position, start, end) < movingRadius + radius + 0.18)
-            return NO;
+        double amount = ((position.x - start.x) * dx +
+                         (position.y - start.y) * dy) / lengthSquared;
+        // The path ends at the intended collision/pocket. A touching rack ball
+        // whose centre is just beyond that endpoint must not falsely block the
+        // head ball; the old clamped segment distance did exactly that on every
+        // fresh rack and left autoplay with no possible break shot.
+        if (amount <= 0.0 || amount >= 1.0) continue;
+        ECDPoint closest = {start.x + dx * amount, start.y + dy * amount};
+        if (hypot(position.x - closest.x, position.y - closest.y) <
+            movingRadius + radius + 0.08) return NO;
     }
     return YES;
 }
 
 static BOOL ECAutoplayBallIsLegal(id manager, id ball, int number) {
     if (!manager || !ball || number <= 0 || number > 15) return NO;
-    int classification = 0;
-    if (ECReadIntegerIvar(ball, "classification", &classification)) {
-        SEL wrongSelector = NSSelectorFromString(@"isVisualGuidePointingToWrongBallClassification:");
-        if ([manager respondsToSelector:wrongSelector] &&
-            ((BOOL (*)(id, SEL, int))objc_msgSend)(manager, wrongSelector, classification)) {
-            return NO;
-        }
-    }
+    int ballClassification = -1;
+    if (!ECReadIntegerIvar(ball, "classification", &ballClassification)) return NO;
 
-    // If the game's classification checker is unavailable, keep the black ball
-    // until no coloured object balls remain. The normal build always takes the
-    // branch above; this is only a conservative compatibility fallback.
-    if (number == 8 && ![manager respondsToSelector:
-                         NSSelectorFromString(@"isVisualGuidePointingToWrongBallClassification:")]) {
+    // Use the same Rules::classificationForPlayer path that GameManager uses
+    // while rebuilding its remaining-ball display. The previous implementation
+    // called isVisualGuidePointingToWrongBallClassification: before aiming at
+    // the candidate; that method checks the *current guide's hit ball* and is
+    // not a candidate-legality query, so its result was unrelated to this ball.
+    int playerClassification = -1;
+    void *rules = ECRawPointerIvar(manager, "_rules");
+    id player = ECIvarObject(manager, "mPlayer");
+    uint32_t *classificationCode = ECGameAddress(EC_RULES_PLAYER_CLASS_ADDRESS);
+    if (rules && player && classificationCode &&
+        *classificationCode == EC_RULES_PLAYER_CLASS_OPCODE) {
+        playerClassification = ((int (*)(void *, id))classificationCode)(rules, player);
+    }
+    if (playerClassification >= 0 && ballClassification != playerClassification) return NO;
+
+    // An unassigned table permits either colour but never an early black. Keep
+    // that same black-ball rule as a guarded fallback if the native lookup is
+    // unavailable on a future build.
+    if (number == 8) {
         NSArray *balls = ECAutoplayBalls(gECCachedTable);
         for (id other in balls) {
             int otherNumber = ECBallNumber(other);
