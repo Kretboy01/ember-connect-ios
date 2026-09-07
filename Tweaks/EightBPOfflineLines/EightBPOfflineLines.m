@@ -2485,9 +2485,13 @@ static void ECAutoplayTick(void) {
     }
 
     if (gECAutoplayShotPending) {
-        if (moving || !waiting || shotId != gECAutoplayShotId) gECAutoplaySawShotStart = YES;
+        // Residual isMovingOrSpinning stays true after the break, so it
+        // cannot mark "this shot started" or "table settled". Only the
+        // game leaving / returning to waitingForPlayerShot does.
+        if (!waiting || shotId != gECAutoplayShotId) gECAutoplaySawShotStart = YES;
         if (gECAutoplaySawShotStart) {
-            if (waiting && playerTurn && !moving && now - gECAutoplayActionAt > 0.8) {
+            if (waiting && playerTurn && cueEnabled && aimEnabled &&
+                now - gECAutoplayActionAt > 0.8) {
                 gECAutoplayShotPending = NO;
                 gECAutoplaySawShotStart = NO;
             } else {
