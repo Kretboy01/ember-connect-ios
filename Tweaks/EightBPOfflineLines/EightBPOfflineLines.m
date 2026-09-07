@@ -145,6 +145,7 @@ static EightBPShadowPrediction gECLastShadowPrediction;
 static BOOL gECHasShadowPrediction = NO;
 static BOOL gECShadowShotMoving = NO;
 static BOOL gECShadowSettleCheckScheduled = NO;
+static BOOL gECMenuOpen = NO;
 static CFTimeInterval gECShadowArmedAt = 0;
 static double gECShadowMaxPathError[EightBPShadowMaxBalls];
 static unsigned int gECShadowPathSamples[EightBPShadowMaxBalls];
@@ -193,6 +194,17 @@ static id ECInvokeId(id object, NSString *selectorName) {
 }
 
 static void ECLogLine(NSString *line) {
+    if (!line.length) return;
+    if ([line hasPrefix:@"shadow stage"] ||
+        [line hasPrefix:@"shadow shadow stage"] ||
+        [line hasPrefix:@"shadow-predict ok"] ||
+        [line hasPrefix:@"shadow-live ok"] ||
+        [line hasPrefix:@"physics-guide"] ||
+        [line hasPrefix:@"table-overlay"] ||
+        [line hasPrefix:@"shadow-parity"] ||
+        [line hasPrefix:@"ring-snap"]) {
+        return;
+    }
     static NSURL *logURL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -204,10 +216,21 @@ static void ECLogLine(NSString *line) {
     });
     if (!logURL) return;
     NSString *row = [NSString stringWithFormat:@"%.3f %@\n", [NSDate.date timeIntervalSince1970], line];
-    NSFileHandle *handle = [NSFileHandle fileHandleForWritingToURL:logURL error:nil];
-    [handle seekToEndOfFile];
-    [handle writeData:[row dataUsingEncoding:NSUTF8StringEncoding]];
-    [handle closeFile];
+    NSURL *url = logURL;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSFileHandle *handle = [NSFileHandle fileHandleForWritingToURL:url error:nil];
+        if (!handle) {
+            [row writeToURL:url atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            return;
+        }
+        [handle seekToEndOfFile];
+        unsigned long long size = handle.offsetInFile;
+        if (size > 256 * 1024) {
+            [handle truncateFileAtOffset:0];
+        }
+        [handle writeData:[row dataUsingEncoding:NSUTF8StringEncoding]];
+        [handle closeFile];
+    });
 }
 
 static BOOL ECExtensionIsActive(void);
@@ -425,6 +448,7 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECCachedTable = nil;
     gECHasShadowPrediction = NO;
     gECShadowShotMoving = NO;
+    gECMenuOpen = NO;
     gECHasLastFriction = NO;
     memset(&gECLastShadowPrediction, 0, sizeof(gECLastShadowPrediction));
     memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
@@ -1146,12 +1170,11 @@ static void ECLogRingSnapshot(void) {
 
 static void ECUpdateVisualBall(id self, SEL selector) {
     if (ECOriginalUpdateVisualBall) ECOriginalUpdateVisualBall(self, selector);
-    if (!gECInMatch) return;
+    if (!gECInMatch || gECMenuOpen) return;
     @try {
         ECSyncCocosMarker(self, YES);
         ECHideReachedLandingMarker(self);
         ECSyncTableOverlay();
-        ECLogRingSnapshot();
         ECObserveShadowParity();
     } @catch (NSException *exception) {
         ECLogLine([NSString stringWithFormat:@"cocos-marker %@", exception]);
@@ -2441,6 +2464,7 @@ static void ECSyncLandingMarker(int index, id parent, ECSimBall *ball,
 static void ECShadowLogCallback(const char *message, void *context) {
     (void)context;
     if (!message || !message[0]) return;
+    if (strstr(message, "stage ") || strstr(message, "completed")) return;
     ECLogLine([NSString stringWithFormat:@"shadow %s", message]);
 }
 
@@ -2695,10 +2719,6 @@ static void ECRefreshLivePrediction(void) {
         return;
     }
     if (!ok || !prediction.valid) return;
-    ECLogLine([NSString stringWithFormat:
-        @"shadow-live ok frames=%u events=%u balls=%u status=%s",
-        prediction.simulatedFrames, prediction.resolvedEvents,
-        prediction.ballCount, prediction.status]);
     ECRenderShadowPrediction(&prediction);
 }
 
@@ -3632,6 +3652,7 @@ static void ECRequestOverlayRedraw(void) {
 - (void)closePanel {
     [self.panel removeFromSuperview];
     self.panel = nil;
+    gECMenuOpen = NO;
 }
 
 - (void)refreshPrediction {
@@ -3695,10 +3716,16 @@ static void ECRequestOverlayRedraw(void) {
 
 - (void)tapped {
     @try {
-        ECFindGameManager();
+        if (self.panel.superview) {
+            [self closePanel];
+            return;
+        }
+        gECMenuOpen = YES;
         UIWindow *host = self.hostWindow ?: [self guestWindow];
-        if (!host) return;
-        [self closePanel];
+        if (!host) {
+            gECMenuOpen = NO;
+            return;
+        }
         EmberMenuPanel *panel = [[EmberMenuPanel alloc]
             initWithTitle:@"8 BALL POOL  //  EMBER TOOLKIT"
             accentColor:[UIColor colorWithRed:0.95 green:0.42 blue:0.14 alpha:1.0]];
@@ -3711,7 +3738,7 @@ static void ECRequestOverlayRedraw(void) {
         self.panel = panel;
         [self renderMenu];
         [panel presentInWindow:host];
-        [host bringSubviewToFront:self.button];
+        if (self.button) [host bringSubviewToFront:self.button];
         [host bringSubviewToFront:panel];
     } @catch (NSException *exception) {
         ECLogLine([NSString stringWithFormat:@"menu-open %@", exception]);
@@ -3757,6 +3784,12 @@ static UIImage *ECEmberConnectIconImage(void) {
 }
 
 - (void)install {
+    if (gECMenuOpen || self.panel.superview) return;
+    if (self.button.superview) {
+        [self.button.superview bringSubviewToFront:self.button];
+        [self updateButton];
+        return;
+    }
     ECFindGameManager();
     UIWindow *host = [self guestWindow];
     if (!host) return;
@@ -3768,7 +3801,6 @@ static UIImage *ECEmberConnectIconImage(void) {
         self.button = (UIButton *)existing;
         self.hostWindow = host;
         [host bringSubviewToFront:existing];
-        ECStripUIKitOverlay();
         [self updateButton];
         return;
     }
@@ -3819,7 +3851,7 @@ static UIImage *ECEmberConnectIconImage(void) {
     [self install];
     [self.keepAliveTimer invalidate];
     __weak typeof(self) weakSelf = self;
-    self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+    self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
         [weakSelf install];
     }];
 }

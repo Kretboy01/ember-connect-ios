@@ -175,9 +175,10 @@ constexpr uintptr_t kBallPocketVirtualResolver = 0x100065178ULL;
 constexpr uintptr_t kBallPointVirtualResolver = 0x1000652A4ULL;
 
 constexpr double kLogicalFrameTime = 1.0 / 60.0;
-constexpr double kRestSpeed = 1.0e-7;
+constexpr double kRestSpeed = 0.35;
 constexpr double kEventEpsilon = 1.0e-9;
-constexpr uint16_t kMaximumFrames = 3600;
+constexpr uint16_t kMaximumFrames = 480;
+constexpr uint16_t kLiveMaximumFrames = 120;
 constexpr uint16_t kMaximumEvents = 512;
 constexpr uint16_t kMaximumZeroTimeEvents = 8;
 constexpr auto kWallTimeLimit = std::chrono::milliseconds(60);
@@ -993,10 +994,10 @@ static bool PredictShadow(NSObject *table, NSObject *cueBall, const void *visual
         const auto started = std::chrono::steady_clock::now();
         uint16_t zeroTimeEvents = 0;
         bool firstQueryCompleted = false;
-        for (uint16_t frame = 0; frame < kMaximumFrames; ++frame) {
+        const uint16_t frameLimit = applyAim ? kMaximumFrames : kLiveMaximumFrames;
+        for (uint16_t frame = 0; frame < frameLimit; ++frame) {
             if (std::chrono::steady_clock::now() - started > kWallTimeLimit) {
-                SetStatus(prediction->status, "shadow simulation wall-time limit reached");
-                return false;
+                break;
             }
             double remaining = kLogicalFrameTime;
             while (remaining > kEventEpsilon) {
@@ -1095,10 +1096,7 @@ static bool PredictShadow(NSObject *table, NSObject *cueBall, const void *visual
             }
             prediction->simulatedFrames = frame + 1;
             if (!moving) break;
-            if (frame + 1 == kMaximumFrames) {
-                SetStatus(prediction->status, "shadow simulation frame limit reached");
-                return false;
-            }
+            if (frame + 1 == frameLimit) break;
         }
 
         for (ShadowBall &ball : shadowBalls) {
