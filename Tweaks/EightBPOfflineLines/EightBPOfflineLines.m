@@ -46,6 +46,7 @@ static BOOL gECAutoplayShotPending = NO;
 static BOOL gECAutoplaySawShotStart = NO;
 static unsigned int gECAutoplayShotId = 0;
 static CFTimeInterval gECAutoplayActionAt = 0;
+static CFTimeInterval gECAutoplayLastStateLog = 0;
 static double gECLastFriction[7];
 static BOOL gECHasLastFriction = NO;
 
@@ -462,6 +463,7 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECAutoplaySawShotStart = NO;
     gECAutoplayShotId = 0;
     gECAutoplayActionAt = 0;
+    gECAutoplayLastStateLog = 0;
     gECHasLastFriction = NO;
     memset(&gECLastShadowPrediction, 0, sizeof(gECLastShadowPrediction));
     memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
@@ -485,6 +487,7 @@ static void ECStartHotSeatGame(id self, SEL selector) {
     gECAutoplaySawShotStart = NO;
     gECAutoplayShotId = 0;
     gECAutoplayActionAt = 0;
+    gECAutoplayLastStateLog = 0;
     dispatch_async(dispatch_get_main_queue(), ^{
         gECOverlayAllowed = YES;
         ECRefreshNativeGuide();
@@ -2455,6 +2458,20 @@ static void ECAutoplayTick(void) {
     BOOL moving = ECAutoplayBallsMoving(balls);
     unsigned int shotId = ECAutoplayCurrentShotId(manager);
     CFTimeInterval now = CACurrentMediaTime();
+    BOOL cueEnabled = ECInvokeBool(visualCue, @"enabled", NO);
+    BOOL aimEnabled = ECInvokeBool(visualCue, @"aimEnabled", NO);
+    BOOL cueHasTouches = ECInvokeBool(visualCue, @"hasTouches", NO);
+    BOOL powerControlEnabled = ECInvokeBool(visualCue, @"powerControlActive", NO);
+    BOOL loggedState = NO;
+    if (now - gECAutoplayLastStateLog >= 2.0) {
+        gECAutoplayLastStateLog = now;
+        loggedState = YES;
+        ECLogLine([NSString stringWithFormat:
+            @"autoplay state waiting=%d player=%d moving=%d cue=%d aim=%d touches=%d powerControl=%d balls=%lu pending=%d shot=%u",
+            waiting, playerTurn, moving, cueEnabled, aimEnabled, cueHasTouches,
+            powerControlEnabled, (unsigned long)balls.count,
+            gECAutoplayShotPending, shotId]);
+    }
 
     if (gECAutoplayShotPending) {
         if (moving || !waiting || shotId != gECAutoplayShotId) gECAutoplaySawShotStart = YES;
@@ -2473,15 +2490,18 @@ static void ECAutoplayTick(void) {
         }
     }
 
-    if (!waiting || !playerTurn || moving || !ECInvokeBool(visualCue, @"enabled", NO) ||
-        !ECInvokeBool(visualCue, @"aimEnabled", NO) ||
-        ECInvokeBool(visualCue, @"hasTouches", NO) ||
-        ECInvokeBool(visualCue, @"powerControlActive", NO)) return;
+    // `powerControlActive` means the power UI is available for the whole turn,
+    // not that a finger is currently dragging it. `waiting` is the game's own
+    // settled-table state, so residual spin bits must not veto the next shot.
+    if (!waiting || !playerTurn || !cueEnabled || !aimEnabled || cueHasTouches) return;
     id currentTouches = ECIvarObject(manager, "mCurrentTouches");
     if ([currentTouches respondsToSelector:@selector(count)] && [currentTouches count] != 0) return;
 
     ECAutoplayPlan plan = {0};
-    if (!ECAutoplayChoosePlan(manager, table, cueBall, &plan)) return;
+    if (!ECAutoplayChoosePlan(manager, table, cueBall, &plan)) {
+        if (loggedState) ECLogLine(@"autoplay no legal clear target");
+        return;
+    }
     double power = ECAutoplayPowerForPlan(table, plan);
     if (!ECAutoplaySetPointAndPower(visualCue, plan.aimPoint, power)) return;
     if (plan.targetNumber == 8 && plan.pocketIndex >= 0) {
@@ -2505,10 +2525,8 @@ static void ECAutoplayTick(void) {
                    dispatch_get_main_queue(), ^{
         if (!gECAutoplayEnabled || !gECAutoplayShotPending || gECMenuOpen) return;
         id liveManager = ECFindGameManager();
-        id liveTable = gECCachedTable ?: ECTableFromManager(liveManager);
-        NSArray *liveBalls = ECAutoplayBalls(liveTable);
         if (!liveManager || !ECInvokeBool(liveManager, @"isWaitingForPlayerShot", NO) ||
-            !ECInvokeBool(liveManager, @"isPlayerTurn", NO) || ECAutoplayBallsMoving(liveBalls) ||
+            !ECInvokeBool(liveManager, @"isPlayerTurn", NO) ||
             ECAutoplayCurrentShotId(liveManager) != gECAutoplayShotId) return;
         if (ECAutoplayReleaseShot(liveManager)) {
             gECAutoplayActionAt = CACurrentMediaTime();
