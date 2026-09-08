@@ -73,6 +73,7 @@ static void ECRefreshLivePrediction(void);
 static void ECSuppressAppleIDPrompts(void);
 static void ECAutoplayTick(void);
 static id ECTableFromManager(id manager);
+static void ECCloseMenuPanel(void);
 
 typedef struct { double x, y; } ECDPoint;
 typedef struct { double minX, minY, maxX, maxY; } ECDBox;
@@ -87,6 +88,7 @@ static ECDPoint ECNorm(ECDPoint point);
 static ECDBox ECDefaultTableBox(void);
 static void ECSyncAimContactCircle(void *guide, BOOL reachable, ECDPoint contact);
 static BOOL ECCuePredictedScratch(void);
+static id ECStruckBallFromGuide(void *guide);
 
 static inline ECDPoint ECMakePoint(double x, double y) { return (ECDPoint){x, y}; }
 
@@ -472,7 +474,10 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     memset(gECPotted, 0, sizeof(gECPotted));
     ECRemoveBallMarkers();
     ECStripUIKitOverlay();
-    dispatch_async(dispatch_get_main_queue(), ^{ ECWriteStatus(@"game-exited"); });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ECCloseMenuPanel();
+        ECWriteStatus(@"game-exited");
+    });
 }
 
 static void ECStartHotSeatGame(id self, SEL selector) {
@@ -2205,13 +2210,7 @@ typedef struct {
     double alignment;
     double score;
     BOOL directPot;
-    BOOL bankShot;
-    int cushionIndex;
-    double totalObjectDistance;
-    id secondBall;
-    int secondNumber;
-    double secondDistance;
-    BOOL lastResort;
+    BOOL breakShot;
     BOOL scratches;
 } ECAutoplayPlan;
 
@@ -2424,10 +2423,53 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
     // The live pocket centres use the same fixed world coordinate system and
     // the build's canonical playable bounds safely cover every valid ghost.
     ECDBox bounds = ECDefaultTableBox();
-    double ballDiameter = cueRadius * 2.0;
 
-    ECAutoplayPlan best = { .score = INFINITY, .pocketIndex = -1, .cushionIndex = -1 };
-    ECAutoplayPlan fallback = { .score = INFINITY, .pocketIndex = -1, .cushionIndex = -1 };
+    // Detect the intact triangle rather than assuming that "15 balls remain"
+    // means a rack. If nothing dropped on the previous break, the balls will
+    // still be scattered and must go through the normal planner.
+    int liveObjectCount = 0;
+    double rackMinX = INFINITY, rackMaxX = -INFINITY;
+    double rackMinY = INFINITY, rackMaxY = -INFINITY;
+    for (id ball in balls) {
+        if (!ECLooksLikeObject(ball) || ball == cueBall || ECBallIsPotted(ball)) continue;
+        ECDPoint position = ECBallLivePosition(ball);
+        if (!ECPointValid(position)) continue;
+        liveObjectCount++;
+        rackMinX = fmin(rackMinX, position.x);
+        rackMaxX = fmax(rackMaxX, position.x);
+        rackMinY = fmin(rackMinY, position.y);
+        rackMaxY = fmax(rackMaxY, position.y);
+    }
+    BOOL intactRack = liveObjectCount == 15 &&
+        rackMaxX - rackMinX < cueRadius * 13.0 &&
+        rackMaxY - rackMinY < cueRadius * 13.0;
+    if (intactRack) {
+        ECAutoplayPlan breakPlan = { .score = INFINITY, .pocketIndex = -1,
+                                      .breakShot = YES };
+        for (id ball in balls) {
+            if (!ECLooksLikeObject(ball) || ball == cueBall || ECBallIsPotted(ball)) continue;
+            ECDPoint position = ECBallLivePosition(ball);
+            double radius = ECBallLiveRadius(ball);
+            double distance = hypot(position.x - cuePosition.x, position.y - cuePosition.y);
+            if (!ECPointValid(position) || radius <= 0.0 || distance >= breakPlan.score) continue;
+            if (!ECAutoplayLaneClear(balls, cueBall, ball,
+                                     cuePosition, position, cueRadius)) continue;
+            breakPlan = (ECAutoplayPlan){
+                .targetBall = ball, .targetNumber = ECBallNumber(ball),
+                .pocketIndex = -1, .aimPoint = position,
+                .cueDistance = distance, .objectDistance = 0.0,
+                .alignment = 1.0, .score = distance,
+                .directPot = NO, .breakShot = YES, .scratches = NO,
+            };
+        }
+        if (breakPlan.targetBall) {
+            *planOut = breakPlan;
+            return YES;
+        }
+    }
+
+    ECAutoplayPlan best = { .score = INFINITY, .pocketIndex = -1 };
+    ECAutoplayPlan fallback = { .score = INFINITY, .pocketIndex = -1 };
     for (id ball in balls) {
         if (!ECLooksLikeObject(ball) || ball == cueBall || ECBallIsPotted(ball)) continue;
         int number = ECBallNumber(ball);
@@ -2436,44 +2478,22 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
         double ballRadius = ECBallLiveRadius(ball);
         if (!ECPointValid(ballPosition) || ballRadius <= 0.0) continue;
 
-        // Safety fallback: ghost-ball tap toward nearest pocket with decent
-        // power. Non-scratching fallbacks are preferred (lower score) but a
-        // scratching fallback is still accepted — it beats doing nothing.
-        int nearestPocket = -1;
-        double nearestPocketDist = INFINITY;
-        for (int p = 0; p < pocketCount; p++) {
-            double d = hypot(pockets[p].x - ballPosition.x, pockets[p].y - ballPosition.y);
-            if (d < nearestPocketDist) { nearestPocketDist = d; nearestPocket = p; }
-        }
-        if (nearestPocket >= 0) {
-            ECDPoint pocketDir = ECNorm(ECMakePoint(
-                pockets[nearestPocket].x - ballPosition.x,
-                pockets[nearestPocket].y - ballPosition.y));
-            ECDPoint ghost = ECMakePoint(
-                ballPosition.x - pocketDir.x * ballDiameter,
-                ballPosition.y - pocketDir.y * ballDiameter);
-            ECDPoint cueVec = ECMakePoint(ghost.x - cuePosition.x, ghost.y - cuePosition.y);
-            double cueDist = hypot(cueVec.x, cueVec.y);
-            if (cueDist > cueRadius &&
-                ECAutoplayLaneClear(balls, cueBall, ball, cuePosition, ghost, cueRadius)) {
-                BOOL fbScratches = ECAutoplayCueScratches(ghost, cueVec, ECMakePoint(
-                    pockets[nearestPocket].x - ballPosition.x,
-                    pockets[nearestPocket].y - ballPosition.y),
-                    pockets, pocketCount, pocketRadius, bounds, cueRadius);
-                double fbScore = cueDist + nearestPocketDist * 0.5;
-                if (fbScratches) fbScore += 500.0;
-                if (fbScore < fallback.score) {
-                    fallback = (ECAutoplayPlan){
-                        .targetBall = ball, .targetNumber = number,
-                        .pocketIndex = nearestPocket, .aimPoint = ghost,
-                        .cueDistance = cueDist, .objectDistance = nearestPocketDist,
-                        .alignment = 0.5, .score = fbScore, .directPot = NO,
-                        .bankShot = NO, .cushionIndex = -1,
-                        .totalObjectDistance = nearestPocketDist,
-                        .scratches = fbScratches,
-                    };
-                }
-            }
+        // If there is no trustworthy pot, hit the nearest legal ball squarely.
+        // The previous "safety" aimed a cut toward the nearest pocket without
+        // checking that object's route, which was the source of many wild shots.
+        double straightDistance = hypot(ballPosition.x - cuePosition.x,
+                                        ballPosition.y - cuePosition.y);
+        if (straightDistance > cueRadius + ballRadius &&
+            straightDistance < fallback.score &&
+            ECAutoplayLaneClear(balls, cueBall, ball,
+                                cuePosition, ballPosition, cueRadius)) {
+            fallback = (ECAutoplayPlan){
+                .targetBall = ball, .targetNumber = number, .pocketIndex = -1,
+                .aimPoint = ballPosition, .cueDistance = straightDistance,
+                .objectDistance = 0.0, .alignment = 1.0,
+                .score = straightDistance, .directPot = NO,
+                .breakShot = NO, .scratches = NO,
+            };
         }
 
         for (int pocketIndex = 0; pocketIndex < pocketCount; pocketIndex++) {
@@ -2497,7 +2517,10 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
             ECDPoint cueDirection = {cueVector.x / cueDistance, cueVector.y / cueDistance};
             double alignment = cueDirection.x * pocketDirection.x +
                                cueDirection.y * pocketDirection.y;
-            if (alignment < 0.28) continue;
+            // Very thin cuts are disproportionately sensitive to tiny physics
+            // and pocket-mouth differences. Leave those for a safety instead
+            // of confidently firing a low-quality miss.
+            if (alignment < 0.50) continue;
             if (!ECAutoplayLaneClear(balls, cueBall, ball, cuePosition, ghost, cueRadius)) continue;
             if (!ECAutoplayLaneClear(balls, ball, nil, ballPosition, pocket, ballRadius)) continue;
             // Scratch avoidance: penalise (not reject) so pots are still found.
@@ -2512,12 +2535,12 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
                     .pocketIndex = pocketIndex, .aimPoint = ghost,
                     .cueDistance = cueDistance, .objectDistance = objectDistance,
                     .alignment = alignment, .score = score, .directPot = YES,
-                    .bankShot = NO, .cushionIndex = -1,
-                    .totalObjectDistance = objectDistance, .scratches = scratches,
+                    .breakShot = NO, .scratches = scratches,
                 };
             }
         }
 
+#if 0
         // ── Bank shots: object ball off a cushion into a pocket ────────────
         for (int pocketIndex = 0; pocketIndex < pocketCount; pocketIndex++) {
             ECDPoint pocket = pockets[pocketIndex];
@@ -2639,12 +2662,11 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
                 }
             }
         }
+#endif
 
     }
-    // Prefer a real pot (direct / bank / combo). Fall back to a ghost-ball
-    // safety tap with decent power. Scratch penalty (+500) ensures
-    // non-scratching shots are chosen first, but a scratching shot is still
-    // taken with capped power rather than doing nothing.
+    // Only direct pots are currently trusted. Bank/combo candidates need to be
+    // validated against the native simulation before they can safely return.
     ECAutoplayPlan selected = best.targetBall ? best : fallback;
     if (!selected.targetBall) return NO;
     *planOut = selected;
@@ -2652,30 +2674,18 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
 }
 
 static double ECAutoplayPowerForPlan(id table, ECAutoplayPlan plan) {
-    // Safety fallback: decent power to actually move balls and break racks.
-    if (!plan.directPot && !plan.bankShot && !plan.secondBall) return 0.60;
+    if (plan.breakShot) return 0.98;
+    if (!plan.directPot) return 0.56;
     Ivar frictionIvar = class_getInstanceVariable([table class], "_frictionProperties");
-    if (!frictionIvar || !ECNativePhysicsSurfaceValid()) {
-        if (plan.bankShot) return 0.82;
-        if (plan.secondBall) return 0.78;
-        return 0.72;
-    }
+    if (!frictionIvar || !ECNativePhysicsSurfaceValid()) return 0.72;
     const uint8_t *tableBytes = (const uint8_t *)(__bridge const void *)table;
     const double *friction = (const double *)(tableBytes + ivar_getOffset(frictionIvar));
     double sliding = NAN, rolling = NAN;
-    if (!ECEffectiveFrictionFactors((double *)friction, &sliding, &rolling)) {
-        if (plan.bankShot) return 0.82;
-        if (plan.secondBall) return 0.78;
-        return 0.72;
-    }
+    if (!ECEffectiveFrictionFactors((double *)friction, &sliding, &rolling)) return 0.72;
     double unitStoppingDistance = ECPhysicsStoppingDistance(1.0, friction, sliding, rolling);
     double cueForce = *(double *)ECGameAddress(EC_GAME_FORCE_ADDRESS);
     if (!isfinite(unitStoppingDistance) || unitStoppingDistance <= 1e-8 ||
-        !isfinite(cueForce) || cueForce <= 0.0) {
-        if (plan.bankShot) return 0.82;
-        if (plan.secondBall) return 0.78;
-        return 0.72;
-    }
+        !isfinite(cueForce) || cueForce <= 0.0) return 0.72;
 
     // Equal-mass collision transfer is the cue speed projected onto the line
     // between the two ball centres. Since stopping distance is quadratic in
@@ -2683,20 +2693,11 @@ static double ECAutoplayPowerForPlan(id table, ECAutoplayPlan plan) {
     // travel by alignment squared, then add the cue's pre-contact travel.
     double transfer = fmax(0.25, plan.alignment * 0.92);
     double requiredStoppingDistance = plan.cueDistance +
-        (plan.totalObjectDistance + 8.0) / (transfer * transfer);
-    // Bank and combo shots lose energy at the extra cushion contact / ball
-    // transfer, so add a margin to keep the object ball moving to the pocket.
-    if (plan.bankShot) requiredStoppingDistance *= 1.18;
-    if (plan.secondBall) requiredStoppingDistance *= 1.25;
+        (plan.objectDistance + 10.0) / (transfer * transfer);
     double speed = sqrt(requiredStoppingDistance / unitStoppingDistance);
     double speedRatio = fmin(1.0, fmax(0.0, speed / cueForce));
     double power = 1.0 - (1.0 - speedRatio) * (1.0 - speedRatio);
-    double maxPower = plan.bankShot ? 0.92 : (plan.secondBall ? 0.90 : 0.94);
-    // If the shot scratches, cap power so the cue ball doesn't fly into the
-    // pocket after contact. 0.55 is enough to pot most balls but keeps the
-    // cue ball's post-contact travel short.
-    if (plan.scratches) maxPower = fmin(maxPower, 0.55);
-    return fmin(maxPower, fmax(0.40, power));
+    return fmin(0.94, fmax(0.34, power));
 }
 
 static BOOL ECAutoplaySetPointAndPower(id cue, ECDPoint point, double power) {
@@ -2812,11 +2813,12 @@ static void ECAutoplayTick(void) {
     gECAutoplayShotId = shotId;
     gECAutoplayActionAt = now;
     ECLogLine([NSString stringWithFormat:
-        @"autoplay aim ball=%d pocket=%d direct=%d bank=%d combo=%d cushion=%d scratch=%d power=%.4f cue=%.2f object=%.2f total=%.2f align=%.3f",
-        plan.targetNumber, plan.pocketIndex, plan.directPot, plan.bankShot,
-        plan.secondBall != nil, plan.cushionIndex, plan.scratches, power,
-        plan.cueDistance, plan.objectDistance, plan.totalObjectDistance, plan.alignment]);
+        @"autoplay aim ball=%d pocket=%d direct=%d break=%d scratch=%d power=%.4f cue=%.2f object=%.2f align=%.3f",
+        plan.targetNumber, plan.pocketIndex, plan.directPot, plan.breakShot,
+        plan.scratches, power, plan.cueDistance, plan.objectDistance, plan.alignment]);
 
+    id expectedBall = plan.targetBall;
+    int expectedNumber = plan.targetNumber;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!gECAutoplayEnabled || !gECAutoplayShotPending || gECMenuOpen) return;
@@ -2824,6 +2826,16 @@ static void ECAutoplayTick(void) {
         if (!liveManager || !ECInvokeBool(liveManager, @"isWaitingForPlayerShot", NO) ||
             !ECInvokeBool(liveManager, @"isPlayerTurn", NO) ||
             ECAutoplayCurrentShotId(liveManager) != gECAutoplayShotId) return;
+        id liveCue = gECActiveVisualCue ?: ECIvarObject(liveManager, "mVisualCue");
+        void *liveGuide = ECRawPointerIvar(liveCue, "mVisualGuide");
+        id actualBall = ECStruckBallFromGuide(liveGuide);
+        if (actualBall && actualBall != expectedBall) {
+            gECAutoplayShotPending = NO;
+            ECLogLine([NSString stringWithFormat:
+                @"autoplay cancelled: native guide hits ball=%d instead of ball=%d",
+                ECBallNumber(actualBall), expectedNumber]);
+            return;
+        }
         if (ECAutoplayReleaseShot(liveManager)) {
             gECAutoplayActionAt = CACurrentMediaTime();
             ECLogLine(@"autoplay released through native shot controller");
@@ -4277,6 +4289,7 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 @property (nonatomic, strong) NSTimer *autoplayTimer;
 + (instancetype)sharedController;
 - (UIWindow *)guestWindow;
+- (void)closePanel;
 @end
 
 static void ECRequestOverlayRedraw(void) {
@@ -4363,6 +4376,13 @@ static void ECRequestOverlayRedraw(void) {
     ECUpdatePhysicsGuideForCue(cue);
 }
 
+- (void)scheduleRenderMenu {
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (weakSelf.panel.superview) [weakSelf renderMenu];
+    });
+}
+
 - (void)renderMenu {
     EmberMenuPanel *panel = self.panel;
     if (!panel) return;
@@ -4379,7 +4399,7 @@ static void ECRequestOverlayRedraw(void) {
         BOOL enabled = gECMultiplier <= 1;
         [weakSelf saveMultiplier:enabled ? 8 : 1];
         if (!enabled) ECClearPredictionVisuals();
-        [weakSelf renderMenu];
+        [weakSelf scheduleRenderMenu];
     }];
     [panel addAction:gECShowRebounds ? @"CUSHION REBOUNDS  ·  ON" : @"CUSHION REBOUNDS  ·  OFF"
               detail:@"Continue predicted paths after cushion contacts"
@@ -4388,7 +4408,7 @@ static void ECRequestOverlayRedraw(void) {
         [NSUserDefaults.standardUserDefaults setBool:gECShowRebounds forKey:ECReboundsKey];
         if (!gECShowRebounds && !gECShowLandingRings) ECClearPredictionVisuals();
         [weakSelf refreshPrediction];
-        [weakSelf renderMenu];
+        [weakSelf scheduleRenderMenu];
     }];
     [panel addAction:gECShowLandingRings ? @"LANDING RINGS  ·  ON" : @"LANDING RINGS  ·  OFF"
               detail:@"Show each moving ball's predicted resting position"
@@ -4397,7 +4417,7 @@ static void ECRequestOverlayRedraw(void) {
         [NSUserDefaults.standardUserDefaults setBool:gECShowLandingRings forKey:ECLandingRingsKey];
         if (!gECShowLandingRings && !gECShowRebounds) ECClearPredictionVisuals();
         [weakSelf refreshPrediction];
-        [weakSelf renderMenu];
+        [weakSelf scheduleRenderMenu];
     }];
     [panel addAction:gECShowTableOverlay ? @"TABLE OVERLAY  ·  ON" : @"TABLE OVERLAY  ·  OFF"
               detail:@"Trace the inner cushions and pockets on the live table"
@@ -4406,7 +4426,7 @@ static void ECRequestOverlayRedraw(void) {
         [NSUserDefaults.standardUserDefaults setBool:gECShowTableOverlay forKey:ECTableOverlayKey];
         if (!gECShowTableOverlay) ECClearTableOverlay();
         else ECSyncTableOverlay();
-        [weakSelf renderMenu];
+        [weakSelf scheduleRenderMenu];
     }];
 
     [panel addSection:@"AUTO PLAY"];
@@ -4419,7 +4439,7 @@ static void ECRequestOverlayRedraw(void) {
         gECAutoplaySawShotStart = NO;
         gECAutoplayActionAt = 0;
         ECLogLine(gECAutoplayEnabled ? @"autoplay enabled" : @"autoplay disabled");
-        [weakSelf renderMenu];
+        [weakSelf scheduleRenderMenu];
     }];
 
     [panel addSection:@"RINGS FOLLOW EACH BALL'S COLOUR"];
@@ -4429,6 +4449,11 @@ static void ECRequestOverlayRedraw(void) {
 }
 
 - (void)tapped {
+    if (!NSThread.isMainThread) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf tapped]; });
+        return;
+    }
     @try {
         if (self.panel.superview) {
             [self closePanel];
@@ -4447,7 +4472,7 @@ static void ECRequestOverlayRedraw(void) {
         panel.onClose = ^{ [weakSelf closePanel]; };
         [panel setTabs:@[@"Prediction"] activeTab:0 handler:^(NSInteger index) {
             (void)index;
-            [weakSelf renderMenu];
+            [weakSelf scheduleRenderMenu];
         }];
         self.panel = panel;
         [self renderMenu];
@@ -4499,6 +4524,19 @@ static UIImage *ECEmberConnectIconImage(void) {
 }
 
 - (void)install {
+    if (!NSThread.isMainThread) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf install]; });
+        return;
+    }
+    UIWindow *host = [self guestWindow];
+    if (!host) return;
+    if (self.panel.superview && self.panel.window != host) [self closePanel];
+    if (self.button.superview && self.button.window != host) {
+        [self.button removeFromSuperview];
+        self.button = nil;
+        self.hostWindow = nil;
+    }
     if (gECMenuOpen || self.panel.superview) return;
     if (self.button.superview) {
         [self.button.superview bringSubviewToFront:self.button];
@@ -4506,8 +4544,6 @@ static UIImage *ECEmberConnectIconImage(void) {
         return;
     }
     ECFindGameManager();
-    UIWindow *host = [self guestWindow];
-    if (!host) return;
     UIView *legacy = [host viewWithTag:EC_LINES_BUTTON_LEGACY_TAG];
     if (legacy) [legacy removeFromSuperview];
     UIView *existing = [host viewWithTag:EC_LINES_BUTTON_TAG];
@@ -4588,6 +4624,12 @@ static UIImage *ECEmberConnectIconImage(void) {
 
 @end
 
+static void ECCloseMenuPanel(void) {
+    EmberEightBPOfflineLinesController *controller =
+        [EmberEightBPOfflineLinesController sharedController];
+    [controller closePanel];
+}
+
 static void ECScheduleOverlay(void) {
     gECOverlayAllowed = YES;
     ECStripUIKitOverlay();
@@ -4630,6 +4672,11 @@ static void EmberEightBPOfflineLinesInit(void) {
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
             object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
                 EmberEightBPOfflineLinesBoot();
+            }];
+        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification
+            object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+                (void)note;
+                ECCloseMenuPanel();
             }];
         for (NSNumber *delay in @[@0.8, @2.0, @5.0]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
