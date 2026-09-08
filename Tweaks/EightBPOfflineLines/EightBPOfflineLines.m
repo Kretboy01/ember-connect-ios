@@ -54,6 +54,8 @@ static CFTimeInterval gECAutoplayBallPlacementAt = 0;
 static BOOL gECAutoplayBallPlacementFinalized = NO;
 static uint8_t gECAutoplayRejectedPockets[16];
 static unsigned int gECAutoplayRejectionShotId = UINT_MAX;
+static CFTimeInterval gECAutoplayReadySince = 0;
+static unsigned int gECAutoplayBreakVariant = 0;
 static double gECLastFriction[7];
 static BOOL gECHasLastFriction = NO;
 
@@ -479,6 +481,8 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECAutoplayBallPlacementFinalized = NO;
     memset(gECAutoplayRejectedPockets, 0, sizeof(gECAutoplayRejectedPockets));
     gECAutoplayRejectionShotId = UINT_MAX;
+    gECAutoplayReadySince = 0;
+    gECAutoplayBreakVariant = 0;
     gECHasLastFriction = NO;
     memset(&gECLastShadowPrediction, 0, sizeof(gECLastShadowPrediction));
     memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
@@ -512,6 +516,8 @@ static void ECStartHotSeatGame(id self, SEL selector) {
     gECAutoplayBallPlacementFinalized = NO;
     memset(gECAutoplayRejectedPockets, 0, sizeof(gECAutoplayRejectedPockets));
     gECAutoplayRejectionShotId = UINT_MAX;
+    gECAutoplayReadySince = 0;
+    gECAutoplayBreakVariant = 0;
     dispatch_async(dispatch_get_main_queue(), ^{
         gECOverlayAllowed = YES;
         ECRefreshNativeGuide();
@@ -2480,9 +2486,24 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
             if (!ECPointValid(position) || radius <= 0.0 || distance >= breakPlan.score) continue;
             if (!ECAutoplayLaneClear(balls, cueBall, ball,
                                      cuePosition, position, cueRadius)) continue;
+            ECDPoint breakDirection = ECNorm((ECDPoint){
+                position.x - cuePosition.x, position.y - cuePosition.y
+            });
+            ECDPoint perpendicular = {-breakDirection.y, breakDirection.x};
+            static const double offsets[] = {
+                0.0, 0.20, -0.20, 0.40, -0.40, 0.60, -0.60,
+                0.80, -0.80, 1.00, -1.00, 1.20, -1.20,
+                1.40, -1.40, 1.60, -1.60, 1.80, -1.80,
+            };
+            NSUInteger variant = gECAutoplayBreakVariant %
+                (sizeof(offsets) / sizeof(offsets[0]));
+            ECDPoint breakAim = {
+                position.x + perpendicular.x * radius * offsets[variant],
+                position.y + perpendicular.y * radius * offsets[variant],
+            };
             breakPlan = (ECAutoplayPlan){
                 .targetBall = ball, .targetNumber = ECBallNumber(ball),
-                .pocketIndex = -1, .aimPoint = position,
+                .pocketIndex = -1, .aimPoint = breakAim,
                 .cueDistance = distance, .objectDistance = 0.0,
                 .alignment = 1.0, .score = distance,
                 .directPot = NO, .breakShot = YES, .scratches = NO,
@@ -2540,12 +2561,21 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
             BOOL scratches = ECAutoplayCueScratches(ghost, cueVector, pocketVector, pockets,
                                        pocketCount, pocketRadius, bounds, cueRadius);
             if (scratches) continue;
+            // pointToTablePosition: treats its point as the finite end of the
+            // native guide query. The mathematical ghost is exactly where the
+            // cue-ball centre first touches the object ball; stopping there
+            // left the native query one epsilon short and reported no hit.
+            // Extend through that contact without changing the aim direction.
+            ECDPoint nativeAimPoint = {
+                ghost.x + cueDirection.x * cueRadius * 6.0,
+                ghost.y + cueDirection.y * cueRadius * 6.0,
+            };
             double cutPenalty = (1.0 - alignment) * 210.0;
             double score = cueDistance + objectDistance * 0.72 + cutPenalty - pocketRadius * 0.1;
             if (score < best.score) {
                 best = (ECAutoplayPlan){
                     .targetBall = ball, .targetNumber = number,
-                    .pocketIndex = pocketIndex, .aimPoint = ghost,
+                    .pocketIndex = pocketIndex, .aimPoint = nativeAimPoint,
                     .cueDistance = cueDistance, .objectDistance = objectDistance,
                     .alignment = alignment, .score = score, .directPot = YES,
                     .breakShot = NO, .scratches = scratches,
@@ -2724,7 +2754,7 @@ static BOOL ECAutoplaySetPower(id cue, double power) {
     return YES;
 }
 
-static BOOL ECAutoplaySetPointAndPower(id cue, ECDPoint point, double power) {
+static BOOL ECAutoplaySetAimPoint(id cue, ECDPoint point) {
     if (!cue || !ECPointValid(point)) return NO;
     SEL pointSelector = NSSelectorFromString(@"pointToTablePosition:");
     Method pointMethod = class_getInstanceMethod([cue class], pointSelector);
@@ -2733,7 +2763,7 @@ static BOOL ECAutoplaySetPointAndPower(id cue, ECDPoint point, double power) {
     // VisualCue::pointToTablePosition 0x1001d1fa8).
     ((void (*)(id, SEL, const ECDPoint *))method_getImplementation(pointMethod))(
         cue, pointSelector, &point);
-    return ECAutoplaySetPower(cue, power);
+    return YES;
 }
 
 static BOOL ECAutoplayReleaseShot(id manager) {
@@ -2843,10 +2873,13 @@ static BOOL ECAutoplayShadowAcceptsPower(id table, id cueBall, id targetBall,
         return NO;
     }
     if (breakShot) {
-        // Standard 8-ball break: either an object drops or four object balls
-        // reach motion. This rejects weak/non-contact breaks as well as scratches.
-        if (pottedObjects == 0 && movedObjects < 4) {
-            if (reasonOut) *reasonOut = @"break does not move four balls";
+        // Autoplay is stricter than the bare legal-break rule: do not spend a
+        // turn on a spread-only break. Aim variants are tried until the native
+        // simulation shows an object ball actually dropping.
+        if (pottedObjects == 0) {
+            if (reasonOut) *reasonOut = movedObjects < 4
+                ? @"break does not move four balls"
+                : @"break spreads the rack but pots no ball";
             return NO;
         }
     } else if (!targetPrediction || !targetPrediction->potted) {
@@ -2999,7 +3032,7 @@ static BOOL ECAutoplayPlaceCueBall(id manager, id control, NSArray *balls,
             ((void (*)(id, SEL))objc_msgSend)(liveControl,
                 NSSelectorFromString(@"finishAnimation"));
         }
-        if (ECInvokeBool(liveManager, @"visualCueBallControlInputIsActive", NO)) {
+        if (ECAutoplayCueBallControlActive(liveManager, liveControl)) {
             SEL deactivate = NSSelectorFromString(@"deactivateCueBallControl");
             if ([liveManager respondsToSelector:deactivate]) {
                 ((void (*)(id, SEL))objc_msgSend)(liveManager, deactivate);
@@ -3053,6 +3086,7 @@ static void ECAutoplayTick(void) {
     }
 
     if (ballInHand) {
+        gECAutoplayReadySince = 0;
         if (controlledTurn) {
             id currentTouches = ECIvarObject(manager, "mCurrentTouches");
             if (![currentTouches respondsToSelector:@selector(count)] ||
@@ -3061,7 +3095,7 @@ static void ECAutoplayTick(void) {
                     ECAutoplayPlaceCueBall(manager, ballControl, balls, cueBall, now);
                 } else if (gECAutoplayBallPlacementFinalized &&
                            now - gECAutoplayBallPlacementAt > 0.9 &&
-                           ECInvokeBool(manager, @"visualCueBallControlInputIsActive", NO)) {
+                           ECAutoplayCueBallControlActive(manager, ballControl)) {
                     SEL deactivate = NSSelectorFromString(@"deactivateCueBallControl");
                     if ([manager respondsToSelector:deactivate]) {
                         ((void (*)(id, SEL))objc_msgSend)(manager, deactivate);
@@ -3084,33 +3118,45 @@ static void ECAutoplayTick(void) {
     }
 
     if (gECAutoplayShotPending) {
-        // Residual isMovingOrSpinning stays true after the break, so it
-        // cannot mark "this shot started" or "table settled". Only the
-        // game leaving / returning to waitingForPlayerShot does.
         if (!waiting || shotId != gECAutoplayShotId) gECAutoplaySawShotStart = YES;
         if (gECAutoplaySawShotStart) {
-            if (controlledTurn && cueEnabled && aimEnabled &&
+            if (controlledTurn && waiting && !moving && cueEnabled && aimEnabled &&
                 now - gECAutoplayActionAt > 0.8) {
                 gECAutoplayShotPending = NO;
                 gECAutoplaySawShotStart = NO;
+                gECAutoplayReadySince = 0;
             } else {
                 return;
             }
         } else if (now - gECAutoplayActionAt > 3.0) {
             ECLogLine(@"autoplay shot did not start; retrying");
+            ECAutoplaySetPower(visualCue, 0.0);
             gECAutoplayShotPending = NO;
+            gECAutoplayReadySince = 0;
+            gECAutoplayRetryAfter = now + 0.6;
         } else {
             return;
         }
     }
 
-    // `powerControlActive` means the power UI is available for the whole turn,
-    // not that a finger is currently dragging it. `waiting` is the game's own
-    // settled-table state, so residual spin bits must not veto the next shot.
-    if (!controlledTurn || !cueEnabled || !aimEnabled || !powerControlEnabled || cueHasTouches ||
-        now < gECAutoplayRetryAfter) return;
+    // Fail closed until both the game state and the physical table have been
+    // continuously ready. This prevents a stale cue/power state from being
+    // carried across a turn transition or the tail of a previous shot.
+    if (!controlledTurn || !waiting || moving || !cueEnabled || !aimEnabled ||
+        !powerControlEnabled || cueHasTouches || now < gECAutoplayRetryAfter) {
+        gECAutoplayReadySince = 0;
+        return;
+    }
     id currentTouches = ECIvarObject(manager, "mCurrentTouches");
-    if ([currentTouches respondsToSelector:@selector(count)] && [currentTouches count] != 0) return;
+    if ([currentTouches respondsToSelector:@selector(count)] && [currentTouches count] != 0) {
+        gECAutoplayReadySince = 0;
+        return;
+    }
+    if (gECAutoplayReadySince <= 0) {
+        gECAutoplayReadySince = now;
+        return;
+    }
+    if (now - gECAutoplayReadySince < 0.55) return;
 
     ECAutoplayPlan plan = {0};
     if (!ECAutoplayChoosePlan(manager, table, cueBall, &plan)) {
@@ -3124,7 +3170,14 @@ static void ECAutoplayTick(void) {
     if ([englishControl respondsToSelector:centerEnglish]) {
         ((void (*)(id, SEL))objc_msgSend)(englishControl, centerEnglish);
     }
-    if (!ECAutoplaySetPointAndPower(visualCue, plan.aimPoint, power)) return;
+    // Aim with an explicitly unloaded cue. Power is applied only after the
+    // native guide and shadow simulation have both accepted this exact shot.
+    if (!ECAutoplaySetPower(visualCue, 0.0) ||
+        !ECAutoplaySetAimPoint(visualCue, plan.aimPoint)) {
+        gECAutoplayReadySince = 0;
+        gECAutoplayRetryAfter = now + 0.6;
+        return;
+    }
     if (plan.targetNumber == 8 && plan.pocketIndex >= 0) {
         SEL nominate = NSSelectorFromString(@"nominatePocket:");
         if ([manager respondsToSelector:nominate]) {
@@ -3137,8 +3190,9 @@ static void ECAutoplayTick(void) {
     gECAutoplaySawShotStart = NO;
     gECAutoplayShotId = shotId;
     gECAutoplayActionAt = now;
+    gECAutoplayReadySince = 0;
     ECLogLine([NSString stringWithFormat:
-        @"autoplay aim ball=%d pocket=%d direct=%d break=%d scratch=%d power=%.4f cue=%.2f object=%.2f align=%.3f",
+        @"autoplay aim ball=%d pocket=%d direct=%d break=%d scratch=%d requestedPower=%.4f cue=%.2f object=%.2f align=%.3f",
         plan.targetNumber, plan.pocketIndex, plan.directPot, plan.breakShot,
         plan.scratches, power, plan.cueDistance, plan.objectDistance, plan.alignment]);
 
@@ -3146,24 +3200,48 @@ static void ECAutoplayTick(void) {
     int expectedNumber = plan.targetNumber;
     int expectedPocket = plan.pocketIndex;
     BOOL expectedBreak = plan.breakShot;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.22 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (!gECAutoplayEnabled || !gECAutoplayShotPending || gECMenuOpen) return;
+        if (!gECAutoplayEnabled || !gECAutoplayShotPending || gECMenuOpen) {
+            gECAutoplayShotPending = NO;
+            return;
+        }
         id liveManager = ECFindGameManager();
-        if (!liveManager || !ECAutoplayControlsCurrentTurn(liveManager) ||
-            ECAutoplayCurrentShotId(liveManager) != gECAutoplayShotId) return;
         id liveCue = gECActiveVisualCue ?: ECIvarObject(liveManager, "mVisualCue");
+        id liveTable = gECCachedTable ?: ECTableFromManager(liveManager);
+        NSArray *liveBalls = ECAutoplayBalls(liveTable);
+        id liveTouches = ECIvarObject(liveManager, "mCurrentTouches");
+        BOOL noLiveTouches = ![liveTouches respondsToSelector:@selector(count)] ||
+            [liveTouches count] == 0;
+        BOOL stillReady = liveManager && ECAutoplayControlsCurrentTurn(liveManager) &&
+            ECInvokeBool(liveManager, @"isWaitingForPlayerShot", NO) &&
+            !ECAutoplayBallsMoving(liveBalls) &&
+            ECInvokeBool(liveCue, @"enabled", NO) &&
+            ECInvokeBool(liveCue, @"aimEnabled", NO) &&
+            !ECInvokeBool(liveCue, @"hasTouches", NO) &&
+            noLiveTouches &&
+            ECAutoplayCurrentShotId(liveManager) == gECAutoplayShotId;
+        if (!stillReady) {
+            ECAutoplaySetPower(liveCue, 0.0);
+            gECAutoplayShotPending = NO;
+            gECAutoplayReadySince = 0;
+            gECAutoplayRetryAfter = CACurrentMediaTime() + 0.6;
+            ECLogLine(@"autoplay cancelled: table or cue state changed before validation");
+            return;
+        }
         void *liveGuide = ECRawPointerIvar(liveCue, "mVisualGuide");
         id actualBall = ECStruckBallFromGuide(liveGuide);
         if (!actualBall || actualBall != expectedBall) {
+            ECAutoplaySetPower(liveCue, 0.0);
             gECAutoplayShotPending = NO;
+            gECAutoplayReadySince = 0;
             gECAutoplayRetryAfter = CACurrentMediaTime() + 0.85;
+            if (expectedBreak) gECAutoplayBreakVariant++;
             ECLogLine([NSString stringWithFormat:
                 @"autoplay cancelled: native guide hits ball=%d instead of ball=%d",
                 actualBall ? ECBallNumber(actualBall) : -1, expectedNumber]);
             return;
         }
-        id liveTable = gECCachedTable ?: ECTableFromManager(liveManager);
         id liveCueBall = gECCachedCueBall;
         if (!liveCueBall && [liveTable respondsToSelector:@selector(getCueBall)]) {
             liveCueBall = ((id (*)(id, SEL))objc_msgSend)(liveTable, @selector(getCueBall));
@@ -3174,9 +3252,13 @@ static void ECAutoplayTick(void) {
                                            liveGuide, power, expectedPocket,
                                            expectedBreak,
                                            &validatedPower, &validationReason)) {
+            ECAutoplaySetPower(liveCue, 0.0);
             gECAutoplayShotPending = NO;
+            gECAutoplayReadySince = 0;
             gECAutoplayRetryAfter = CACurrentMediaTime() + 0.35;
-            if (!expectedBreak && expectedNumber > 0 && expectedNumber < 16 &&
+            if (expectedBreak) {
+                gECAutoplayBreakVariant++;
+            } else if (expectedNumber > 0 && expectedNumber < 16 &&
                 expectedPocket >= 0 && expectedPocket < 8) {
                 gECAutoplayRejectedPockets[expectedNumber] |=
                     (uint8_t)(1u << expectedPocket);
@@ -3189,6 +3271,9 @@ static void ECAutoplayTick(void) {
         }
         if (!ECAutoplaySetPower(liveCue, validatedPower)) {
             gECAutoplayShotPending = NO;
+            gECAutoplayReadySince = 0;
+            gECAutoplayRetryAfter = CACurrentMediaTime() + 0.6;
+            ECLogLine(@"autoplay cancelled: could not apply validated power");
             return;
         }
         ECLogLine([NSString stringWithFormat:
@@ -3197,6 +3282,12 @@ static void ECAutoplayTick(void) {
         if (ECAutoplayReleaseShot(liveManager)) {
             gECAutoplayActionAt = CACurrentMediaTime();
             ECLogLine(@"autoplay released through native shot controller");
+        } else {
+            ECAutoplaySetPower(liveCue, 0.0);
+            gECAutoplayShotPending = NO;
+            gECAutoplayReadySince = 0;
+            gECAutoplayRetryAfter = CACurrentMediaTime() + 0.8;
+            ECLogLine(@"autoplay cancelled: native shot release failed");
         }
     });
 }
@@ -4823,6 +4914,8 @@ static void ECRequestOverlayRedraw(void) {
         gECAutoplayBallPlacementFinalized = NO;
         memset(gECAutoplayRejectedPockets, 0, sizeof(gECAutoplayRejectedPockets));
         gECAutoplayRejectionShotId = UINT_MAX;
+        gECAutoplayReadySince = 0;
+        gECAutoplayBreakVariant = 0;
         ECLogLine(gECAutoplayEnabled ? @"autoplay enabled" : @"autoplay disabled");
         [weakSelf scheduleRenderMenu];
     }];
