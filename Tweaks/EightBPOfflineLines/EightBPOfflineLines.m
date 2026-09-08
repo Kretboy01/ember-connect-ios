@@ -46,7 +46,9 @@ static BOOL gECAutoplayShotPending = NO;
 static BOOL gECAutoplaySawShotStart = NO;
 static unsigned int gECAutoplayShotId = 0;
 static CFTimeInterval gECAutoplayActionAt = 0;
+static CFTimeInterval gECAutoplayRetryAfter = 0;
 static CFTimeInterval gECAutoplayLastStateLog = 0;
+static BOOL gECAutoplayBallPlacementPending = NO;
 static double gECLastFriction[7];
 static BOOL gECHasLastFriction = NO;
 
@@ -465,7 +467,9 @@ static void ECGameManagerOnExit(id self, SEL selector) {
     gECAutoplaySawShotStart = NO;
     gECAutoplayShotId = 0;
     gECAutoplayActionAt = 0;
+    gECAutoplayRetryAfter = 0;
     gECAutoplayLastStateLog = 0;
+    gECAutoplayBallPlacementPending = NO;
     gECHasLastFriction = NO;
     memset(&gECLastShadowPrediction, 0, sizeof(gECLastShadowPrediction));
     memset(gECShadowMaxPathError, 0, sizeof(gECShadowMaxPathError));
@@ -492,7 +496,9 @@ static void ECStartHotSeatGame(id self, SEL selector) {
     gECAutoplaySawShotStart = NO;
     gECAutoplayShotId = 0;
     gECAutoplayActionAt = 0;
+    gECAutoplayRetryAfter = 0;
     gECAutoplayLastStateLog = 0;
+    gECAutoplayBallPlacementPending = NO;
     dispatch_async(dispatch_get_main_queue(), ^{
         gECOverlayAllowed = YES;
         ECRefreshNativeGuide();
@@ -2469,7 +2475,6 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
     }
 
     ECAutoplayPlan best = { .score = INFINITY, .pocketIndex = -1 };
-    ECAutoplayPlan fallback = { .score = INFINITY, .pocketIndex = -1 };
     for (id ball in balls) {
         if (!ECLooksLikeObject(ball) || ball == cueBall || ECBallIsPotted(ball)) continue;
         int number = ECBallNumber(ball);
@@ -2477,24 +2482,6 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
         ECDPoint ballPosition = ECBallLivePosition(ball);
         double ballRadius = ECBallLiveRadius(ball);
         if (!ECPointValid(ballPosition) || ballRadius <= 0.0) continue;
-
-        // If there is no trustworthy pot, hit the nearest legal ball squarely.
-        // The previous "safety" aimed a cut toward the nearest pocket without
-        // checking that object's route, which was the source of many wild shots.
-        double straightDistance = hypot(ballPosition.x - cuePosition.x,
-                                        ballPosition.y - cuePosition.y);
-        if (straightDistance > cueRadius + ballRadius &&
-            straightDistance < fallback.score &&
-            ECAutoplayLaneClear(balls, cueBall, ball,
-                                cuePosition, ballPosition, cueRadius)) {
-            fallback = (ECAutoplayPlan){
-                .targetBall = ball, .targetNumber = number, .pocketIndex = -1,
-                .aimPoint = ballPosition, .cueDistance = straightDistance,
-                .objectDistance = 0.0, .alignment = 1.0,
-                .score = straightDistance, .directPot = NO,
-                .breakShot = NO, .scratches = NO,
-            };
-        }
 
         for (int pocketIndex = 0; pocketIndex < pocketCount; pocketIndex++) {
             ECDPoint pocket = pockets[pocketIndex];
@@ -2667,9 +2654,8 @@ static BOOL ECAutoplayChoosePlan(id manager, id table, id cueBall, ECAutoplayPla
     }
     // Only direct pots are currently trusted. Bank/combo candidates need to be
     // validated against the native simulation before they can safely return.
-    ECAutoplayPlan selected = best.targetBall ? best : fallback;
-    if (!selected.targetBall) return NO;
-    *planOut = selected;
+    if (!best.targetBall) return NO;
+    *planOut = best;
     return YES;
 }
 
@@ -2733,6 +2719,93 @@ static BOOL ECAutoplayReleaseShot(id manager) {
     return YES;
 }
 
+static BOOL ECAutoplayCueBallControlActive(id manager, id control) {
+    if (!manager || !control) return NO;
+    if (ECInvokeBool(manager, @"visualCueBallControlInputIsActive", NO)) return YES;
+    if (ECInvokeBool(control, @"inputActive", NO)) return YES;
+    return ECInvokeBool(control, @"enabled", NO) &&
+           ECInvokeBool(control, @"isShowingHand", NO);
+}
+
+static BOOL ECAutoplayCuePlacementIsClear(NSArray *balls, id cueBall,
+                                          ECDPoint point, double cueRadius) {
+    ECDBox bounds = ECDefaultTableBox();
+    double inset = cueRadius * 1.25;
+    if (!ECPointValid(point) || point.x <= bounds.minX + inset ||
+        point.x >= bounds.maxX - inset || point.y <= bounds.minY + inset ||
+        point.y >= bounds.maxY - inset) return NO;
+    for (id ball in balls) {
+        if (!ECLooksLikeObject(ball) || ball == cueBall || ECBallIsPotted(ball)) continue;
+        ECDPoint other = ECBallLivePosition(ball);
+        double radius = ECBallLiveRadius(ball);
+        if (!ECPointValid(other) || radius <= 0.0) continue;
+        if (hypot(point.x - other.x, point.y - other.y) <
+            cueRadius + radius + 0.75) return NO;
+    }
+    return YES;
+}
+
+static BOOL ECAutoplayChooseCuePlacement(NSArray *balls, id cueBall,
+                                         ECDPoint *pointOut) {
+    if (!pointOut) return NO;
+    double cueRadius = ECBallLiveRadius(cueBall);
+    if (!isfinite(cueRadius) || cueRadius < 1.0 || cueRadius > 10.0) cueRadius = 3.6;
+    // Prefer the kitchen side so this remains legal for the stricter placement
+    // used after a break foul as well as ordinary whole-table ball-in-hand.
+    static const ECDPoint candidates[] = {
+        {-92.0, 0.0}, {-92.0, 22.0}, {-92.0, -22.0},
+        {-76.0, 11.0}, {-76.0, -11.0}, {-76.0, 34.0}, {-76.0, -34.0},
+        {-58.0, 0.0}, {-58.0, 24.0}, {-58.0, -24.0},
+        {-40.0, 12.0}, {-40.0, -12.0}, {-20.0, 0.0},
+    };
+    for (NSUInteger index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index++) {
+        if (ECAutoplayCuePlacementIsClear(balls, cueBall, candidates[index], cueRadius)) {
+            *pointOut = candidates[index];
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL ECAutoplayPlaceCueBall(id manager, id control, NSArray *balls,
+                                   id cueBall, CFTimeInterval now) {
+    if (!manager || !control || gECAutoplayBallPlacementPending ||
+        now < gECAutoplayRetryAfter) return NO;
+    ECDPoint point = {NAN, NAN};
+    if (!ECAutoplayChooseCuePlacement(balls, cueBall, &point)) return NO;
+    SEL overrideSelector = NSSelectorFromString(@"overrideCueBallPositionTarget:");
+    SEL setSelector = NSSelectorFromString(@"setCueBallPosition:");
+    Method setMethod = class_getInstanceMethod([control class], setSelector);
+    if (!setMethod) return NO;
+    Method overrideMethod = class_getInstanceMethod([control class], overrideSelector);
+    if (overrideMethod) {
+        ((void (*)(id, SEL, const ECDPoint *))method_getImplementation(overrideMethod))(
+            control, overrideSelector, &point);
+    }
+    ((void (*)(id, SEL, const ECDPoint *))method_getImplementation(setMethod))(
+        control, setSelector, &point);
+    gECAutoplayBallPlacementPending = YES;
+    gECAutoplayActionAt = now;
+    gECAutoplayRetryAfter = now + 0.9;
+    ECLogLine([NSString stringWithFormat:@"autoplay cue placement x=%.2f y=%.2f",
+               point.x, point.y]);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id liveManager = ECFindGameManager();
+        id liveControl = ECInvokeId(liveManager, @"visualCueBallControl");
+        if (!liveControl) liveControl = ECIvarObject(liveManager, "mVisualCueBallControl");
+        if (ECAutoplayCueBallControlActive(liveManager, liveControl)) {
+            SEL deactivate = NSSelectorFromString(@"deactivateCueBallControl");
+            if ([liveManager respondsToSelector:deactivate]) {
+                ((void (*)(id, SEL))objc_msgSend)(liveManager, deactivate);
+                ECLogLine(@"autoplay cue placement finalized");
+            }
+        }
+        gECAutoplayBallPlacementPending = NO;
+    });
+    return YES;
+}
+
 static void ECAutoplayTick(void) {
     if (!gECAutoplayEnabled || !gECInMatch || gECMenuOpen) return;
     id manager = ECFindGameManager();
@@ -2741,15 +2814,19 @@ static void ECAutoplayTick(void) {
     if (!cueBall && [table respondsToSelector:@selector(getCueBall)]) {
         cueBall = ((id (*)(id, SEL))objc_msgSend)(table, @selector(getCueBall));
     }
-    id visualCue = gECActiveVisualCue ?: ECIvarObject(manager, "mVisualCue");
     NSArray *balls = ECAutoplayBalls(table);
-    if (!manager || !table || !cueBall || !visualCue || balls.count < 2) return;
+    if (!manager || !table || !cueBall || balls.count < 2) return;
 
     BOOL waiting = ECInvokeBool(manager, @"isWaitingForPlayerShot", NO);
     BOOL playerTurn = ECInvokeBool(manager, @"isPlayerTurn", NO);
     BOOL moving = ECAutoplayBallsMoving(balls);
     unsigned int shotId = ECAutoplayCurrentShotId(manager);
     CFTimeInterval now = CACurrentMediaTime();
+    id ballControl = ECInvokeId(manager, @"visualCueBallControl");
+    if (!ballControl) ballControl = ECIvarObject(manager, "mVisualCueBallControl");
+    BOOL ballInHand = ECAutoplayCueBallControlActive(manager, ballControl);
+    id visualCue = gECActiveVisualCue ?: ECIvarObject(manager, "mVisualCue");
+    if (!visualCue) return;
     BOOL cueEnabled = ECInvokeBool(visualCue, @"enabled", NO);
     BOOL aimEnabled = ECInvokeBool(visualCue, @"aimEnabled", NO);
     BOOL cueHasTouches = ECInvokeBool(visualCue, @"hasTouches", NO);
@@ -2759,10 +2836,21 @@ static void ECAutoplayTick(void) {
         gECAutoplayLastStateLog = now;
         loggedState = YES;
         ECLogLine([NSString stringWithFormat:
-            @"autoplay state waiting=%d player=%d moving=%d cue=%d aim=%d touches=%d powerControl=%d balls=%lu pending=%d shot=%u",
+            @"autoplay state waiting=%d player=%d moving=%d cue=%d aim=%d touches=%d powerControl=%d ballInHand=%d balls=%lu pending=%d shot=%u",
             waiting, playerTurn, moving, cueEnabled, aimEnabled, cueHasTouches,
-            powerControlEnabled, (unsigned long)balls.count,
+            powerControlEnabled, ballInHand, (unsigned long)balls.count,
             gECAutoplayShotPending, shotId]);
+    }
+
+    if (ballInHand) {
+        if (waiting && playerTurn) {
+            id currentTouches = ECIvarObject(manager, "mCurrentTouches");
+            if (![currentTouches respondsToSelector:@selector(count)] ||
+                [currentTouches count] == 0) {
+                ECAutoplayPlaceCueBall(manager, ballControl, balls, cueBall, now);
+            }
+        }
+        return;
     }
 
     if (gECAutoplayShotPending) {
@@ -2789,7 +2877,8 @@ static void ECAutoplayTick(void) {
     // `powerControlActive` means the power UI is available for the whole turn,
     // not that a finger is currently dragging it. `waiting` is the game's own
     // settled-table state, so residual spin bits must not veto the next shot.
-    if (!waiting || !playerTurn || !cueEnabled || !aimEnabled || cueHasTouches) return;
+    if (!waiting || !playerTurn || !cueEnabled || !aimEnabled || cueHasTouches ||
+        now < gECAutoplayRetryAfter) return;
     id currentTouches = ECIvarObject(manager, "mCurrentTouches");
     if ([currentTouches respondsToSelector:@selector(count)] && [currentTouches count] != 0) return;
 
@@ -2829,11 +2918,12 @@ static void ECAutoplayTick(void) {
         id liveCue = gECActiveVisualCue ?: ECIvarObject(liveManager, "mVisualCue");
         void *liveGuide = ECRawPointerIvar(liveCue, "mVisualGuide");
         id actualBall = ECStruckBallFromGuide(liveGuide);
-        if (actualBall && actualBall != expectedBall) {
+        if (!actualBall || actualBall != expectedBall) {
             gECAutoplayShotPending = NO;
+            gECAutoplayRetryAfter = CACurrentMediaTime() + 0.85;
             ECLogLine([NSString stringWithFormat:
                 @"autoplay cancelled: native guide hits ball=%d instead of ball=%d",
-                ECBallNumber(actualBall), expectedNumber]);
+                actualBall ? ECBallNumber(actualBall) : -1, expectedNumber]);
             return;
         }
         if (ECAutoplayReleaseShot(liveManager)) {
@@ -4306,6 +4396,11 @@ static void ECRequestOverlayRedraw(void) {
 }
 
 - (UIWindow *)guestWindow {
+    UIWindow *current = self.button.window ?: self.hostWindow;
+    if (current && !current.hidden && current.windowLevel <= UIWindowLevelNormal) return current;
+    UIWindow *renderWindow = gECVisualCueView.window ?: gECRenderHost.window;
+    if (renderWindow && !renderWindow.hidden &&
+        renderWindow.windowLevel <= UIWindowLevelNormal) return renderWindow;
     UIWindow *best = nil;
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (![scene isKindOfClass:UIWindowScene.class]) continue;
@@ -4346,9 +4441,14 @@ static void ECRequestOverlayRedraw(void) {
 }
 
 - (void)closePanel {
-    [self.panel removeFromSuperview];
-    self.panel = nil;
+    if (!NSThread.isMainThread) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf closePanel]; });
+        return;
+    }
+    self.panel.hidden = YES;
     gECMenuOpen = NO;
+    ECLogLine(@"menu-closed");
     [self markButtonActive];
 }
 
@@ -4384,6 +4484,11 @@ static void ECRequestOverlayRedraw(void) {
 }
 
 - (void)renderMenu {
+    if (!NSThread.isMainThread) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf renderMenu]; });
+        return;
+    }
     EmberMenuPanel *panel = self.panel;
     if (!panel) return;
     @try {
@@ -4438,6 +4543,8 @@ static void ECRequestOverlayRedraw(void) {
         gECAutoplayShotPending = NO;
         gECAutoplaySawShotStart = NO;
         gECAutoplayActionAt = 0;
+        gECAutoplayRetryAfter = 0;
+        gECAutoplayBallPlacementPending = NO;
         ECLogLine(gECAutoplayEnabled ? @"autoplay enabled" : @"autoplay disabled");
         [weakSelf scheduleRenderMenu];
     }];
@@ -4455,16 +4562,27 @@ static void ECRequestOverlayRedraw(void) {
         return;
     }
     @try {
-        if (self.panel.superview) {
+        if (self.panel.superview && !self.panel.hidden) {
             [self closePanel];
             return;
         }
         gECMenuOpen = YES;
-        UIWindow *host = self.hostWindow ?: [self guestWindow];
+        UIWindow *host = self.button.window ?: self.hostWindow ?: [self guestWindow];
         if (!host) {
             gECMenuOpen = NO;
             return;
         }
+        if (self.panel && self.panel.superview == host) {
+            self.panel.hidden = NO;
+            [self renderMenu];
+            [host bringSubviewToFront:self.button];
+            [host bringSubviewToFront:self.panel];
+            [self markButtonActive];
+            ECLogLine(@"menu-opened reused=1");
+            return;
+        }
+        [self.panel removeFromSuperview];
+        self.panel = nil;
         EmberMenuPanel *panel = [[EmberMenuPanel alloc]
             initWithTitle:@"8 BALL POOL  //  EMBER TOOLKIT"
             accentColor:[UIColor colorWithRed:0.95 green:0.42 blue:0.14 alpha:1.0]];
@@ -4480,6 +4598,7 @@ static void ECRequestOverlayRedraw(void) {
         if (self.button) [host bringSubviewToFront:self.button];
         [host bringSubviewToFront:panel];
         [self markButtonActive];
+        ECLogLine(@"menu-opened reused=0");
     } @catch (NSException *exception) {
         ECLogLine([NSString stringWithFormat:@"menu-open %@", exception]);
         [self closePanel];
@@ -4531,13 +4650,17 @@ static UIImage *ECEmberConnectIconImage(void) {
     }
     UIWindow *host = [self guestWindow];
     if (!host) return;
-    if (self.panel.superview && self.panel.window != host) [self closePanel];
+    if (self.panel.superview && self.panel.window != host) {
+        [self.panel removeFromSuperview];
+        self.panel = nil;
+        gECMenuOpen = NO;
+    }
     if (self.button.superview && self.button.window != host) {
         [self.button removeFromSuperview];
         self.button = nil;
         self.hostWindow = nil;
     }
-    if (gECMenuOpen || self.panel.superview) return;
+    if (gECMenuOpen || (self.panel.superview && !self.panel.hidden)) return;
     if (self.button.superview) {
         [self.button.superview bringSubviewToFront:self.button];
         [self updateButton];
