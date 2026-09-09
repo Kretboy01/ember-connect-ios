@@ -57,6 +57,8 @@ static unsigned int gECAutoplayRejectionShotId = UINT_MAX;
 static CFTimeInterval gECAutoplayReadySince = 0;
 static BOOL gECAutoplayAimLocked = NO;
 static NSUInteger gECAutoplayValidationToken = 0;
+static NSString *gECAimStatus = @"Searching";
+static BOOL gECAimStatusFound = NO;
 static double gECLastFriction[7];
 static BOOL gECHasLastFriction = NO;
 
@@ -2690,6 +2692,32 @@ static double ECAutoplayPowerForPlan(id table, ECAutoplayPlan plan) {
     return fmin(0.94, fmax(0.34, power));
 }
 
+// Sample actual centres. isMovingOrSpinning remains set after a completed shot
+// in this build, including when the next player's cue is already enabled.
+static BOOL ECAimPositionsChanged(NSArray *balls) {
+    static ECDPoint anchors[16];
+    static uint16_t previousMask = 0;
+    uint16_t mask = 0;
+    BOOL changed = NO;
+    for (id ball in balls) {
+        if (!ECLooksLikeObject(ball) || ECBallIsPotted(ball)) continue;
+        int number = ECBallNumber(ball);
+        if (number < 0 || number > 15) return YES;
+        ECDPoint point = ECBallLivePosition(ball);
+        if (!ECPointValid(point)) return YES;
+        uint16_t bit = (uint16_t)(1u << number);
+        mask |= bit;
+        if (!(previousMask & bit) ||
+            hypot(point.x - anchors[number].x, point.y - anchors[number].y) > 0.015) {
+            anchors[number] = point;
+            changed = YES;
+        }
+    }
+    changed |= mask != previousMask;
+    previousMask = mask;
+    return changed || mask == 0;
+}
+
 static BOOL ECAutoplaySetPower(id cue, double power) {
     if (!cue || !isfinite(power)) return NO;
     SEL powerSelector = NSSelectorFromString(@"setPower:");
@@ -3245,7 +3273,12 @@ static void ECAutoplayLegacyTick(void) {
 #endif
 
 static void ECAutoplayTick(void) {
-    if (!gECAutoplayEnabled || !gECInMatch || gECMenuOpen) return;
+    if (!gECAutoplayEnabled || !gECInMatch || gECMenuOpen) {
+        if (gECAutoplayShotPending) gECAutoplayValidationToken++;
+        gECAutoplayShotPending = NO;
+        gECAutoplayReadySince = 0;
+        return;
+    }
 
     id manager = ECFindGameManager();
     id table = gECCachedTable ?: ECTableFromManager(manager);
@@ -3261,7 +3294,7 @@ static void ECAutoplayTick(void) {
     BOOL opponentTurn = ECInvokeBool(manager, @"isOpponentTurn", NO);
     BOOL localGame = ECInvokeBool(manager, @"isOnLocalGame", NO);
     BOOL controlledTurn = ECAutoplayControlsCurrentTurn(manager);
-    BOOL moving = ECAutoplayBallsMoving(balls);
+    BOOL moving = ECAimPositionsChanged(balls);
     id ballControl = ECInvokeId(manager, @"visualCueBallControl");
     if (!ballControl) ballControl = ECIvarObject(manager, "mVisualCueBallControl");
     BOOL ballInHand = ECAutoplayCueBallControlActive(manager, ballControl);
@@ -3292,6 +3325,9 @@ static void ECAutoplayTick(void) {
         gECAutoplayShotPending = NO;
         gECAutoplayAimLocked = NO;
         gECAutoplayReadySince = 0;
+        gECAimStatusFound = NO;
+        gECAimStatus = ballInHand ? @"Searching · place cue ball" :
+            (!controlledTurn ? @"Waiting for your turn" : @"Searching · balls settling");
         memset(gECAutoplayRejectedPockets, 0, sizeof(gECAutoplayRejectedPockets));
         return;
     }
@@ -3301,17 +3337,20 @@ static void ECAutoplayTick(void) {
     if (cueHasTouches || hasCurrentTouches) {
         if (gECAutoplayShotPending) gECAutoplayValidationToken++;
         gECAutoplayShotPending = NO;
-        gECAutoplayAimLocked = YES;
         gECAutoplayReadySince = 0;
+        if (!gECAutoplayAimLocked) gECAimStatus = @"Searching · release controls";
         return;
     }
 
     if (!cueEnabled || !aimEnabled || !powerControlEnabled ||
         now < gECAutoplayRetryAfter) {
         gECAutoplayReadySince = 0;
+        if (!gECAutoplayAimLocked) gECAimStatus = @"Searching · waiting for cue";
         return;
     }
     if (gECAutoplayAimLocked || gECAutoplayShotPending) return;
+    gECAimStatusFound = NO;
+    gECAimStatus = @"Searching";
     if (gECAutoplayReadySince <= 0) {
         gECAutoplayReadySince = now;
         return;
@@ -3320,6 +3359,7 @@ static void ECAutoplayTick(void) {
 
     ECAutoplayPlan plan = {0};
     if (!ECAutoplayChoosePlan(manager, table, cueBall, &plan)) {
+        gECAimStatus = @"Searching · no valid pot";
         if (now - gECAutoplayActionAt >= 2.0) {
             gECAutoplayActionAt = now;
             ECLogLine(@"aimbot found no geometrically clear legal pot");
@@ -3340,6 +3380,7 @@ static void ECAutoplayTick(void) {
     gECAutoplayReadySince = 0;
     gECAutoplayActionAt = now;
     NSUInteger validationToken = ++gECAutoplayValidationToken;
+    gECAimStatus = @"Searching · checking shot";
     id expectedBall = plan.targetBall;
     int expectedNumber = plan.targetNumber;
     int expectedPocket = plan.pocketIndex;
@@ -3364,7 +3405,7 @@ static void ECAutoplayTick(void) {
             [liveTouches count] == 0;
         BOOL stillReady = liveManager && liveTable && liveCue &&
             ECAutoplayControlsCurrentTurn(liveManager) &&
-            !ECAutoplayBallsMoving(liveBalls) &&
+            !ECAimPositionsChanged(liveBalls) &&
             !ECAutoplayCueBallControlActive(liveManager, liveBallControl) &&
             ECInvokeBool(liveCue, @"enabled", NO) &&
             ECInvokeBool(liveCue, @"aimEnabled", NO) &&
@@ -3429,6 +3470,9 @@ static void ECAutoplayTick(void) {
         gECAutoplayShotPending = NO;
         gECAutoplayAimLocked = YES;
         gECAutoplayReadySince = 0;
+        gECAimStatusFound = YES;
+        gECAimStatus = [NSString stringWithFormat:
+            @"Shot found · ball %d · power %.0f%%", expectedNumber, validatedPower * 100.0];
         ECLogLine([NSString stringWithFormat:
             @"aimbot locked valid pot ball=%d pocket=%d simulatedPower=%.4f",
             expectedNumber, expectedPocket, validatedPower]);
@@ -4879,9 +4923,11 @@ static CAShapeLayer *ECMakeLineLayer(UIColor *color, CGFloat width) {
 @property (nonatomic, strong) NSTimer *keepAliveTimer;
 @property (nonatomic, strong) NSTimer *idleTimer;
 @property (nonatomic, strong) NSTimer *autoplayTimer;
+@property (nonatomic, strong) UILabel *aimStatusLabel;
 + (instancetype)sharedController;
 - (UIWindow *)guestWindow;
 - (void)closePanel;
+- (void)updateAimStatus;
 @end
 
 static void ECRequestOverlayRedraw(void) {
@@ -5237,16 +5283,49 @@ static UIImage *ECEmberConnectIconImage(void) {
     self.autoplayTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
         (void)timer;
         ECAutoplayTick();
+        [weakSelf updateAimStatus];
     }];
 }
 
 - (void)stop {
+    [self.aimStatusLabel removeFromSuperview];
+    self.aimStatusLabel = nil;
     [self.keepAliveTimer invalidate];
     self.keepAliveTimer = nil;
     [self.idleTimer invalidate];
     self.idleTimer = nil;
     [self.autoplayTimer invalidate];
     self.autoplayTimer = nil;
+}
+
+- (void)updateAimStatus {
+    if (!gECInMatch) {
+        self.aimStatusLabel.hidden = YES;
+        return;
+    }
+    UIWindow *host = [self guestWindow];
+    if (!host) return;
+    if (!self.aimStatusLabel) {
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectZero];
+        label.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightSemibold];
+        label.textAlignment = NSTextAlignmentCenter;
+        label.backgroundColor = [UIColor colorWithWhite:0.04 alpha:0.88];
+        label.layer.cornerRadius = 7;
+        label.clipsToBounds = YES;
+        label.userInteractionEnabled = NO;
+        label.accessibilityIdentifier = @"ember.aimStatus";
+        self.aimStatusLabel = label;
+    }
+    UILabel *label = self.aimStatusLabel;
+    if (label.superview != host) [host addSubview:label];
+    label.hidden = gECMenuOpen;
+    label.text = gECAutoplayEnabled ? gECAimStatus : @"Aimbot off";
+    label.textColor = gECAutoplayEnabled && gECAimStatusFound ?
+        [UIColor colorWithRed:0.4 green:1 blue:0.5 alpha:1] :
+        [UIColor colorWithRed:1 green:0.75 blue:0.3 alpha:1];
+    CGFloat width = MIN(330, CGRectGetWidth(host.bounds) - host.safeAreaInsets.left - 16);
+    label.frame = CGRectMake(host.safeAreaInsets.left + 8, host.safeAreaInsets.top + 8, width, 30);
+    [host bringSubviewToFront:label];
 }
 
 @end
